@@ -118,6 +118,7 @@ mod tests {
 			line_end: Some(1),
 			cwe: None,
 			patch_unified: None,
+			poc_unified: None,
 			fingerprint: "fp1".into(),
 		};
 		let env = LeaseEnvelope {

@@ -66,6 +66,7 @@ mod tests {
 				line_end: None,
 				cwe: None,
 				patch_unified: None,
+				poc_unified: None,
 				fingerprint: "fp".into(),
 			}],
 		};

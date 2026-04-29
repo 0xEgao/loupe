@@ -173,6 +173,7 @@ async fn end_to_end_scan_lifecycle() {
 		line_end: Some(1),
 		cwe: None,
 		patch_unified: None,
+		poc_unified: None,
 		fingerprint: "fp1".into(),
 	};
 	for _ in 0..2 {

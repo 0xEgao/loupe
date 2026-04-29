@@ -17,6 +17,7 @@ pub struct FindingRow {
 	pub line_end: Option<u32>,
 	pub cwe: Option<String>,
 	pub patch_unified: Option<String>,
+	pub poc_unified: Option<String>,
 	pub fingerprint: String,
 	pub state: String,
 	pub created_at: i64,
@@ -32,8 +33,8 @@ pub fn insert_or_ignore(
 		"INSERT OR IGNORE INTO findings
 		   (repo_id, job_id, scanner_id, severity, title, description,
 		    file_path, line_start, line_end, cwe, patch_unified,
-		    fingerprint, created_at)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+		    poc_unified, fingerprint, created_at)
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
 		params![
 			repo_id,
 			job_id,
@@ -46,6 +47,7 @@ pub fn insert_or_ignore(
 			f.line_end,
 			&f.cwe,
 			&f.patch_unified,
+			&f.poc_unified,
 			&f.fingerprint,
 			now,
 		],
@@ -57,7 +59,7 @@ pub fn list_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<Vec<Find
 	let mut stmt = conn.prepare(
 		"SELECT id, repo_id, job_id, scanner_id, severity, title, description,
 		        file_path, line_start, line_end, cwe, patch_unified,
-		        fingerprint, state, created_at
+		        poc_unified, fingerprint, state, created_at
 		 FROM findings WHERE job_id = ?1 ORDER BY id ASC",
 	)?;
 	let rows = stmt.query_map(params![job_id], row_to_finding)?;
@@ -70,7 +72,7 @@ pub fn get_for_repo(
 	conn.query_row(
 		"SELECT id, repo_id, job_id, scanner_id, severity, title, description,
 		        file_path, line_start, line_end, cwe, patch_unified,
-		        fingerprint, state, created_at
+		        poc_unified, fingerprint, state, created_at
 		 FROM findings WHERE repo_id = ?1 AND fingerprint = ?2",
 		params![repo_id, fingerprint],
 		row_to_finding,
@@ -96,9 +98,10 @@ fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<FindingRow> {
 		line_end: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
 		cwe: row.get(10)?,
 		patch_unified: row.get(11)?,
-		fingerprint: row.get(12)?,
-		state: row.get(13)?,
-		created_at: row.get(14)?,
+		poc_unified: row.get(12)?,
+		fingerprint: row.get(13)?,
+		state: row.get(14)?,
+		created_at: row.get(15)?,
 	})
 }
 
@@ -169,6 +172,7 @@ mod tests {
 			line_end: Some(1),
 			cwe: Some("CWE-798".into()),
 			patch_unified: None,
+			poc_unified: None,
 			fingerprint: fingerprint.into(),
 		}
 	}

@@ -218,6 +218,7 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 				line_end: finding_row.line_end,
 				cwe: finding_row.cwe,
 				patch_unified: finding_row.patch_unified,
+				poc_unified: finding_row.poc_unified,
 				fingerprint: finding_row.fingerprint,
 			};
 			LeasePayload::Verify { finding_id: target_id, finding }
@@ -464,6 +465,7 @@ async fn dispatch_for_job(
 			line_end: r.line_end,
 			cwe: r.cwe,
 			patch_unified: r.patch_unified,
+			poc_unified: r.poc_unified,
 			fingerprint: r.fingerprint,
 		})
 		.collect();

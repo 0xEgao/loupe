@@ -116,6 +116,7 @@ fn walk(
 				line_end: Some(line_start),
 				cwe: Some("CWE-798".into()),
 				patch_unified: None,
+				poc_unified: None,
 				fingerprint,
 			});
 		}

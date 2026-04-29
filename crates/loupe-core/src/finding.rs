@@ -25,6 +25,11 @@ pub struct Finding {
 	pub cwe: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub patch_unified: Option<String>,
+	/// Unified diff that adds a regression test demonstrating the
+	/// vulnerability — fails on HEAD, passes after a fix is applied.
+	/// Distinct from `patch_unified` which carries a candidate *fix*.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub poc_unified: Option<String>,
 	pub fingerprint: String,
 }
 
@@ -43,6 +48,7 @@ mod tests {
 			line_end: Some(42),
 			cwe: Some("CWE-798".into()),
 			patch_unified: None,
+			poc_unified: None,
 			fingerprint: "deadbeef".into(),
 		}
 	}
@@ -67,11 +73,32 @@ mod tests {
 			line_end: None,
 			cwe: None,
 			patch_unified: None,
+			poc_unified: None,
 			fingerprint: "fp".into(),
 		};
 		let s = serde_json::to_string(&f).unwrap();
 		assert!(!s.contains("file_path"));
 		assert!(!s.contains("cwe"));
 		assert!(!s.contains("patch_unified"));
+		assert!(!s.contains("poc_unified"));
+	}
+
+	#[test]
+	fn poc_unified_round_trips_when_present() {
+		let mut f = sample();
+		f.poc_unified = Some("--- a/src/x.rs\n+++ b/src/x.rs\n@@ ...".into());
+		let s = serde_json::to_string(&f).unwrap();
+		assert!(s.contains("poc_unified"));
+		let back: Finding = serde_json::from_str(&s).unwrap();
+		assert_eq!(back.poc_unified.as_deref(), f.poc_unified.as_deref());
+	}
+
+	#[test]
+	fn poc_unified_defaults_to_none_when_absent() {
+		// Wire format from an older sender that doesn't know about
+		// poc_unified must still deserialise.
+		let s = r#"{"scanner_id":"x","severity":"low","title":"t","description":"d","fingerprint":"fp"}"#;
+		let f: Finding = serde_json::from_str(s).unwrap();
+		assert!(f.poc_unified.is_none());
 	}
 }

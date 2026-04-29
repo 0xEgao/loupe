@@ -15,8 +15,7 @@ struct Migration {
 }
 
 /// The full migration list. New migrations are appended here.
-const MIGRATIONS: &[Migration] =
-	&[Migration { version: 1, sql: V1_INITIAL }, Migration { version: 2, sql: V2_WORKER_KIND }];
+const MIGRATIONS: &[Migration] = &[Migration { version: 1, sql: V1_INITIAL }];
 
 /// The highest version this build knows about.
 pub const LATEST_SCHEMA_VERSION: u32 = {
@@ -98,6 +97,8 @@ CREATE TABLE workers (
     id                INTEGER PRIMARY KEY,
     record_version    INTEGER NOT NULL DEFAULT 1,
     name              TEXT    NOT NULL UNIQUE,
+    kind              TEXT    NOT NULL DEFAULT 'worker'
+                            CHECK (kind IN ('worker', 'admin')),
     cert_fingerprint  BLOB    NOT NULL UNIQUE,
     created_at        INTEGER NOT NULL,
     last_seen_at      INTEGER,
@@ -161,6 +162,7 @@ CREATE TABLE findings (
     line_end                INTEGER,
     cwe                     TEXT,
     patch_unified           TEXT,
+    poc_unified             TEXT,
     fingerprint             TEXT    NOT NULL,
     state                   TEXT    NOT NULL DEFAULT 'pending'
                                 CHECK (state IN ('pending','validating','confirmed','dismissed','reported')),
@@ -198,15 +200,6 @@ CREATE TABLE scan_history (
     finished_at     INTEGER NOT NULL
 );
 CREATE INDEX idx_history_repo ON scan_history(repo_id, finished_at DESC);
-"#;
-
-/// v2 — add a `kind` column to `workers` so we can distinguish admin
-/// operators from scan workers. Both authenticate by client cert against
-/// the same CA; the kind column is what gates admin-only routes from
-/// scan workers and vice versa.
-const V2_WORKER_KIND: &str = r#"
-ALTER TABLE workers ADD COLUMN kind TEXT NOT NULL DEFAULT 'worker'
-    CHECK (kind IN ('worker', 'admin'));
 "#;
 
 #[cfg(test)]
