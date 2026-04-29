@@ -3,6 +3,7 @@
 pub mod client;
 pub mod repo_cache;
 pub mod runner;
+pub mod sandbox;
 pub mod scanner;
 pub mod scanners;
 
