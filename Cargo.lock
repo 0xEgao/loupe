@@ -18,6 +18,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "loupe-proto"
+version = "0.0.0"
+dependencies = [
+ "loupe-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/loupe-core"]
+members = ["crates/loupe-core", "crates/loupe-proto"]
 
 [workspace.package]
 edition = "2021"
