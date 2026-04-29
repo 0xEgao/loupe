@@ -1,0 +1,92 @@
+//! Spin up loupe-server with a freshly minted CA + server cert and make
+//! a real mTLS request to `/v1/health` from a reqwest client carrying a
+//! minted client cert.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use loupe_server::{serve, AppState, Config};
+use loupe_storage::Db;
+use loupe_tls::Ca;
+use reqwest::tls::CertificateRevocationList;
+
+fn pem_to_certificate(pem: &str) -> reqwest::Certificate {
+	reqwest::Certificate::from_pem(pem.as_bytes()).expect("parse cert PEM")
+}
+
+fn pem_to_identity(cert_pem: &str, key_pem: &str) -> reqwest::Identity {
+	let mut combined = String::with_capacity(cert_pem.len() + key_pem.len() + 1);
+	combined.push_str(cert_pem);
+	if !cert_pem.ends_with('\n') {
+		combined.push('\n');
+	}
+	combined.push_str(key_pem);
+	reqwest::Identity::from_pem(combined.as_bytes()).expect("parse client identity PEM")
+}
+
+async fn bring_up() -> (loupe_server::ServeHandle, reqwest::Client, SocketAddr) {
+	let ca = Ca::new("loupe-test-ca").unwrap();
+	let server_cert = ca.mint_server("loupe-server", &["loupe-server".into()]).unwrap();
+	let client_cert = ca.mint_client("admin").unwrap();
+
+	let cfg = Config {
+		bind_addr: "127.0.0.1:0".parse().unwrap(),
+		db_path: ":memory:".into(),
+		server_cert_pem: server_cert.cert_pem,
+		server_key_pem: server_cert.key_pem,
+		ca_cert_pem: ca.cert_pem().to_owned(),
+	};
+	let db = Arc::new(Db::open_in_memory().unwrap());
+	let state = AppState::new(db);
+	let handle = serve(cfg, state).await.unwrap();
+	let local = handle.local_addr;
+
+	let _ = CertificateRevocationList::from_pem; // just makes sure tls feature flags compile
+
+	let client = reqwest::Client::builder()
+		.add_root_certificate(pem_to_certificate(ca.cert_pem()))
+		.identity(pem_to_identity(&client_cert.cert_pem, &client_cert.key_pem))
+		.resolve("loupe-server", local)
+		.use_rustls_tls()
+		.build()
+		.unwrap();
+	(handle, client, local)
+}
+
+#[tokio::test]
+async fn health_endpoint_returns_protocol_version() {
+	let (handle, client, _addr) = bring_up().await;
+	let resp =
+		client.get("https://loupe-server/v1/health").send().await.expect("request to /v1/health");
+	assert!(resp.status().is_success(), "got {}", resp.status());
+	assert_eq!(resp.headers().get("x-loupe-protocol").and_then(|v| v.to_str().ok()), Some("1"));
+
+	let body: serde_json::Value = resp.json().await.unwrap();
+	assert_eq!(body["status"], "ok");
+	assert_eq!(body["protocol_version"], 1);
+
+	handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn server_rejects_client_with_foreign_cert() {
+	let (handle, _, addr) = bring_up().await;
+
+	// Fresh CA the server doesn't trust.
+	let foreign_ca = Ca::new("foreign-ca").unwrap();
+	let foreign_cert = foreign_ca.mint_client("intruder").unwrap();
+	let server_ca = handle.local_addr; // re-using bring_up's CA isn't exposed; just use foreign CA both ways
+	let _ = server_ca;
+
+	let intruder = reqwest::Client::builder()
+		.danger_accept_invalid_certs(true) // skip server-cert verification — we only care about *our* identity being rejected
+		.identity(pem_to_identity(&foreign_cert.cert_pem, &foreign_cert.key_pem))
+		.resolve("loupe-server", addr)
+		.use_rustls_tls()
+		.build()
+		.unwrap();
+
+	let result = intruder.get("https://loupe-server/v1/health").send().await;
+	assert!(result.is_err(), "foreign cert should not handshake; got {result:?}");
+	handle.shutdown().await;
+}

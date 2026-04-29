@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/loupe-core",
     "crates/loupe-proto",
+    "crates/loupe-server",
     "crates/loupe-storage",
     "crates/loupe-tls",
     "crates/loupe-worker",
@@ -22,6 +23,9 @@ all = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
 anyhow = "1"
+axum = "0.8"
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+clap = { version = "4", features = ["derive", "env"] }
 git2 = { version = "0.20", default-features = false, features = ["https"] }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -32,7 +36,8 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time", "signal"] }
 tokio-rustls = "0.26"
+tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
