@@ -101,6 +101,7 @@ pub async fn serve(cfg: Config, state: AppState) -> Result<ServeHandle> {
 	let listener = TcpListener::bind(cfg.bind_addr).await.context("binding loupe-server")?;
 	let local_addr = listener.local_addr().context("local_addr on bound listener")?;
 	let db = state.db.clone();
+	let job_arrived = state.job_arrived.clone();
 	let app = router(state);
 
 	let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -108,7 +109,7 @@ pub async fn serve(cfg: Config, state: AppState) -> Result<ServeHandle> {
 
 	let cancel = tokio_util::sync::CancellationToken::new();
 	let bg_joins = vec![
-		crate::background::spawn_scheduler(db.clone(), cancel.clone()),
+		crate::background::spawn_scheduler(db.clone(), job_arrived, cancel.clone()),
 		crate::background::spawn_reaper(db, cancel.clone()),
 	];
 

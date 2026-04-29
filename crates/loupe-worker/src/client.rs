@@ -37,9 +37,11 @@ impl ServerClient {
 		Self { http, base }
 	}
 
-	pub async fn lease(&self, capabilities: Vec<String>) -> Result<LeaseResponse> {
+	pub async fn lease(
+		&self, capabilities: Vec<String>, wait_seconds: u32,
+	) -> Result<LeaseResponse> {
 		let url = self.url("/v1/jobs/lease");
-		let req = LeaseRequest { protocol_version: PROTOCOL_VERSION, capabilities };
+		let req = LeaseRequest { protocol_version: PROTOCOL_VERSION, capabilities, wait_seconds };
 		let resp = self.http.post(url).json(&req).send().await.context("lease request")?;
 		ensure_ok(&resp)?;
 		resp.json().await.context("decoding lease response")

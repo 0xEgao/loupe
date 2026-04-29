@@ -139,6 +139,7 @@ async fn end_to_end_scan_lifecycle() {
 		.json(&LeaseRequest {
 			protocol_version: PROTOCOL_VERSION,
 			capabilities: vec!["scan:secrets".into()],
+			wait_seconds: 0,
 		})
 		.send()
 		.await
@@ -234,7 +235,11 @@ async fn admin_cannot_lease_jobs() {
 	let resp = f
 		.admin
 		.post("https://loupe-server/v1/jobs/lease")
-		.json(&LeaseRequest { protocol_version: PROTOCOL_VERSION, capabilities: vec![] })
+		.json(&LeaseRequest {
+			protocol_version: PROTOCOL_VERSION,
+			capabilities: vec![],
+			wait_seconds: 0,
+		})
 		.send()
 		.await
 		.unwrap();
@@ -257,12 +262,57 @@ async fn worker_cannot_enqueue_scans() {
 }
 
 #[tokio::test]
+async fn long_poll_lease_wakes_on_enqueue() {
+	let f = bring_up_with_repo_and_worker().await;
+
+	// Worker starts a long-poll *before* anything's queued.
+	let lease_fut = f
+		.worker
+		.post("https://loupe-server/v1/jobs/lease")
+		.json(&LeaseRequest {
+			protocol_version: PROTOCOL_VERSION,
+			capabilities: vec![],
+			wait_seconds: 5,
+		})
+		.send();
+
+	// Briefly give the lease handler time to register on the notifier.
+	let admin = f.admin.clone();
+	let repo_id = f.repo_id;
+	let enqueue_task = async move {
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		admin
+			.post(format!("https://loupe-server/v1/repos/{}/scan", repo_id))
+			.json(&ScanRequest { protocol_version: PROTOCOL_VERSION, incremental: false })
+			.send()
+			.await
+			.unwrap();
+	};
+
+	let started = tokio::time::Instant::now();
+	let (lease_resp, _) = tokio::join!(lease_fut, enqueue_task);
+	let elapsed = started.elapsed();
+
+	let resp = lease_resp.unwrap();
+	assert!(resp.status().is_success());
+	let body: LeaseResponse = resp.json().await.unwrap();
+	assert!(matches!(body, LeaseResponse::Lease(_)), "long-poll must wake with a job");
+	assert!(elapsed < std::time::Duration::from_secs(2), "long-poll woke quickly: {elapsed:?}");
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn empty_queue_returns_empty_lease_response() {
 	let f = bring_up_with_repo_and_worker().await;
 	let resp = f
 		.worker
 		.post("https://loupe-server/v1/jobs/lease")
-		.json(&LeaseRequest { protocol_version: PROTOCOL_VERSION, capabilities: vec![] })
+		.json(&LeaseRequest {
+			protocol_version: PROTOCOL_VERSION,
+			capabilities: vec![],
+			wait_seconds: 0,
+		})
 		.send()
 		.await
 		.unwrap();

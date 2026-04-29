@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use loupe_core::JobKind;
 use loupe_storage::jobs::{self, NewJob};
 use loupe_storage::{repos, Db};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 /// How often the scheduler checks for due repos. Operators with very
@@ -72,9 +73,11 @@ pub fn reap_once(db: &Db, now: i64) -> anyhow::Result<usize> {
 }
 
 /// Spawn the scheduler. Returns a JoinHandle so the caller can wait on
-/// it during shutdown. Cancels cleanly when `cancel` fires.
+/// it during shutdown. Cancels cleanly when `cancel` fires. Pokes
+/// `job_arrived` whenever it enqueues something so long-polling
+/// workers wake immediately.
 pub fn spawn_scheduler(
-	db: std::sync::Arc<Db>, cancel: CancellationToken,
+	db: std::sync::Arc<Db>, job_arrived: std::sync::Arc<Notify>, cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
 	tokio::spawn(async move {
 		let mut interval = tokio::time::interval(SCHEDULER_TICK);
@@ -83,8 +86,10 @@ pub fn spawn_scheduler(
 			tokio::select! {
 				_ = cancel.cancelled() => return,
 				_ = interval.tick() => {
-					if let Err(e) = schedule_due(&db, now_secs()) {
-						tracing::warn!(error = %e, "scheduler tick failed");
+					match schedule_due(&db, now_secs()) {
+						Ok(0) => {},
+						Ok(_) => job_arrived.notify_waiters(),
+						Err(e) => tracing::warn!(error = %e, "scheduler tick failed"),
 					}
 				}
 			}

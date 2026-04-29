@@ -4,10 +4,17 @@ use serde::{Deserialize, Serialize};
 /// Body of `POST /v1/jobs/lease`. The worker advertises capabilities so
 /// the server can match a `kind=verify` job to a worker that runs the
 /// right verifier (`verify:secrets`, `verify:llm-review`, ...).
+///
+/// `wait_seconds` enables server-side long-polling: if the queue is
+/// empty, the server holds the connection up to that many seconds
+/// waiting for a job. Default `0` means the legacy poll-and-return-empty
+/// behaviour, so older workers don't have to opt in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRequest {
 	pub protocol_version: u16,
 	pub capabilities: Vec<String>,
+	#[serde(default)]
+	pub wait_seconds: u32,
 }
 
 /// Response body. Either a job is handed out (`Lease(LeaseEnvelope)`) or

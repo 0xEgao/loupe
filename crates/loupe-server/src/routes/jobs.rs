@@ -93,6 +93,7 @@ pub async fn enqueue_scan(
 		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue: {e}")))?;
 
+	state.job_arrived.notify_waiters();
 	Ok((StatusCode::CREATED, Json(ScanResponse { protocol_version: PROTOCOL_VERSION, job_id })))
 }
 
@@ -119,28 +120,71 @@ pub async fn get(
 	Ok(Json(job_to_info(&row)))
 }
 
-/// `POST /v1/jobs/lease` — worker pulls the next available job.
-/// Returns `LeaseResponse::Empty` if the queue is empty.
+/// Maximum wait the server will honour on a single long-poll, even if
+/// the client asked for longer. Picked under the typical proxy idle
+/// timeout so we never hold a connection long enough for an
+/// intermediary to kill it.
+const MAX_LEASE_WAIT_SECS: u32 = 60;
+
+/// `POST /v1/jobs/lease` — worker pulls the next available job. Honours
+/// `wait_seconds` for server-side long-polling: when the queue is empty
+/// the server waits on `state.job_arrived` for up to that many seconds
+/// (capped) before returning `Empty`. `wait_seconds = 0` is the
+/// historical poll-and-return-empty behaviour.
 pub async fn lease(
 	State(state): State<AppState>, Extension(worker): Extension<AuthedWorker>,
 	Json(req): Json<LeaseRequest>,
 ) -> Result<Json<LeaseResponse>, (StatusCode, String)> {
 	check_version(req.protocol_version)?;
 	let _ = req.capabilities; // capability matching lands with the verifier dispatcher in M2.
-	let now = now_secs();
 
+	if let Some(env) = try_lease(&state, worker.id())? {
+		return Ok(Json(LeaseResponse::Lease(Box::new(env))));
+	}
+	if req.wait_seconds == 0 {
+		return Ok(Json(LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }));
+	}
+
+	let wait = std::time::Duration::from_secs(req.wait_seconds.min(MAX_LEASE_WAIT_SECS) as u64);
+	let deadline = tokio::time::Instant::now() + wait;
+	loop {
+		// Subscribe to notify *before* the lease check so we can't
+		// miss a notify_waiters fired between our two attempts.
+		let notified = state.job_arrived.notified();
+		tokio::pin!(notified);
+
+		if let Some(env) = try_lease(&state, worker.id())? {
+			return Ok(Json(LeaseResponse::Lease(Box::new(env))));
+		}
+
+		let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+		if remaining.is_zero() {
+			return Ok(Json(LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }));
+		}
+		tokio::select! {
+			_ = &mut notified => {
+				// New job — loop and try the lease again.
+			}
+			_ = tokio::time::sleep(remaining) => {
+				return Ok(Json(LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }));
+			}
+		}
+	}
+}
+
+/// One non-blocking lease attempt. `None` means the queue is empty.
+fn try_lease(
+	state: &AppState, worker_id: i64,
+) -> Result<Option<LeaseEnvelope>, (StatusCode, String)> {
+	let now = now_secs();
 	let row = state
 		.db
-		.with_conn(|c| Ok(jobs::lease_next(c, worker.id(), now, DEFAULT_LEASE_SECONDS)?))
+		.with_conn(|c| Ok(jobs::lease_next(c, worker_id, now, DEFAULT_LEASE_SECONDS)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lease: {e}")))?;
-
-	let Some(row) = row else {
-		return Ok(Json(LeaseResponse::Empty { protocol_version: PROTOCOL_VERSION }));
-	};
-
-	let envelope = build_lease_envelope(&state, &row)
+	let Some(row) = row else { return Ok(None) };
+	let env = build_lease_envelope(state, &row)
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("envelope: {e}")))?;
-	Ok(Json(LeaseResponse::Lease(Box::new(envelope))))
+	Ok(Some(env))
 }
 
 fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseEnvelope> {

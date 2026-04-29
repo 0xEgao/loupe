@@ -22,8 +22,11 @@ use crate::scanner::{ScanContext, Scanner};
 
 /// How often the runner heartbeat-pings during a long scan.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
-/// Idle pause when the queue is empty.
-const IDLE_POLL: Duration = Duration::from_secs(5);
+/// Long-poll budget on `POST /v1/jobs/lease`. Tuned just under the
+/// typical proxy idle timeout so a TCP connection won't get killed
+/// mid-wait. The server still answers immediately if a job is already
+/// queued, so this doesn't cost anything when the queue is hot.
+const LEASE_WAIT_SECONDS: u32 = 25;
 
 pub struct Runner {
 	client: Arc<ServerClient>,
@@ -43,10 +46,11 @@ impl Runner {
 		Self { client, cache, scanners, capabilities }
 	}
 
-	/// Run one iteration: try to lease a job, run it if there is one,
-	/// otherwise return false (caller can sleep then try again).
+	/// Run one iteration: long-poll for a job and, if one arrives, run
+	/// it. Returns `true` if a job was processed, `false` if the long-
+	/// poll window elapsed without one.
 	pub async fn step(&self, cancel: &CancellationToken) -> Result<bool> {
-		let resp = self.client.lease(self.capabilities.clone()).await?;
+		let resp = self.client.lease(self.capabilities.clone(), LEASE_WAIT_SECONDS).await?;
 		match resp {
 			LeaseResponse::Empty { .. } => Ok(false),
 			LeaseResponse::Lease(env) => {
@@ -56,22 +60,16 @@ impl Runner {
 		}
 	}
 
-	/// Run forever until cancelled. Pauses [`IDLE_POLL`] between empty
-	/// leases so we don't hammer the server.
+	/// Run forever until cancelled. The server's long-poll absorbs idle
+	/// time, so the worker only has to back off on errors.
 	pub async fn run_forever(&self, cancel: CancellationToken) -> Result<()> {
 		while !cancel.is_cancelled() {
 			match self.step(&cancel).await {
-				Ok(true) => {},
-				Ok(false) => {
-					tokio::select! {
-						_ = tokio::time::sleep(IDLE_POLL) => {},
-						_ = cancel.cancelled() => break,
-					}
-				},
+				Ok(_) => {},
 				Err(e) => {
 					tracing::warn!(error = %e, "runner step failed; backing off");
 					tokio::select! {
-						_ = tokio::time::sleep(IDLE_POLL) => {},
+						_ = tokio::time::sleep(Duration::from_secs(5)) => {},
 						_ = cancel.cancelled() => break,
 					}
 				},
