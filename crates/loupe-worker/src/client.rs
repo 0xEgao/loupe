@@ -5,7 +5,7 @@
 use anyhow::{anyhow, Context, Result};
 use loupe_proto::{
 	CompleteRequest, FindingsBatch, HeartbeatResponse, LeaseRequest, LeaseResponse,
-	PROTOCOL_VERSION,
+	VerdictSubmission, PROTOCOL_VERSION,
 };
 use reqwest::Url;
 
@@ -63,6 +63,12 @@ impl ServerClient {
 	pub async fn complete(&self, job_id: i64, req: &CompleteRequest) -> Result<()> {
 		let url = self.url(&format!("/v1/jobs/{job_id}/complete"));
 		let resp = self.http.post(url).json(req).send().await.context("complete request")?;
+		ensure_ok(&resp)
+	}
+
+	pub async fn submit_verdict(&self, job_id: i64, req: &VerdictSubmission) -> Result<()> {
+		let url = self.url(&format!("/v1/jobs/{job_id}/verdict"));
+		let resp = self.http.post(url).json(req).send().await.context("verdict request")?;
 		ensure_ok(&resp)
 	}
 

@@ -77,6 +77,39 @@ When `verdict = "confirmed"`, `poc_unified` MUST be a non-empty unified
 diff. When the verdict is anything else, `poc_unified` MUST be null.
 "##;
 
+/// Cross-model verification prompt — runs once per finding when the
+/// server has enqueued a `kind=verify` job. Independent second
+/// opinion: takes the original finding (rendered as JSON) and asks
+/// the model whether it agrees with the diagnosis. No PoC requested
+/// — the original validator already produced one (see `VALIDATE`).
+///
+/// `{file}` and `{finding_json}` placeholders match the validation
+/// prompt's. We keep the phrase "validating a vulnerability report"
+/// out of this template so a stub backend keying on prompt content
+/// can tell the verify and validate paths apart.
+pub const VERIFY: &str = r##"
+You are providing an independent second opinion on a vulnerability
+report from another security reviewer. Re-read the file `{file}`
+(located at `/workdir/{file}`) and decide whether the report is real
+and exploitable, or whether it's a false-positive.
+
+Original report:
+{finding_json}
+
+Output **exactly one JSON object** and nothing else:
+
+```
+{
+  "verdict": "confirmed" | "dismissed" | "inconclusive",
+  "notes": "<one sentence on why>"
+}
+```
+
+Use `"inconclusive"` only when the file's behaviour genuinely
+depends on context outside the file itself (e.g. a downstream
+caller's invariants). Prefer a definite verdict when you can.
+"##;
+
 /// Substitute `{key}` placeholders in a template. Simple sentinel-
 /// based replacement — no escaping, no nested templates. Used for the
 /// two prompts above.
@@ -116,5 +149,15 @@ mod tests {
 	fn validate_template_has_required_placeholders() {
 		assert!(VALIDATE.contains("{file}"));
 		assert!(VALIDATE.contains("{finding_json}"));
+	}
+
+	#[test]
+	fn verify_template_distinct_from_validate() {
+		// A stub backend that keys on prompt content must be able to
+		// tell a VERIFY call apart from a VALIDATE call. We rely on
+		// the "validating a vulnerability report" phrase appearing in
+		// VALIDATE only.
+		assert!(VALIDATE.contains("validating a vulnerability report"));
+		assert!(!VERIFY.contains("validating a vulnerability report"));
 	}
 }

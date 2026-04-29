@@ -428,7 +428,7 @@ fn parse_validation(resp: &LlmResponse, d: Discovered) -> Option<Validated> {
 /// markdown fence around it. Returns the slice as a `String` rather
 /// than a `&str` because the model occasionally emits trailing junk
 /// after the closing brace; we feed only what's inside the braces.
-fn extract_json_object(text: &str) -> Option<String> {
+pub(crate) fn extract_json_object(text: &str) -> Option<String> {
 	let bytes = text.as_bytes();
 	// Find first '{'.
 	let start = bytes.iter().position(|b| *b == b'{')?;

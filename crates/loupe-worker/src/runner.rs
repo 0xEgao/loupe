@@ -12,13 +12,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use loupe_proto::{
 	CompleteOutcome, CompleteRequest, FindingsBatch, LeaseEnvelope, LeasePayload, LeaseResponse,
-	PROTOCOL_VERSION,
+	VerdictSubmission, PROTOCOL_VERSION,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::client::ServerClient;
 use crate::repo_cache::{RepoCache, RepoKey};
-use crate::scanner::{ScanContext, Scanner};
+use crate::scanner::{ScanContext, Scanner, VerifyContext};
 
 /// How often the runner heartbeat-pings during a long scan.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
@@ -143,11 +143,49 @@ impl Runner {
 		// alternate is still in use.
 
 		match env.payload {
-			LeasePayload::Verify { .. } => {
-				// M2 wires verifier execution. For now the worker should
-				// not have leased a verify job because it doesn't advertise
-				// any `verify:*` capability.
-				anyhow::bail!("verify-kind jobs are not yet executed by this worker");
+			LeasePayload::Verify { finding_id, finding } => {
+				let (workdir, head_sha) = checkout(&bare, env.head_branch.as_deref()).await?;
+				let workdir_size = crate::repo_cache::dir_size(workdir.path());
+				if workdir_size > self.max_workdir_bytes {
+					anyhow::bail!(
+						"checkout size {workdir_size} bytes exceeds max_workdir_bytes {}",
+						self.max_workdir_bytes
+					);
+				}
+				let vctx = VerifyContext {
+					workdir: workdir.path().to_path_buf(),
+					repo: env.repo.clone(),
+					finding,
+					config: env.scanner_config,
+					cancel: cancel.clone(),
+				};
+				// Pick the first scanner advertising any verify:* tag.
+				// Refining to per-tag matching can come later; today
+				// the server already filtered the lease so we know
+				// some verifier on this worker is eligible.
+				let verifier = self
+					.scanners
+					.iter()
+					.find(|s| s.capabilities().iter().any(|c| c.starts_with("verify:")))
+					.ok_or_else(|| {
+						anyhow::anyhow!(
+							"verify lease arrived but worker advertises no verify:* scanner"
+						)
+					})?;
+				let verdict = verifier.verify(&vctx).await?;
+				tracing::info!(
+					job_id = env.job_id,
+					finding_id,
+					verifier = verifier.id(),
+					"submitting verdict"
+				);
+				self.client
+					.submit_verdict(
+						env.job_id,
+						&VerdictSubmission { protocol_version: PROTOCOL_VERSION, verdict },
+					)
+					.await?;
+				Ok((head_sha, 0))
 			},
 			LeasePayload::Scan { since_sha } => {
 				let (workdir, head_sha) = checkout(&bare, env.head_branch.as_deref()).await?;
