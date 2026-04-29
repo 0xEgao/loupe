@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use loupe_worker::scanners::RegexSecretsScanner;
-use loupe_worker::{RepoCache, Runner, Scanner, ServerClient};
+use loupe_worker::llm::ClaudeCliBackend;
+use loupe_worker::scanners::{LlmCodeReviewScanner, RegexSecretsScanner};
+use loupe_worker::{sandbox, RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
@@ -30,6 +31,12 @@ struct Args {
 	/// Maximum cache size in GB before LRU eviction kicks in.
 	#[arg(long, default_value_t = 40)]
 	max_cache_gb: u64,
+	/// Enable the LLM code-review scanner. Requires `claude` and
+	/// `bwrap` (bubblewrap) to be on PATH unless `LOUPE_DISABLE_SANDBOX=1`
+	/// is set. Disabled by default because each scan accrues real LLM
+	/// spend.
+	#[arg(long, env = "LOUPE_ENABLE_LLM_SCANNER")]
+	enable_llm_scanner: bool,
 }
 
 #[tokio::main]
@@ -47,7 +54,22 @@ async fn main() -> Result<()> {
 	let client = Arc::new(ServerClient::new(&ca_cert_pem, &cert_pem, &key_pem, args.server_url)?);
 	let cache = Arc::new(RepoCache::new(args.cache_dir, args.max_cache_gb * 1_073_741_824)?);
 
-	let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
+	let mut scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
+	if args.enable_llm_scanner {
+		// Hard-fatal if bubblewrap is missing — the LLM scanner runs
+		// untrusted scanner subprocesses and we won't fall back silently.
+		match sandbox::probe_at_startup() {
+			Ok(true) => tracing::info!("bubblewrap available; LLM scanner sandboxed"),
+			Ok(false) => tracing::warn!(
+				"LOUPE_DISABLE_SANDBOX is set; LLM scanner running without isolation"
+			),
+			Err(e) => {
+				return Err(e.context("LLM scanner enabled but bubblewrap is unavailable"));
+			},
+		}
+		scanners.push(Arc::new(LlmCodeReviewScanner::new(Arc::new(ClaudeCliBackend::new()))));
+		tracing::info!("LLM code-review scanner enabled");
+	}
 	let runner = Runner::new(client, cache, scanners);
 
 	let cancel = CancellationToken::new();
