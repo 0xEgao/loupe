@@ -23,31 +23,41 @@ unsafe_code = "forbid"
 all = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
-anyhow = "1"
-async-trait = "0.1"
-axum = "0.8"
-blake3 = "1"
-clap = { version = "4", features = ["derive", "env"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "service", "server"] }
-regex = "1"
+# Every dep below sets `default-features = false` and lists exactly the
+# features we use. Two reasons: it documents our usage so a future
+# tightener can verify nothing's unused, and it keeps the dep tree
+# small (most notably: keeps `aws-lc-rs` out of the rustls subtree —
+# default rustls pulls both ring AND aws-lc-rs, the latter is a
+# vendored LibCrypto fork worth tens of MB of build artefacts).
+anyhow = { version = "1", default-features = false, features = ["std"] }
+async-trait = { version = "0.1", default-features = false }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "matched-path", "query", "tokio", "tracing"] }
+blake3 = { version = "1", default-features = false, features = ["std"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service", "server"] }
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
+# `rustls-tls-manual-roots-no-provider` keeps reqwest from pinning a
+# crypto provider; we explicitly add the `ring` provider via the
+# `rustls` workspace dep below, which both reqwest and tokio-rustls
+# share. `aws-lc-rs` is excluded.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 git2 = { version = "0.20", default-features = false, features = ["https"] }
-rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
-rustls = "0.23"
-rustls-pemfile = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-tempfile = "3"
-thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time", "signal", "process"] }
-toml = "0.8"
-tokio-rustls = "0.26"
-tower = "0.5"
-rand_core = { version = "0.6", features = ["getrandom"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-walkdir = "2"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem", "x509-parser"] }
+rusqlite = { version = "0.32", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+rustls-pemfile = { version = "2", default-features = false, features = ["std"] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+tempfile = { version = "3", default-features = false }
+thiserror = { version = "2", default-features = false }
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time", "signal", "process"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring", "logging"] }
+tower = { version = "0.5", default-features = false }
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "json", "tracing-log"] }
+walkdir = { version = "2", default-features = false }
