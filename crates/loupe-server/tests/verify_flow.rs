@@ -158,6 +158,7 @@ async fn run_flow(
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: true,
+			require_approval: None,
 		})
 		.send()
 		.await

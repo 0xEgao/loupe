@@ -26,6 +26,11 @@ pub struct AppState {
 	pub email_reporter: Arc<EmailReporter>,
 	pub job_arrived: Arc<Notify>,
 	pub master_key: Option<Arc<MasterKey>>,
+	/// Server-wide default for the human-in-the-loop approval gate.
+	/// Used when a repo has `require_approval = NULL` (the wire-side
+	/// default — i.e. the operator didn't pin a per-repo override).
+	/// `false` keeps the existing immediate-dispatch behaviour.
+	pub require_approval_default: bool,
 }
 
 impl AppState {
@@ -37,6 +42,7 @@ impl AppState {
 			email_reporter: Arc::new(EmailReporter::new()),
 			job_arrived: Arc::new(Notify::new()),
 			master_key: None,
+			require_approval_default: false,
 		}
 	}
 
@@ -47,6 +53,11 @@ impl AppState {
 
 	pub fn with_email_reporter(mut self, reporter: EmailReporter) -> Self {
 		self.email_reporter = Arc::new(reporter);
+		self
+	}
+
+	pub fn with_require_approval_default(mut self, on: bool) -> Self {
+		self.require_approval_default = on;
 		self
 	}
 }

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use clap::{Parser, Subcommand};
 use loupe_server::init::{run_init, DataDirLayout};
-use loupe_server::{serve, AppState, Config};
+use loupe_server::{serve, AppState, Config, FileConfig};
 use loupe_storage::secrets::MasterKey;
 use loupe_storage::Db;
 use loupe_tls::Ca;
@@ -41,18 +41,29 @@ struct InitArgs {
 
 #[derive(Debug, Parser)]
 struct ServeArgs {
-	#[arg(long, env = "LOUPE_BIND", default_value = "127.0.0.1:8443")]
-	bind: SocketAddr,
+	/// Optional path to a TOML config file. Settings the file
+	/// supplies act as defaults; matching env vars or CLI flags
+	/// override them. See `contrib/config.toml` for a sample.
+	#[arg(long, env = "LOUPE_CONFIG")]
+	config: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_BIND")]
+	bind: Option<SocketAddr>,
 	#[arg(long, env = "LOUPE_DB")]
-	db: PathBuf,
+	db: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_SERVER_CERT")]
-	server_cert: PathBuf,
+	server_cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_SERVER_KEY")]
-	server_key: PathBuf,
+	server_key: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_CA_CERT")]
-	ca_cert: PathBuf,
+	ca_cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_CA_KEY")]
-	ca_key: PathBuf,
+	ca_key: Option<PathBuf>,
+	/// Server-level default for the human-in-the-loop approval gate.
+	/// Per-repo `require_approval` overrides this. When unset both
+	/// here and in the config file, the default is `false`
+	/// (immediate dispatch).
+	#[arg(long, env = "LOUPE_REQUIRE_APPROVAL_DEFAULT")]
+	require_approval_default: Option<bool>,
 }
 
 #[tokio::main]
@@ -85,34 +96,70 @@ fn run_init_cmd(args: InitArgs) -> Result<()> {
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
-	let server_cert_pem = std::fs::read_to_string(&args.server_cert)
-		.with_context(|| format!("reading server cert at {}", args.server_cert.display()))?;
-	let server_key_pem = std::fs::read_to_string(&args.server_key)
-		.with_context(|| format!("reading server key at {}", args.server_key.display()))?;
-	let ca_cert_pem = std::fs::read_to_string(&args.ca_cert)
-		.with_context(|| format!("reading CA cert at {}", args.ca_cert.display()))?;
-	let ca_key_pem = std::fs::read_to_string(&args.ca_key)
-		.with_context(|| format!("reading CA key at {}", args.ca_key.display()))?;
+	let file_cfg = match &args.config {
+		Some(path) => FileConfig::load(path)?,
+		None => FileConfig::default(),
+	};
+
+	let bind_addr = args
+		.bind
+		.or(file_cfg.server.bind)
+		.unwrap_or_else(|| "127.0.0.1:8443".parse().expect("hardcoded socket addr is valid"));
+	let db_path = args
+		.db
+		.or(file_cfg.paths.db)
+		.context("db path missing — pass --db, set LOUPE_DB, or [paths].db in config.toml")?;
+	let server_cert_path = args.server_cert.or(file_cfg.paths.server_cert).context(
+		"server cert path missing — pass --server-cert, set LOUPE_SERVER_CERT, or [paths].server_cert",
+	)?;
+	let server_key_path = args.server_key.or(file_cfg.paths.server_key).context(
+		"server key path missing — pass --server-key, set LOUPE_SERVER_KEY, or [paths].server_key",
+	)?;
+	let ca_cert_path = args
+		.ca_cert
+		.or(file_cfg.paths.ca_cert)
+		.context("CA cert path missing — pass --ca-cert, set LOUPE_CA_CERT, or [paths].ca_cert")?;
+	let ca_key_path = args
+		.ca_key
+		.or(file_cfg.paths.ca_key)
+		.context("CA key path missing — pass --ca-key, set LOUPE_CA_KEY, or [paths].ca_key")?;
+	let require_approval_default =
+		args.require_approval_default.or(file_cfg.policy.require_approval_default).unwrap_or(false);
+
+	let server_cert_pem = std::fs::read_to_string(&server_cert_path)
+		.with_context(|| format!("reading server cert at {}", server_cert_path.display()))?;
+	let server_key_pem = std::fs::read_to_string(&server_key_path)
+		.with_context(|| format!("reading server key at {}", server_key_path.display()))?;
+	let ca_cert_pem = std::fs::read_to_string(&ca_cert_path)
+		.with_context(|| format!("reading CA cert at {}", ca_cert_path.display()))?;
+	let ca_key_pem = std::fs::read_to_string(&ca_key_path)
+		.with_context(|| format!("reading CA key at {}", ca_key_path.display()))?;
 
 	let ca = Ca::from_pem(&ca_cert_pem, &ca_key_pem).context("rebuilding CA from PEM")?;
 
 	let cfg = Config {
-		bind_addr: args.bind,
-		db_path: args.db.clone(),
+		bind_addr,
+		db_path: db_path.clone(),
 		server_cert_pem,
 		server_key_pem,
 		ca_cert_pem,
 		ca_key_pem,
 	};
-	let db = Db::open(&args.db).with_context(|| format!("opening db at {}", args.db.display()))?;
+	let db = Db::open(&db_path).with_context(|| format!("opening db at {}", db_path.display()))?;
 	let github = Arc::new(loupe_server::reporters::GithubReporter::new()?);
-	let mut state = AppState::new(Arc::new(db), Arc::new(ca), github);
+	let mut state = AppState::new(Arc::new(db), Arc::new(ca), github)
+		.with_require_approval_default(require_approval_default);
 	if let Some(key) = read_master_key_from_env()? {
 		state = state.with_master_key(key);
 		tracing::info!("loupe-server: master key loaded; secrets will be encrypted at rest");
 	} else {
 		tracing::warn!(
 			"loupe-server: LOUPE_MASTER_KEY not set; secrets will be stored as plaintext"
+		);
+	}
+	if require_approval_default {
+		tracing::info!(
+			"loupe-server: require_approval_default = true (per-repo overrides may opt out)"
 		);
 	}
 

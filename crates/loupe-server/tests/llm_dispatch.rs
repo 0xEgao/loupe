@@ -161,6 +161,7 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: false,
+			require_approval: None,
 		})
 		.send()
 		.await

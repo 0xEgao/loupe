@@ -22,6 +22,10 @@ pub struct FindingRow {
 	pub state: String,
 	pub verification_required: bool,
 	pub created_at: i64,
+	pub approved_at: Option<i64>,
+	pub approved_by_cn: Option<String>,
+	pub rejected_at: Option<i64>,
+	pub rejected_by_cn: Option<String>,
 }
 
 /// Insert a finding produced by a scan job. Idempotent on
@@ -63,13 +67,18 @@ pub fn insert_or_ignore(
 	Ok(if n > 0 { Some(conn.last_insert_rowid()) } else { None })
 }
 
+/// Column list for `row_to_finding`. Centralised so adding a column
+/// is one edit, not four.
+const FINDING_COLUMNS: &str = "id, repo_id, job_id, scanner_id, severity, title, description,
+        file_path, line_start, line_end, cwe, patch_unified,
+        poc_unified, fingerprint, state, verification_required, created_at,
+        approved_at, approved_by_cn, rejected_at, rejected_by_cn";
+
 pub fn list_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<Vec<FindingRow>> {
-	let mut stmt = conn.prepare(
-		"SELECT id, repo_id, job_id, scanner_id, severity, title, description,
-		        file_path, line_start, line_end, cwe, patch_unified,
-		        poc_unified, fingerprint, state, verification_required, created_at
-		 FROM findings WHERE job_id = ?1 ORDER BY id ASC",
-	)?;
+	let mut stmt = conn.prepare(&format!(
+		"SELECT {FINDING_COLUMNS}
+		 FROM findings WHERE job_id = ?1 ORDER BY id ASC"
+	))?;
 	let rows = stmt.query_map(params![job_id], row_to_finding)?;
 	rows.collect()
 }
@@ -113,12 +122,10 @@ pub fn reap_stale_validating(conn: &mut Connection, now: i64) -> rusqlite::Resul
 pub fn list_for_repo(
 	conn: &Connection, repo_id: i64, limit: i64,
 ) -> rusqlite::Result<Vec<FindingRow>> {
-	let mut stmt = conn.prepare(
-		"SELECT id, repo_id, job_id, scanner_id, severity, title, description,
-		        file_path, line_start, line_end, cwe, patch_unified,
-		        poc_unified, fingerprint, state, verification_required, created_at
-		 FROM findings WHERE repo_id = ?1 ORDER BY id DESC LIMIT ?2",
-	)?;
+	let mut stmt = conn.prepare(&format!(
+		"SELECT {FINDING_COLUMNS}
+		 FROM findings WHERE repo_id = ?1 ORDER BY id DESC LIMIT ?2"
+	))?;
 	let rows = stmt.query_map(params![repo_id, limit], row_to_finding)?;
 	rows.collect()
 }
@@ -126,10 +133,7 @@ pub fn list_for_repo(
 /// Fetch one finding by id. Returns `None` if it doesn't exist.
 pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<FindingRow>> {
 	conn.query_row(
-		"SELECT id, repo_id, job_id, scanner_id, severity, title, description,
-		        file_path, line_start, line_end, cwe, patch_unified,
-		        poc_unified, fingerprint, state, verification_required, created_at
-		 FROM findings WHERE id = ?1",
+		&format!("SELECT {FINDING_COLUMNS} FROM findings WHERE id = ?1"),
 		params![id],
 		row_to_finding,
 	)
@@ -140,14 +144,83 @@ pub fn get_for_repo(
 	conn: &Connection, repo_id: i64, fingerprint: &str,
 ) -> rusqlite::Result<Option<FindingRow>> {
 	conn.query_row(
-		"SELECT id, repo_id, job_id, scanner_id, severity, title, description,
-		        file_path, line_start, line_end, cwe, patch_unified,
-		        poc_unified, fingerprint, state, verification_required, created_at
-		 FROM findings WHERE repo_id = ?1 AND fingerprint = ?2",
+		&format!("SELECT {FINDING_COLUMNS} FROM findings WHERE repo_id = ?1 AND fingerprint = ?2"),
 		params![repo_id, fingerprint],
 		row_to_finding,
 	)
 	.optional()
+}
+
+/// Outcome of an `approve`/`reject` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+	/// The finding was in `awaiting_approval` and got transitioned.
+	Applied,
+	/// The finding exists but isn't in `awaiting_approval` (already
+	/// approved, rejected, or never gated). Caller decides whether
+	/// that's a 404 or a 409.
+	NotPending,
+	/// No finding with that id.
+	NotFound,
+}
+
+/// Park a freshly-`confirmed` finding in `awaiting_approval` because
+/// the repo (or server default) requires human sign-off before
+/// dispatch. No-op if the finding isn't in `confirmed`.
+pub fn transition_to_awaiting_approval(conn: &Connection, finding_id: i64) -> rusqlite::Result<()> {
+	conn.execute(
+		"UPDATE findings SET state = 'awaiting_approval'
+		 WHERE id = ?1 AND state = 'confirmed'",
+		[finding_id],
+	)?;
+	Ok(())
+}
+
+/// Approve a finding. Stamps `approved_at`/`approved_by_cn` and
+/// transitions `awaiting_approval → confirmed` so the dispatcher can
+/// pick it up. Idempotent on already-approved rows: re-running on a
+/// `confirmed` row returns `NotPending` rather than re-stamping.
+pub fn approve(
+	conn: &Connection, id: i64, by_cn: &str, now: i64,
+) -> rusqlite::Result<ApprovalOutcome> {
+	let n = conn.execute(
+		"UPDATE findings
+		    SET state = 'confirmed', approved_at = ?1, approved_by_cn = ?2
+		  WHERE id = ?3 AND state = 'awaiting_approval'",
+		params![now, by_cn, id],
+	)?;
+	Ok(if n > 0 {
+		ApprovalOutcome::Applied
+	} else {
+		match get(conn, id)? {
+			Some(_) => ApprovalOutcome::NotPending,
+			None => ApprovalOutcome::NotFound,
+		}
+	})
+}
+
+/// Reject a finding sitting in `awaiting_approval`. Transitions to
+/// terminal `dismissed` with `rejected_at`/`rejected_by_cn` stamped.
+/// `dismissed_at` is also stamped so dashboards that group on
+/// `dismissed_at` don't need to special-case the rejection path.
+pub fn reject(
+	conn: &Connection, id: i64, by_cn: &str, now: i64,
+) -> rusqlite::Result<ApprovalOutcome> {
+	let n = conn.execute(
+		"UPDATE findings
+		    SET state = 'dismissed', dismissed_at = ?1,
+		        rejected_at = ?1, rejected_by_cn = ?2
+		  WHERE id = ?3 AND state = 'awaiting_approval'",
+		params![now, by_cn, id],
+	)?;
+	Ok(if n > 0 {
+		ApprovalOutcome::Applied
+	} else {
+		match get(conn, id)? {
+			Some(_) => ApprovalOutcome::NotPending,
+			None => ApprovalOutcome::NotFound,
+		}
+	})
 }
 
 fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<FindingRow> {
@@ -173,6 +246,10 @@ fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<FindingRow> {
 		state: row.get(14)?,
 		verification_required: row.get::<_, i64>(15)? != 0,
 		created_at: row.get(16)?,
+		approved_at: row.get(17)?,
+		approved_by_cn: row.get(18)?,
+		rejected_at: row.get(19)?,
+		rejected_by_cn: row.get(20)?,
 	})
 }
 
@@ -209,6 +286,7 @@ mod tests {
 							pat_secret_id: secret_id,
 						},
 						verification_enabled: false,
+						require_approval: None,
 					},
 					0,
 				)?)

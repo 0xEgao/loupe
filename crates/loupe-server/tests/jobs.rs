@@ -98,6 +98,7 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 		},
 		scanner_config: serde_json::Value::Null,
 		verification_enabled: false,
+		require_approval: None,
 	};
 	let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
 	assert_eq!(resp.status(), 201);

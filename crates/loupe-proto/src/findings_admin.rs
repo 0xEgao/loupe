@@ -35,6 +35,21 @@ pub struct FindingSummary {
 	pub state: String,
 	pub verification_required: bool,
 	pub created_at: i64,
+	/// Approval audit trail. Populated when an admin runs
+	/// `loupectl finding approve` on a finding parked in
+	/// `awaiting_approval`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub approved_at: Option<i64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub approved_by_cn: Option<String>,
+	/// Rejection audit trail. Populated when an admin runs
+	/// `loupectl finding reject` on a finding parked in
+	/// `awaiting_approval`. Distinct from a verifier-issued dismiss
+	/// (those leave `rejected_*` NULL).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rejected_at: Option<i64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rejected_by_cn: Option<String>,
 }
 
 /// Full detail view for `GET /v1/findings/:id`.
@@ -64,4 +79,12 @@ pub struct FindingDetail {
 	pub state: String,
 	pub verification_required: bool,
 	pub created_at: i64,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub approved_at: Option<i64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub approved_by_cn: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rejected_at: Option<i64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rejected_by_cn: Option<String>,
 }

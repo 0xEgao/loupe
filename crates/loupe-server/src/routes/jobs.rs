@@ -353,6 +353,17 @@ pub async fn submit_verdict(
 		loupe_core::Verdict::Dismissed { notes } => ("dismissed", notes.clone()),
 		loupe_core::Verdict::Inconclusive { reason } => ("inconclusive", Some(reason.clone())),
 	};
+	// Resolve effective approval mode for this finding's repo before
+	// the tx so the rollup can route a `confirmed` verdict either to
+	// `confirmed` (immediate dispatch) or `awaiting_approval` (parked
+	// for human sign-off).
+	let server_default = state.require_approval_default;
+	let require_approval = state
+		.db
+		.with_conn(|c| Ok(repos::get(c, row.repo_id)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
+		.map(|r| r.effective_require_approval(server_default))
+		.unwrap_or(false);
 	// Insert the verdict + apply the rollup policy in a single
 	// transaction so a concurrent verdict from a second verifier
 	// can't catch us mid-state-flip and observe "confirmed AND
@@ -399,15 +410,25 @@ pub async fn submit_verdict(
 					|r| r.get(0),
 				)?;
 				if any_confirmed {
-					Some("confirmed")
+					if require_approval {
+						Some("awaiting_approval")
+					} else {
+						Some("confirmed")
+					}
 				} else {
 					None
 				}
 			};
 			if let Some(s) = next_state {
-				let stamp_col = if s == "confirmed" { "confirmed_at" } else { "dismissed_at" };
+				// `awaiting_approval` doesn't stamp anything yet —
+				// `approved_at` lands later when the operator approves.
+				let stamp_clause = match s {
+					"confirmed" => ", confirmed_at = ?2",
+					"dismissed" => ", dismissed_at = ?2",
+					_ => "",
+				};
 				tx.execute(
-					&format!("UPDATE findings SET state = ?1, {stamp_col} = ?2 WHERE id = ?3"),
+					&format!("UPDATE findings SET state = ?1{stamp_clause} WHERE id = ?3"),
 					(s, now, target_finding_id),
 				)?;
 			}
@@ -453,6 +474,21 @@ pub async fn complete(
 		return Err((StatusCode::FORBIDDEN, "no leased job for this worker".into()));
 	}
 
+	// Resolve effective approval mode once, outside the tx, so the
+	// state-transition SQL can branch on it. `dispatch_for_job` later
+	// also reads the repo, but that's a separate call path.
+	let server_default = state.require_approval_default;
+	let require_approval = if matches!(new_state, JobState::Succeeded) && job.kind == JobKind::Scan
+	{
+		state
+			.db
+			.with_conn(|c| Ok(repos::get(c, job.repo_id)?))
+			.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
+			.map(|r| r.effective_require_approval(server_default))
+			.unwrap_or(false)
+	} else {
+		false
+	};
 	state
 		.db
 		.with_conn(|c| {
@@ -496,16 +532,29 @@ pub async fn complete(
 					),
 				)?;
 
-				// Transition each finding produced by this scan into
-				// either `confirmed` (auto-pass; dispatcher picks up
-				// later) or `validating` (verify job enqueued for a
-				// verifier worker to confirm or reject).
-				tx.execute(
-					"UPDATE findings
-					   SET state = 'confirmed', confirmed_at = ?1
-					 WHERE job_id = ?2 AND verification_required = 0 AND state = 'pending'",
-					(now, job_id),
-				)?;
+				// Transition each finding produced by this scan. The
+				// auto-pass branch (verification_required = 0) lands on
+				// either `confirmed` (dispatcher picks up later) or
+				// `awaiting_approval` (parked until a human runs
+				// `loupectl finding approve`), driven by the repo's
+				// effective `require_approval`. `confirmed_at` is only
+				// stamped on the `confirmed` path — `awaiting_approval`
+				// stamps `approved_at` later when (and if) approved.
+				if require_approval {
+					tx.execute(
+						"UPDATE findings
+						   SET state = 'awaiting_approval'
+						 WHERE job_id = ?1 AND verification_required = 0 AND state = 'pending'",
+						[job_id],
+					)?;
+				} else {
+					tx.execute(
+						"UPDATE findings
+						   SET state = 'confirmed', confirmed_at = ?1
+						 WHERE job_id = ?2 AND verification_required = 0 AND state = 'pending'",
+						(now, job_id),
+					)?;
+				}
 				tx.execute(
 					"UPDATE findings
 					   SET state = 'validating', validating_deadline = ?1
@@ -552,9 +601,12 @@ pub async fn complete(
 
 /// Dispatch a single finding that has just transitioned to `confirmed`
 /// (typical caller: the verdict handler after a verify worker confirms
-/// it). Skips findings that aren't in the right state — defends
-/// against double-dispatch races.
-async fn dispatch_finding(state: &AppState, finding_id: i64, now: i64) -> anyhow::Result<()> {
+/// it, or the approval handler after a human signs off). Skips
+/// findings that aren't in the right state — defends against
+/// double-dispatch races.
+pub(super) async fn dispatch_finding(
+	state: &AppState, finding_id: i64, now: i64,
+) -> anyhow::Result<()> {
 	use loupe_core::{Finding, ReportingDestination};
 
 	let row = state

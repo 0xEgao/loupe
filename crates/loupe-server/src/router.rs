@@ -33,6 +33,8 @@ pub fn router(state: AppState) -> Router {
 		.route("/v1/repos/{id}/scan", post(routes::jobs::enqueue_scan))
 		.route("/v1/repos/{id}/findings", get(routes::findings_admin::list_for_repo))
 		.route("/v1/findings/{id}", get(routes::findings_admin::get))
+		.route("/v1/findings/{id}/approve", post(routes::findings_admin::approve))
+		.route("/v1/findings/{id}/reject", post(routes::findings_admin::reject))
 		.route("/v1/workers", post(routes::workers::create))
 		.route("/v1/workers/{id}", delete(routes::workers::revoke))
 		.route("/v1/jobs", get(routes::jobs::list))

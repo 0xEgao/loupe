@@ -45,6 +45,12 @@ pub struct RegisterRepoRequest {
 	/// dispatch immediately.
 	#[serde(default)]
 	pub verification_enabled: bool,
+	/// Per-repo override of the human-in-the-loop approval gate. `None`
+	/// (the default on the wire) means "inherit the server's
+	/// `require_approval_default`". `Some(true)` / `Some(false)` pin
+	/// the value for this repo regardless of the server default.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub require_approval: Option<bool>,
 }
 
 impl RegisterRepoRequest {
@@ -57,6 +63,7 @@ impl RegisterRepoRequest {
 			reporting,
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: false,
+			require_approval: None,
 		}
 	}
 }
@@ -73,6 +80,12 @@ pub struct RegisterRepoResponse {
 /// reporting destination, clone URL, and PAT cannot be patched: those
 /// are register-time inputs, and changing them would silently affect
 /// where new findings get filed. Re-register the repo for that.
+///
+/// `require_approval` is tri-state on the wire: omitted = leave the
+/// existing per-repo override alone; `Some(true)` / `Some(false)` =
+/// pin per-repo. To clear the per-repo override back to "inherit
+/// server default", set `inherit_require_approval = true` instead.
+/// The server rejects requests that set both at once.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct UpdateRepoRequest {
 	pub protocol_version: u16,
@@ -82,6 +95,10 @@ pub struct UpdateRepoRequest {
 	pub scan_interval_seconds: Option<u64>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub verification_enabled: Option<bool>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub require_approval: Option<bool>,
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub inherit_require_approval: bool,
 }
 
 /// Response body of `GET /v1/repos`. `RepoSummary` deliberately omits
@@ -149,6 +166,7 @@ mod tests {
 			},
 			scanner_config: json!({"regex": {"enabled": true}}),
 			verification_enabled: true,
+			require_approval: Some(false),
 		};
 		let s = serde_json::to_string(&req).unwrap();
 		let back: RegisterRepoRequest = serde_json::from_str(&s).unwrap();

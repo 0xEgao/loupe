@@ -121,7 +121,7 @@ export LOUPE_MASTER_KEY="$(openssl rand -base64 32)"
 
 loupe-server serve \
   --bind 127.0.0.1:8443 \
-  --db /var/lib/loupe/loupe.db \
+  --db /var/lib/loupe/loupe.sqlite \
   --server-cert /var/lib/loupe/server.pem \
   --server-key  /var/lib/loupe/server.key \
   --ca-cert     /var/lib/loupe/ca.pem \
@@ -130,6 +130,26 @@ loupe-server serve \
 
 All flags also accept the matching `LOUPE_*` env vars (`LOUPE_BIND`,
 `LOUPE_DB`, `LOUPE_SERVER_CERT`, etc.).
+
+#### Or: keep settings in `config.toml`
+
+Anything you'd otherwise pass on the command line can live in a TOML
+config file (a sample ships in `contrib/config.toml`). Drop it next to
+the data directory and point the server at it:
+
+```
+cp contrib/config.toml /var/lib/loupe/config.toml
+$EDITOR /var/lib/loupe/config.toml      # adjust to taste
+
+loupe-server serve --config /var/lib/loupe/config.toml
+```
+
+Path-typed fields under `[paths]` are interpreted relative to the
+config file's directory, so a single file can ship next to the certs
+and database without absolute paths. CLI flags and `LOUPE_*` env vars
+override anything the file supplies, so a typical deploy keeps stable
+settings in `config.toml` and uses the env to flip per-environment
+knobs.
 
 ### 3. Point `loupectl` at the server
 
@@ -223,11 +243,48 @@ loupectl repo update <id> --disable                  # pause scheduler
 loupectl repo update <id> --enable
 loupectl repo update <id> --interval 3600            # hourly
 loupectl repo update <id> --verification-enabled     # route via verify flow
+loupectl repo update <id> --require-approval         # hold for human sign-off
+loupectl repo update <id> --no-require-approval      # opt out of the approval gate
+loupectl repo update <id> --inherit-approval         # fall back to the server default
 ```
 
 The clone URL and reporting destination are deliberately *not*
 patchable: silently re-pointing where new findings get filed is too
 easy a footgun. Re-register the repo if you need to change either.
+
+## Human-in-the-loop approval
+
+By default, confirmed findings dispatch immediately. For repos where
+you want a human to read the finding before an issue is filed, turn on
+the approval gate. Two layers compose:
+
+- **Per-repo `require_approval`** (`loupectl repo add --require-approval`,
+  or `loupectl repo update <id> --require-approval`). Pinning it
+  `true` always holds; pinning it `false` always dispatches; leaving
+  it unpinned (`--inherit-approval` clears the override) falls back
+  to the server default.
+- **Server-wide default `require_approval_default`** in
+  `config.toml`'s `[policy]` section, or via the
+  `--require-approval-default` flag / `LOUPE_REQUIRE_APPROVAL_DEFAULT`
+  env. Off by default. Per-repo overrides win.
+
+When the gate is active, a confirmed finding (auto-pass or
+verifier-confirmed) parks in state `awaiting_approval` instead of
+hitting the reporter. The operator handles it with:
+
+```
+loupectl finding list <repo-id>                 # state=awaiting_approval
+loupectl finding get  <finding-id>              # full body, PoC, patch
+loupectl finding approve <finding-id>           # → confirmed → dispatched
+loupectl finding reject  <finding-id>           # → terminal dismissed
+```
+
+`approve` runs the dispatcher synchronously, so the issue is filed
+the moment the call returns. `reject` is terminal; the audit columns
+`approved_by_cn` / `rejected_by_cn` record the admin client cert's
+`workers.name` so dashboards can later answer "who clicked what". A
+verifier-issued `dismiss` and a human `reject` both land on
+`state = 'dismissed'`, but only the human path stamps `rejected_*`.
 
 ## Verification flow (cross-model second opinion)
 

@@ -97,6 +97,7 @@ pub async fn create(
 					scanner_config: req.scanner_config.clone(),
 					reporting,
 					verification_enabled: req.verification_enabled,
+					require_approval: req.require_approval,
 				},
 				now,
 			)?;
@@ -142,11 +143,22 @@ pub async fn update(
 			format!("unsupported protocol_version {}", req.protocol_version),
 		));
 	}
+	if req.require_approval.is_some() && req.inherit_require_approval {
+		return Err((
+			StatusCode::BAD_REQUEST,
+			"require_approval and inherit_require_approval are mutually exclusive".into(),
+		));
+	}
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 	let patch = RepoUpdate {
 		disabled: req.disabled,
 		scan_interval_seconds: req.scan_interval_seconds.map(|v| v as i64),
 		verification_enabled: req.verification_enabled,
+		require_approval: if req.inherit_require_approval {
+			Some(None)
+		} else {
+			req.require_approval.map(Some)
+		},
 	};
 	let updated = state
 		.db

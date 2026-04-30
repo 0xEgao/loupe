@@ -156,6 +156,7 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: false,
+			require_approval: None,
 		})
 		.send()
 		.await

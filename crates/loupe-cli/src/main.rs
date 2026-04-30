@@ -85,6 +85,19 @@ struct RepoUpdateArgs {
 	/// Dispatch findings immediately on insert; skip the verify flow.
 	#[arg(long, conflicts_with = "verification_enabled")]
 	no_verification: bool,
+	/// Pin require_approval = true for this repo. Confirmed findings
+	/// park in `awaiting_approval` until a human runs `loupectl
+	/// finding approve`.
+	#[arg(long, conflicts_with_all = ["no_require_approval", "inherit_approval"])]
+	require_approval: bool,
+	/// Pin require_approval = false for this repo (immediate dispatch
+	/// even if the server default is on).
+	#[arg(long, conflicts_with_all = ["require_approval", "inherit_approval"])]
+	no_require_approval: bool,
+	/// Clear any per-repo override and fall back to the server-level
+	/// `require_approval_default`.
+	#[arg(long, conflicts_with_all = ["require_approval", "no_require_approval"])]
+	inherit_approval: bool,
 }
 
 #[derive(Debug, Args)]
@@ -109,6 +122,14 @@ struct RepoAddArgs {
 	/// verifier worker to confirm each finding.
 	#[arg(long, default_value_t = false)]
 	verification_enabled: bool,
+	/// Pin per-repo require_approval = true at registration time.
+	#[arg(long, conflicts_with = "no_require_approval")]
+	require_approval: bool,
+	/// Pin per-repo require_approval = false at registration time.
+	/// If neither flag is set, the repo inherits the server-level
+	/// `require_approval_default`.
+	#[arg(long, conflicts_with = "require_approval")]
+	no_require_approval: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -136,6 +157,13 @@ enum FindingCmd {
 	List { repo_id: i64 },
 	/// Print a single finding in full detail (description + PoC + patch).
 	Get { id: i64 },
+	/// Approve a finding parked in `awaiting_approval`. Transitions
+	/// it to `confirmed` and immediately runs the dispatcher.
+	Approve { id: i64 },
+	/// Reject a finding parked in `awaiting_approval`. Transitions
+	/// it to terminal `dismissed` with the rejection audit trail
+	/// stamped (distinct from a verifier-issued dismiss).
+	Reject { id: i64 },
 }
 
 #[tokio::main]
@@ -167,6 +195,8 @@ async fn main() -> Result<()> {
 				finding_list(&client, &cli.conn.server_url, repo_id).await
 			},
 			FindingCmd::Get { id } => finding_get(&client, &cli.conn.server_url, id).await,
+			FindingCmd::Approve { id } => finding_approve(&client, &cli.conn.server_url, id).await,
+			FindingCmd::Reject { id } => finding_reject(&client, &cli.conn.server_url, id).await,
 		},
 	}
 }
@@ -201,6 +231,11 @@ fn url(base: &reqwest::Url, path: &str) -> reqwest::Url {
 }
 
 async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs) -> Result<()> {
+	let require_approval = match (a.require_approval, a.no_require_approval) {
+		(true, false) => Some(true),
+		(false, true) => Some(false),
+		_ => None,
+	};
 	let req = RegisterRepoRequest {
 		protocol_version: PROTOCOL_VERSION,
 		clone_url: a.clone_url,
@@ -213,6 +248,7 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 		},
 		scanner_config: serde_json::Value::Null,
 		verification_enabled: a.verification_enabled,
+		require_approval,
 	};
 	let resp = client.post(url(base, "/v1/repos")).json(&req).send().await?;
 	let status = resp.status();
@@ -255,11 +291,18 @@ async fn repo_update(
 		(false, true) => Some(false),
 		_ => None,
 	};
+	let require_approval = match (a.require_approval, a.no_require_approval) {
+		(true, false) => Some(true),
+		(false, true) => Some(false),
+		_ => None,
+	};
 	let req = UpdateRepoRequest {
 		protocol_version: PROTOCOL_VERSION,
 		disabled,
 		scan_interval_seconds: a.interval,
 		verification_enabled,
+		require_approval,
+		inherit_require_approval: a.inherit_approval,
 	};
 	let resp = client.patch(url(base, &format!("/v1/repos/{}", a.id))).json(&req).send().await?;
 	let status = resp.status();
@@ -363,5 +406,23 @@ async fn finding_get(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> 
 	let resp = client.get(url(base, &format!("/v1/findings/{id}"))).send().await?;
 	let detail: FindingDetail = resp.error_for_status()?.json().await?;
 	println!("{}", serde_json::to_string_pretty(&detail)?);
+	Ok(())
+}
+
+async fn finding_approve(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
+	let resp = client.post(url(base, &format!("/v1/findings/{id}/approve"))).send().await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!("approve finding: {} — {}", status, resp.text().await.unwrap_or_default());
+	}
+	Ok(())
+}
+
+async fn finding_reject(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
+	let resp = client.post(url(base, &format!("/v1/findings/{id}/reject"))).send().await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!("reject finding: {} — {}", status, resp.text().await.unwrap_or_default());
+	}
 	Ok(())
 }

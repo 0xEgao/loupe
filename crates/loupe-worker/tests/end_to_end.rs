@@ -109,6 +109,7 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: false,
+			require_approval: None,
 		})
 		.send()
 		.await

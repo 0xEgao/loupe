@@ -13,6 +13,6 @@ pub mod routes;
 pub mod state;
 pub mod tls;
 
-pub use config::Config;
+pub use config::{Config, FileConfig};
 pub use router::{router, serve, PeerCert, ServeHandle};
 pub use state::AppState;

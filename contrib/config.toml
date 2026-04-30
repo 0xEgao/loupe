@@ -1,0 +1,36 @@
+# Sample loupe-server config. Settings here act as defaults; matching
+# CLI flags or env vars override them at startup.
+#
+# Drop this next to your data directory (e.g. /var/lib/loupe/) and
+# point the server at it with `loupe-server serve --config
+# /var/lib/loupe/config.toml` (or `LOUPE_CONFIG=/var/lib/loupe/config.toml`).
+#
+# Path-typed fields are interpreted relative to the directory holding
+# this file, so a single file can ship next to certs and the SQLite
+# database without forcing absolute paths.
+
+[server]
+# TCP socket the mTLS listener binds to. Default: "127.0.0.1:8443".
+bind = "127.0.0.1:8443"
+
+[paths]
+# All paths are relative to the directory containing this config
+# file. The names below match what `loupe-server init --data-dir
+# /var/lib/loupe` writes out, so the simplest deployment is to keep
+# config.toml alongside the data directory.
+db          = "loupe.sqlite"
+server_cert = "server.pem"
+server_key  = "server.key"
+ca_cert     = "ca.pem"
+ca_key      = "ca.key"
+
+[policy]
+# Server-wide default for the human-in-the-loop approval gate. When
+# `true`, confirmed findings (auto-pass or verifier-confirmed) park
+# in `awaiting_approval` until a human runs `loupectl finding
+# approve <id>`. Per-repo `require_approval` overrides this, so you
+# can enable approval globally and still mark trusted repos as
+# auto-dispatch via `loupectl repo update <id> --no-require-approval`.
+#
+# Default when unset: false (immediate dispatch).
+require_approval_default = false

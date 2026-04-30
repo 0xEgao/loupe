@@ -122,6 +122,12 @@ CREATE TABLE registered_repos (
     -- extra round-trip for repos that don't have a verifier worker
     -- pool to pick the verify jobs up.
     verification_enabled    INTEGER NOT NULL DEFAULT 0,
+    -- Tri-state approval gate. NULL → inherit the server-level
+    -- default (`require_approval_default`). 0/1 → explicit per-repo
+    -- override. When the effective value is true, confirmed findings
+    -- park in `awaiting_approval` until a human runs `loupectl
+    -- finding approve <id>` (or rejects with `finding reject`).
+    require_approval        INTEGER,
     last_scanned_sha        TEXT,
     last_scanned_at         INTEGER,
     created_at              INTEGER NOT NULL,
@@ -171,13 +177,21 @@ CREATE TABLE findings (
     poc_unified             TEXT,
     fingerprint             TEXT    NOT NULL,
     state                   TEXT    NOT NULL DEFAULT 'pending'
-                                CHECK (state IN ('pending','validating','confirmed','dismissed','reported')),
+                                CHECK (state IN ('pending','validating','awaiting_approval','confirmed','dismissed','reported')),
     verification_required   INTEGER NOT NULL DEFAULT 1,
     validating_deadline     INTEGER,
     created_at              INTEGER NOT NULL,
     confirmed_at            INTEGER,
     dismissed_at            INTEGER,
     reported_at             INTEGER,
+    -- Audit trail for the human-in-the-loop approval gate. Stamped
+    -- when an admin runs `loupectl finding approve` / `reject` on a
+    -- finding sitting in `awaiting_approval`. `*_by_cn` carries the
+    -- workers.name of the admin client cert that made the call.
+    approved_at             INTEGER,
+    approved_by_cn          TEXT,
+    rejected_at             INTEGER,
+    rejected_by_cn          TEXT,
     UNIQUE(repo_id, fingerprint)
 );
 CREATE INDEX idx_findings_job   ON findings(job_id);

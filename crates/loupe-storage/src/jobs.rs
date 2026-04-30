@@ -269,6 +269,7 @@ mod tests {
 							pat_secret_id: secret_id,
 						},
 						verification_enabled: false,
+						require_approval: None,
 					},
 					0,
 				)?)
