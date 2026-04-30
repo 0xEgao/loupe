@@ -258,53 +258,72 @@ impl RepoCache {
 		Ok(())
 	}
 
+	/// Clone via the `git` CLI rather than libgit2.
+	///
+	/// libgit2's `file://` transport doesn't use the local-clone fast
+	/// path that git CLI does (hardlink pack files, copy refs verbatim).
+	/// On a 538MB ldk-node clone that's the difference between
+	/// **~0.4s** (git CLI) and **~7m** (libgit2). HTTPS clones are also
+	/// modestly faster via git CLI (parallel delta resolution, bitmap
+	/// support) but the gap there is single-digit-x rather than 1000x.
+	///
+	/// Auth: when a token is provided, embed it in the URL as
+	/// `https://x-access-token:TOKEN@host/...`. The token is briefly
+	/// visible in the git subprocess's `argv` (and thus to `ps -ef` on
+	/// the same host) for the duration of the clone — the same level
+	/// of in-memory exposure libgit2's `userpass_plaintext` callback
+	/// produced. A future hardening pass can switch to a credential
+	/// helper if that's not acceptable.
 	fn clone_bare(path: &Path, clone_url: &str, token: Option<&str>) -> Result<()> {
-		let mut callbacks = git2::RemoteCallbacks::new();
-		if let Some(token) = token {
-			let token = token.to_string();
-			callbacks.credentials(move |_url, _username, _allowed| {
-				git2::Cred::userpass_plaintext("x-access-token", &token)
-			});
-		}
-		let mut fetch_opts = git2::FetchOptions::new();
-		fetch_opts.remote_callbacks(callbacks);
-		let mut builder = git2::build::RepoBuilder::new();
-		builder.bare(true);
-		builder.fetch_options(fetch_opts);
-		builder.clone(clone_url, path).map_err(|e| {
-			anyhow::anyhow!(
-				"git2 clone {} failed: {} (class={}, code={})",
+		let url_with_token = inject_token(clone_url, token);
+		let output = std::process::Command::new("git")
+			.arg("clone")
+			.arg("--bare")
+			.arg("--quiet")
+			.arg(url_with_token.as_str())
+			.arg(path)
+			.output()
+			.context("spawning git clone")?;
+		if !output.status.success() {
+			let stderr = String::from_utf8_lossy(&output.stderr);
+			anyhow::bail!(
+				"git clone {} → {} failed ({}): {}",
 				clone_url,
-				e.message(),
-				e.class() as i32,
-				e.code() as i32,
-			)
-		})?;
+				path.display(),
+				output.status,
+				stderr.trim(),
+			);
+		}
 		Ok(())
 	}
 
+	/// Fetch new objects + refs from `origin` into a previously-cloned
+	/// bare repo. Uses the git CLI for the same reason as
+	/// `clone_bare` — local-transport fast path, fewer surprises.
 	fn fetch_bare(path: &Path, token: Option<&str>) -> Result<()> {
-		let git_repo = git2::Repository::open_bare(path)
-			.with_context(|| format!("failed to open bare repo at {}", path.display()))?;
-		let mut remote =
-			git_repo.find_remote("origin").context("no 'origin' remote in cached bare repo")?;
-
-		let mut callbacks = git2::RemoteCallbacks::new();
-		if let Some(token) = token {
-			let token = token.to_string();
-			callbacks.credentials(move |_url, _username, _allowed| {
-				git2::Cred::userpass_plaintext("x-access-token", &token)
-			});
+		// `git fetch origin` uses whatever URL is configured for
+		// `origin`. To inject a token without rewriting the stored
+		// remote URL on disk, we override it via `-c` for this one
+		// invocation. The override doesn't persist.
+		let mut cmd = std::process::Command::new("git");
+		cmd.current_dir(path);
+		if let Some(stored_url) = read_origin_url(path).ok().flatten() {
+			let with_token = inject_token(&stored_url, token);
+			if with_token.as_str() != stored_url {
+				cmd.args(["-c", &format!("remote.origin.url={}", with_token.as_str())]);
+			}
 		}
-		let mut fetch_opts = git2::FetchOptions::new();
-		fetch_opts.remote_callbacks(callbacks);
-
-		let refspecs: Vec<String> =
-			remote.refspecs().filter_map(|r| r.str().map(String::from)).collect();
-		let refspec_strs: Vec<&str> = refspecs.iter().map(|s| s.as_str()).collect();
-		remote
-			.fetch(&refspec_strs, Some(&mut fetch_opts), None)
-			.context("fetch from origin failed")?;
+		cmd.args(["fetch", "--quiet", "--prune", "--tags", "origin"]);
+		let output = cmd.output().context("spawning git fetch")?;
+		if !output.status.success() {
+			let stderr = String::from_utf8_lossy(&output.stderr);
+			anyhow::bail!(
+				"git fetch in {} failed ({}): {}",
+				path.display(),
+				output.status,
+				stderr.trim(),
+			);
+		}
 		Ok(())
 	}
 
@@ -386,6 +405,51 @@ fn decode_cursor(bytes: &[u8]) -> Option<String> {
 	}
 }
 
+/// Read the URL configured for `origin` in a bare repo. Returns
+/// `Ok(None)` if there's no `origin` remote (or the config doesn't
+/// parse), `Err` only on outright invocation failure.
+fn read_origin_url(bare_path: &Path) -> Result<Option<String>> {
+	let output = std::process::Command::new("git")
+		.current_dir(bare_path)
+		.args(["config", "--get", "remote.origin.url"])
+		.output()
+		.context("spawning git config")?;
+	if !output.status.success() {
+		// `git config --get` exits 1 when the key is missing — that's
+		// not an error from our perspective.
+		return Ok(None);
+	}
+	let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+	if url.is_empty() {
+		Ok(None)
+	} else {
+		Ok(Some(url))
+	}
+}
+
+/// For an HTTPS clone URL, inject a `x-access-token:TOKEN` basic-auth
+/// userinfo so the git subprocess authenticates without us touching
+/// the credential helper. For non-HTTPS URLs (file://, ssh://, etc.)
+/// or when no token is provided, returns the URL unchanged.
+///
+/// Token leak surface: the resulting URL is in the subprocess's argv
+/// (or `-c` value, in the fetch path) for the duration of the clone /
+/// fetch, visible to a `ps` on the same host. Same exposure libgit2's
+/// in-process credential callback offered (the credential is in
+/// process memory either way). Acceptable on a single-tenant worker;
+/// shared hosts should switch to a credential helper.
+fn inject_token(url: &str, token: Option<&str>) -> String {
+	let Some(token) = token else { return url.to_owned() };
+	if let Some(rest) = url.strip_prefix("https://") {
+		format!("https://x-access-token:{token}@{rest}")
+	} else if let Some(rest) = url.strip_prefix("http://") {
+		format!("http://x-access-token:{token}@{rest}")
+	} else {
+		// file://, ssh://, local paths — token doesn't apply.
+		url.to_owned()
+	}
+}
+
 /// Recursively compute the size of a directory in bytes.
 pub fn dir_size(path: &Path) -> u64 {
 	let mut total = 0u64;
@@ -404,6 +468,28 @@ pub fn dir_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn inject_token_rewrites_https_only() {
+		// HTTPS gets userinfo injected.
+		assert_eq!(
+			inject_token("https://github.com/acme/widget.git", Some("ghp_abc")),
+			"https://x-access-token:ghp_abc@github.com/acme/widget.git",
+		);
+		// HTTP same shape (loupe-server rejects http registration but the
+		// helper doesn't care).
+		assert_eq!(
+			inject_token("http://example.com/a/b", Some("t")),
+			"http://x-access-token:t@example.com/a/b",
+		);
+		// file:// passes through — no auth applies.
+		assert_eq!(inject_token("file:///home/me/repo", Some("t")), "file:///home/me/repo",);
+		// No token = unchanged.
+		assert_eq!(
+			inject_token("https://github.com/acme/widget.git", None),
+			"https://github.com/acme/widget.git",
+		);
+	}
 
 	#[test]
 	fn repo_path_includes_host() {
