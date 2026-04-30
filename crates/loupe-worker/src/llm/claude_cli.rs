@@ -23,6 +23,17 @@ use crate::sandbox::SandboxBuilder;
 const BACKEND_ID: &str = "claude-cli";
 const CLAUDE_BIN: &str = "claude";
 
+/// Cap a borrow at `n` chars; appends an ellipsis if the original was
+/// longer. Used to keep error messages from blowing up when the CLI
+/// dumps multi-MB diagnostics on a non-zero exit.
+fn truncate(s: &str, n: usize) -> String {
+	let mut buf: String = s.chars().take(n).collect();
+	if s.chars().nth(n).is_some() {
+		buf.push('…');
+	}
+	buf.replace('\n', " ")
+}
+
 pub struct ClaudeCliBackend {
 	bin: String,
 }
@@ -126,14 +137,26 @@ impl LlmBackend for ClaudeCliBackend {
 
 		if !status.success() {
 			let stderr_text = String::from_utf8_lossy(&stderr);
+			let stdout_text = String::from_utf8_lossy(&stdout);
 			tracing::debug!(
 				backend = BACKEND_ID,
 				exit = ?status.code(),
+				stdout_chars = stdout.len(),
 				stderr_chars = stderr.len(),
 				elapsed_ms = started.elapsed().as_millis() as u64,
 				"claude-cli: subprocess failed",
 			);
-			return Err(anyhow!("claude CLI exited with {}: {}", status, stderr_text.trim()));
+			// Some CLIs (claude included) print "please log in" /
+			// auth-error messages to stdout, not stderr — surface
+			// both so the operator's log shows whichever the CLI
+			// chose. Trim and truncate so a multi-MB diagnostic dump
+			// doesn't drown the log line.
+			let combined = format!(
+				"stderr=`{}` stdout=`{}`",
+				truncate(&stderr_text, 400),
+				truncate(&stdout_text, 400),
+			);
+			return Err(anyhow!("claude CLI exited with {}: {}", status, combined));
 		}
 
 		let text = String::from_utf8(stdout)

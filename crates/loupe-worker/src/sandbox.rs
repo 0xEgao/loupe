@@ -170,6 +170,16 @@ impl SandboxBuilder {
 
 		cmd.args(["--proc", "/proc", "--dev", "/dev"]);
 
+		// Fresh tmpfs for /tmp and a new $HOME. *Must* come before
+		// any extra_ro_binds that target paths inside /home/scanner —
+		// bwrap processes args in order and a tmpfs mounted on top of
+		// a prior bind hides it. Putting the tmpfs first lets caller
+		// binds (e.g. ~/.claude.json → /home/scanner/.claude.json)
+		// overlay the tmpfs and stay visible.
+		cmd.args(["--tmpfs", "/tmp", "--tmpfs", "/home/scanner"]);
+		cmd.args(["--setenv", "HOME", "/home/scanner"]);
+		cmd.args(["--setenv", "TMPDIR", "/tmp"]);
+
 		// Caller-supplied read-only binds (binary install dirs, agent
 		// config dirs, etc.). Use `--ro-bind-try` so a missing src
 		// path is a no-op rather than a fatal — handy when binding an
@@ -181,11 +191,6 @@ impl SandboxBuilder {
 		// Worktree: read-only.
 		cmd.arg("--ro-bind").arg(&self.workdir).arg("/workdir");
 		cmd.args(["--chdir", "/workdir"]);
-
-		// Fresh tmpfs for /tmp and a new $HOME.
-		cmd.args(["--tmpfs", "/tmp", "--tmpfs", "/home/scanner"]);
-		cmd.args(["--setenv", "HOME", "/home/scanner"]);
-		cmd.args(["--setenv", "TMPDIR", "/tmp"]);
 
 		// Forwarded env vars. Skip those that aren't set on the host.
 		for name in &self.forward_env {
@@ -366,6 +371,40 @@ mod tests {
 		b.disabled = true;
 		let cmd = b.build("/bin/echo");
 		assert_eq!(cmd.as_std().get_program(), "/bin/echo");
+	}
+
+	#[tokio::test]
+	async fn bind_ro_under_tmpfs_home_remains_visible() {
+		// Regression: bwrap processes args in order, so a tmpfs
+		// emitted *after* a bind on a path inside that tmpfs will
+		// hide the bind. We emit tmpfs first; this test pins that
+		// ordering by binding a marker file into /home/scanner and
+		// reading it back from inside the sandbox.
+		if !bwrap_present() {
+			eprintln!("skipping: bwrap not installed");
+			return;
+		}
+		let workdir = tempfile::tempdir().unwrap();
+		let marker_dir = tempfile::tempdir().unwrap();
+		let marker_path = marker_dir.path().join("creds");
+		std::fs::write(&marker_path, b"hello-from-host").unwrap();
+
+		let out = SandboxBuilder::new(workdir.path())
+			.bind_ro(marker_path, "/home/scanner/creds")
+			.build("/bin/sh")
+			.arg("-c")
+			.arg("cat /home/scanner/creds")
+			.output()
+			.await
+			.unwrap();
+		assert!(
+			out.status.success(),
+			"exit: {}, stderr: {}",
+			out.status,
+			String::from_utf8_lossy(&out.stderr),
+		);
+		let stdout = String::from_utf8_lossy(&out.stdout);
+		assert_eq!(stdout.trim(), "hello-from-host");
 	}
 
 	#[test]
