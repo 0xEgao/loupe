@@ -294,11 +294,13 @@ keep re-scans cheap:
 
 - **Semantic dedup (agent-driven):** every discovery session has the
   `query_prior_findings` and `get_finding_by_id` MCP tools. The
-  prompt asks the agent to search for prior reports of the bug it's
-  about to flag and skip submission on a clear match. Catches
-  paraphrases, refactor-shifted bugs (function moved to a different
-  file), and renamed functions. Conservative — only suppresses on
-  a clear match.
+  prompt asks the agent to enumerate *every* exploitable bug in the
+  file (severity-ordered) and search for prior reports before
+  submitting each — a duplicate hit suppresses *that one* candidate
+  and the agent moves on to the next, so a re-scan still surfaces
+  bugs ranked below an already-reported finding. Catches paraphrases,
+  refactor-shifted bugs (function moved to a different file), and
+  renamed functions. Conservative — only suppresses on a clear match.
 - **Hash dedup (free, server-side):** every finding carries a
   `blake3(scanner_id | file | normalized_content_window)`
   fingerprint. The `findings` table has `UNIQUE(repo_id,

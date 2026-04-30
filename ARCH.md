@@ -117,14 +117,18 @@ A finding's journey from "agent saw something" to "human looked at it":
    │   prompt: DISCOVERY             │   │
    │   ┌── one agent session ──────┐ │   │   agent fan-out
    │   │ • read /workdir/{file}    │ │   │
-   │   │ • query_prior_findings    │ │   │     (semantic dedup)
-   │   │ • get_finding_by_id       │ │   │     (compare bodies)
-   │   │ • generate PoC diff       │ │   │
-   │   │ • validate_poc            │ │   │     (`git apply --check`)
-   │   │ • submit_finding ─────────┼─┼───┼──── mTLS to loupe-server
-   │   └───────────────────────────┘ │   │     POST /v1/jobs/{id}/findings
-   │   wait for session exit         │   │     (one finding per call)
-   │ scanner returns Vec::new()      │   │
+   │   │ • enumerate every real    │ │   │
+   │   │   bug, severity-ordered   │ │   │
+   │   │ for each candidate:       │ │   │
+   │   │   • query_prior_findings  │ │   │   (semantic dedup;
+   │   │   • get_finding_by_id     │ │   │    dup → skip *this* one,
+   │   │     (on a hit)            │ │   │    keep iterating)
+   │   │   • generate PoC diff     │ │   │
+   │   │   • validate_poc          │ │   │   (`git apply --check`)
+   │   │   • submit_finding ───────┼─┼───┼─── mTLS to loupe-server
+   │   └───────────────────────────┘ │   │   POST /v1/jobs/{id}/findings
+   │   wait for session exit         │   │   (one call per finding;
+   │ scanner returns Vec::new()      │   │    multiple per session OK)
    │   (submission already happened) │   │
    └─────────────────────────────────┘   │
                   │
