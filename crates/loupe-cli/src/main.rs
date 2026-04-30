@@ -3,6 +3,8 @@
 //! Authenticates with the admin client cert minted by `loupe-server
 //! init`. Every command is one round-trip; the CLI does no caching.
 
+mod render;
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -155,8 +157,15 @@ enum JobCmd {
 enum FindingCmd {
 	/// List recent findings for a repo (newest first, capped server-side).
 	List { repo_id: i64 },
-	/// Print a single finding in full detail (description + PoC + patch).
-	Get { id: i64 },
+	/// Pretty-print a single finding for human review: title + severity,
+	/// location, description, PoC diff, and audit trail. Pass `--json`
+	/// to dump the raw FindingDetail DTO instead (for scripting).
+	Show {
+		id: i64,
+		/// Output the raw JSON DTO instead of the pretty rendering.
+		#[arg(long, default_value_t = false)]
+		json: bool,
+	},
 	/// Approve a finding parked in `awaiting_approval`. Transitions
 	/// it to `confirmed` and immediately runs the dispatcher.
 	Approve { id: i64 },
@@ -194,7 +203,9 @@ async fn main() -> Result<()> {
 			FindingCmd::List { repo_id } => {
 				finding_list(&client, &cli.conn.server_url, repo_id).await
 			},
-			FindingCmd::Get { id } => finding_get(&client, &cli.conn.server_url, id).await,
+			FindingCmd::Show { id, json } => {
+				finding_show(&client, &cli.conn.server_url, id, json).await
+			},
 			FindingCmd::Approve { id } => finding_approve(&client, &cli.conn.server_url, id).await,
 			FindingCmd::Reject { id } => finding_reject(&client, &cli.conn.server_url, id).await,
 		},
@@ -402,10 +413,16 @@ async fn finding_list(client: &reqwest::Client, base: &reqwest::Url, repo_id: i6
 	Ok(())
 }
 
-async fn finding_get(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
+async fn finding_show(
+	client: &reqwest::Client, base: &reqwest::Url, id: i64, as_json: bool,
+) -> Result<()> {
 	let resp = client.get(url(base, &format!("/v1/findings/{id}"))).send().await?;
 	let detail: FindingDetail = resp.error_for_status()?.json().await?;
-	println!("{}", serde_json::to_string_pretty(&detail)?);
+	if as_json {
+		println!("{}", serde_json::to_string_pretty(&detail)?);
+	} else {
+		print!("{}", render::finding(&detail, render::Style::detect()));
+	}
 	Ok(())
 }
 

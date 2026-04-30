@@ -233,7 +233,8 @@ stamping `reported_at` on the finding row.
 loupectl job list
 loupectl job get  <job-id>
 loupectl finding list <repo-id>
-loupectl finding get  <finding-id>     # full body, PoC, patch
+loupectl finding show <finding-id>     # pretty-printed for human review
+loupectl finding show <finding-id> --json   # raw FindingDetail DTO
 ```
 
 ### 8. Adjust an existing repo
@@ -274,10 +275,24 @@ hitting the reporter. The operator handles it with:
 
 ```
 loupectl finding list <repo-id>                 # state=awaiting_approval
-loupectl finding get  <finding-id>              # full body, PoC, patch
+loupectl finding show <finding-id>              # pretty: title, severity,
+                                                #   location, description,
+                                                #   PoC diff (regression test
+                                                #   that fails on HEAD)
+loupectl finding show <finding-id> --json       # raw DTO for scripting
 loupectl finding approve <finding-id>           # → confirmed → dispatched
 loupectl finding reject  <finding-id>           # → terminal dismissed
 ```
+
+`finding show` is the review surface: it renders the model's
+description, the location of the suspect code, and — most
+importantly — the **proof-of-concept regression test** as a unified
+diff (with `+`/`-` colored like `git diff` when stdout is a TTY). The
+PoC is the strongest evidence the finding is real: applying the diff
+against a fresh worktree and running the test should fail on HEAD.
+`--json` falls back to the raw `FindingDetail` DTO when you need
+machine-readable output. `NO_COLOR=1` (or piping into a non-TTY)
+suppresses ANSI escapes.
 
 `approve` runs the dispatcher synchronously, so the issue is filed
 the moment the call returns. `reject` is terminal; the audit columns

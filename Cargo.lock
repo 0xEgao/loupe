@@ -1025,6 +1025,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "loupe-core",
  "loupe-proto",
  "reqwest",
  "serde_json",
