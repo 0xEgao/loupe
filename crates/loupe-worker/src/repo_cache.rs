@@ -177,18 +177,31 @@ impl RepoCache {
 		let _guard = lock.lock().await;
 
 		if path.exists() {
+			info!(host = %key.host, owner = %key.owner, repo = %key.repo, "fetching repo updates");
 			let fp = path.clone();
 			let ft = token.map(String::from);
+			let started = std::time::Instant::now();
 			let res =
 				tokio::task::spawn_blocking(move || Self::fetch_bare(&fp, ft.as_deref())).await?;
 			match res {
 				Ok(()) => {
-					debug!(host = %key.host, owner = %key.owner, repo = %key.repo, "fetched updates")
+					info!(
+						host = %key.host, owner = %key.owner, repo = %key.repo,
+						elapsed_ms = started.elapsed().as_millis() as u64,
+						"fetched repo updates",
+					);
 				},
 				Err(e) => {
 					warn!(host = %key.host, owner = %key.owner, repo = %key.repo, error = %e, "cached repo corrupted, re-cloning");
 					let _ = std::fs::remove_dir_all(&path);
+					info!(host = %key.host, owner = %key.owner, repo = %key.repo, "cloning bare repo");
+					let started = std::time::Instant::now();
 					self.do_clone(&path, clone_url, token).await?;
+					info!(
+						host = %key.host, owner = %key.owner, repo = %key.repo,
+						elapsed_ms = started.elapsed().as_millis() as u64,
+						"cloned bare repo",
+					);
 				},
 			}
 		} else {
@@ -198,8 +211,14 @@ impl RepoCache {
 					format!("failed to create cache parent dir: {}", parent.display())
 				})?;
 			}
+			info!(host = %key.host, owner = %key.owner, repo = %key.repo, "cloning bare repo (cold cache)");
+			let started = std::time::Instant::now();
 			self.do_clone(&path, clone_url, token).await?;
-			info!(host = %key.host, owner = %key.owner, repo = %key.repo, "cloned new bare repo");
+			info!(
+				host = %key.host, owner = %key.owner, repo = %key.repo,
+				elapsed_ms = started.elapsed().as_millis() as u64,
+				"cloned bare repo",
+			);
 		}
 
 		if let Ok(mut log) = self.access_log.lock() {

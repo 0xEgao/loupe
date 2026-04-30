@@ -188,8 +188,15 @@ impl Runner {
 				Ok((head_sha, 0))
 			},
 			LeasePayload::Scan { since_sha } => {
+				tracing::info!(job_id = env.job_id, "checking out worktree");
 				let (workdir, head_sha) = checkout(&bare, env.head_branch.as_deref()).await?;
 				let workdir_size = crate::repo_cache::dir_size(workdir.path());
+				tracing::info!(
+					job_id = env.job_id,
+					head_sha = %head_sha,
+					workdir_bytes = workdir_size,
+					"worktree ready"
+				);
 				if workdir_size > self.max_workdir_bytes {
 					anyhow::bail!(
 						"checkout size {workdir_size} bytes exceeds max_workdir_bytes {}",
@@ -207,8 +214,17 @@ impl Runner {
 
 				let mut all = Vec::new();
 				for s in &self.scanners {
+					tracing::info!(job_id = env.job_id, scanner = s.id(), "running scanner");
 					match s.scan(&ctx).await {
-						Ok(mut findings) => all.append(&mut findings),
+						Ok(mut findings) => {
+							tracing::info!(
+								job_id = env.job_id,
+								scanner = s.id(),
+								findings = findings.len(),
+								"scanner finished",
+							);
+							all.append(&mut findings);
+						},
 						Err(e) => tracing::warn!(scanner = s.id(), error = %e, "scanner failed"),
 					}
 				}
