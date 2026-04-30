@@ -75,11 +75,14 @@ impl Scanner for LlmVerifierScanner {
 			timeout: crate::llm::DEFAULT_REQUEST_TIMEOUT,
 			cancel: ctx.cancel.clone(),
 			repo_id: Some(ctx.repo_id),
+			// Verify flow doesn't submit findings via MCP — it
+			// returns a Verdict to the runner instead — so
+			// `submit_finding` is intentionally unavailable here.
+			job_id: None,
 		};
 		let resp = self.backend.run(req).await?;
 
-		let json = crate::scanners::llm_code_review::extract_json_object(&resp.text)
-			.unwrap_or_else(|| resp.text.clone());
+		let json = crate::llm::extract_json_object(&resp.text).unwrap_or_else(|| resp.text.clone());
 		let raw: VerifyRaw = serde_json::from_str(&json).map_err(|e| {
 			anyhow::anyhow!(
 				"verify response did not parse as VerifyRaw JSON: {e}; got: {}",

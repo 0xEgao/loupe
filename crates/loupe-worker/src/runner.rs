@@ -208,6 +208,7 @@ impl Runner {
 					workdir: workdir.path().to_path_buf(),
 					repo: env.repo.clone(),
 					repo_id: env.repo_id,
+					job_id: env.job_id,
 					head_sha: head_sha.clone(),
 					base_sha: since_sha,
 					config: env.scanner_config,

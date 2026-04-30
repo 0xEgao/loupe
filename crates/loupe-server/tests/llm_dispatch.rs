@@ -14,9 +14,10 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use git2::{Repository, Signature};
+use loupe_core::{Finding, Severity};
 use loupe_proto::{
-	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	ScanRequest, PROTOCOL_VERSION,
+	FindingsBatch, RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse,
+	ReportingSetup, ScanRequest, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
 use loupe_server::reporters::GithubReporter;
@@ -24,7 +25,6 @@ use loupe_server::{serve, AppState, Config};
 use loupe_storage::Db;
 use loupe_tls::Ca;
 use loupe_worker::llm::testing::StubLlmBackend;
-use loupe_worker::llm::LlmRequest;
 use loupe_worker::scanners::LlmCodeReviewScanner;
 use loupe_worker::{RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
@@ -203,15 +203,45 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 		.await
 		.unwrap();
 
-	// Stub LLM backend: discovery returns one finding, validation
-	// confirms it with a small PoC diff. We tell the two prompts apart
-	// by the "validating a vulnerability report" phrase the validation
-	// template begins with.
-	let stub_backend = Arc::new(StubLlmBackend::new("stub", |req: &LlmRequest| {
-		if req.prompt.contains("validating a vulnerability report") {
-			Ok(r#"{"verdict":"confirmed","notes":"reproduced","poc_unified":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n+#[test] fn oob_panic() { idx(&[], 0); }\n"}"#.to_owned())
-		} else {
-			Ok(r#"{"found":true,"severity":"high","title":"Out-of-bounds index in idx","file":"src/lib.rs","line_start":1,"line_end":1,"description":"`idx` indexes the slice without bounds checking, causing a panic on empty input.","cwe":"CWE-129"}"#.to_owned())
+	// Stub LLM backend simulating one agent session per file. In
+	// production the agent's MCP `submit_finding` tool POSTs to
+	// `/v1/jobs/{job_id}/findings`; the stub mirrors that by calling
+	// `submit_findings` directly on the worker's mTLS-cert-bearing
+	// ServerClient. Body content is canned but the route, auth, and
+	// downstream pipeline (insert → reporting dispatch) are real.
+	let server_client_for_stub = server_client.clone();
+	let stub_backend = Arc::new(StubLlmBackend::new_async("stub", move |req| {
+		let server_client = server_client_for_stub.clone();
+		async move {
+			let job_id = req.job_id.expect("test stub requires job_id (one-pass agent flow)");
+			let finding = Finding {
+				scanner_id: "llm-code-review".into(),
+				severity: Severity::High,
+				title: "Out-of-bounds index in idx".into(),
+				description:
+					"`idx` indexes the slice without bounds checking, causing a panic on empty input."
+						.into(),
+				file_path: Some("src/lib.rs".into()),
+				line_start: Some(1),
+				line_end: Some(1),
+				cwe: Some("CWE-129".into()),
+				patch_unified: None,
+				poc_unified: Some(
+					"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n\
+					 +#[test] fn oob_panic() { idx(&[], 0); }\n"
+						.into(),
+				),
+				// Test fingerprint: the real MCP server computes this
+				// from the worktree, but here the path is short-cut.
+				// UNIQUE(repo_id, fingerprint) silently dedups so we
+				// don't care about cosmetic stability — only that
+				// it's stable within this test.
+				fingerprint: "test-fp-oob-idx".into(),
+			};
+			let batch =
+				FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![finding] };
+			server_client.submit_findings(job_id, &batch).await?;
+			Ok(String::new())
 		}
 	}));
 	let cache_dir = tempfile::tempdir().unwrap();

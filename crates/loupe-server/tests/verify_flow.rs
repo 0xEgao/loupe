@@ -17,9 +17,10 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use git2::{Repository, Signature};
+use loupe_core::{Finding, Severity};
 use loupe_proto::{
-	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	ScanRequest, PROTOCOL_VERSION,
+	FindingsBatch, RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse,
+	ReportingSetup, ScanRequest, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
 use loupe_server::reporters::GithubReporter;
@@ -200,20 +201,43 @@ async fn run_flow(
 		.await
 		.unwrap();
 
-	// Single stub backend used for both discovery and verification —
-	// keys on prompt content. Three branches:
-	//   * VALIDATE prompt (has the "validating a vulnerability report"
-	//     phrase): confirm with a tiny PoC diff.
-	//   * Anything else with "second opinion" phrasing → caller-supplied
-	//     verify_response.
-	//   * Otherwise: discovery — return one finding.
-	let backend = Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
-		if req.prompt.contains("validating a vulnerability report") {
-			Ok(r#"{"verdict":"confirmed","notes":"reproduced","poc_unified":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n+#[test] fn oob() { idx(&[], 0); }\n"}"#.to_owned())
-		} else if req.prompt.contains("independent second opinion") {
-			Ok(verify_response.to_owned())
-		} else {
-			Ok(r#"{"found":true,"severity":"high","title":"OOB index","file":"src/lib.rs","line_start":1,"line_end":1,"description":"unchecked index","cwe":"CWE-129"}"#.to_owned())
+	// Stub backend: two paths.
+	//   * Discovery (one-pass agent flow) — the agent's MCP
+	//     `submit_finding` tool is the only emit path; the stub
+	//     simulates it by POSTing directly to the server.
+	//   * Verify (still uses prompt+parse — the verifier scanner
+	//     hasn't been migrated to MCP yet) — returns the caller-
+	//     supplied verdict JSON in stdout for the verifier to parse.
+	let server_client_for_stub = server_client.clone();
+	let backend = Arc::new(StubLlmBackend::new_async("stub", move |req: LlmRequest| {
+		let server_client = server_client_for_stub.clone();
+		async move {
+			if req.prompt.contains("independent second opinion") {
+				return Ok(verify_response.to_owned());
+			}
+			// Discovery: simulate the agent calling submit_finding.
+			let job_id = req.job_id.expect("discovery sessions must carry a job_id");
+			let finding = Finding {
+				scanner_id: "llm-code-review".into(),
+				severity: Severity::High,
+				title: "OOB index".into(),
+				description: "unchecked index".into(),
+				file_path: Some("src/lib.rs".into()),
+				line_start: Some(1),
+				line_end: Some(1),
+				cwe: Some("CWE-129".into()),
+				patch_unified: None,
+				poc_unified: Some(
+					"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n\
+					 +#[test] fn oob() { idx(&[], 0); }\n"
+						.into(),
+				),
+				fingerprint: "test-fp-oob-idx".into(),
+			};
+			let batch =
+				FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![finding] };
+			server_client.submit_findings(job_id, &batch).await?;
+			Ok(String::new())
 		}
 	}));
 

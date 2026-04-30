@@ -87,6 +87,18 @@ struct McpServeArgs {
 	/// agent surface.
 	#[arg(long, env = "LOUPE_REPO_ID")]
 	repo_id: i64,
+	/// Job id the agent is currently working on. Required for the
+	/// `submit_finding` tool — submissions POST to
+	/// `/v1/jobs/{job_id}/findings`. When omitted (e.g. a future
+	/// read-only MCP usage) the tool is not advertised.
+	#[arg(long, env = "LOUPE_JOB_ID")]
+	job_id: Option<i64>,
+	/// Path to the worktree the agent is reasoning over. The MCP
+	/// server reads source files from here to compute fingerprints
+	/// for `submit_finding`. Inside the bwrap sandbox this is
+	/// `/workdir`; bare runs use the host worktree path.
+	#[arg(long, env = "LOUPE_WORKDIR")]
+	workdir: PathBuf,
 }
 
 #[tokio::main]
@@ -149,10 +161,9 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 			client_key_path: key.clone(),
 		};
 		let backend = Arc::new(ClaudeCliBackend::new().with_mcp_context(mcp_ctx));
-		scanners
-			.push(Arc::new(LlmCodeReviewScanner::new(backend).with_server_client(client.clone())));
+		scanners.push(Arc::new(LlmCodeReviewScanner::new(backend)));
 		tracing::info!(
-			"LLM code-review scanner enabled (MCP server attached per call, dedup pass on)"
+			"LLM code-review scanner enabled (agent owns submission via MCP submit_finding)"
 		);
 	}
 	let runner = Runner::new(client, cache, scanners);
@@ -179,8 +190,13 @@ async fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
 		.with_context(|| format!("reading worker key at {}", args.key.display()))?;
 
 	let client = Arc::new(ServerClient::new(&ca_cert_pem, &cert_pem, &key_pem, args.server_url)?);
-	tracing::info!(repo_id = args.repo_id, "loupe-mcp: starting stdio server");
-	mcp::run_stdio_server(client, args.repo_id).await
+	tracing::info!(
+		repo_id = args.repo_id,
+		job_id = ?args.job_id,
+		workdir = %args.workdir.display(),
+		"loupe-mcp: starting stdio server",
+	);
+	mcp::run_stdio_server(client, args.repo_id, args.job_id, args.workdir).await
 }
 
 /// Initialise tracing. Defaults to the human-readable formatter; set

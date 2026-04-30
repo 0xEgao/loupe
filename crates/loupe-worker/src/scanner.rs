@@ -30,6 +30,11 @@ pub struct ScanContext {
 	/// backends to scope MCP tool calls (e.g. `query_prior_findings`)
 	/// to this repo without relying on the agent to keep state.
 	pub repo_id: i64,
+	/// Server-side job id from the lease envelope. The agent's MCP
+	/// `submit_finding` tool uses it to POST findings to
+	/// `/v1/jobs/{job_id}/findings` directly — submission no longer
+	/// goes through the runner's batch call at end-of-scan.
+	pub job_id: i64,
 	pub head_sha: String,
 	pub base_sha: Option<String>,
 	pub config: serde_json::Value,

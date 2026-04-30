@@ -1,12 +1,20 @@
 //! LLM-driven code-review scanner.
 //!
-//! Pipeline: walk → discovery → dedup → validation → emit. Each
-//! stage in its own helper. The dedup pass uses
-//! `findings::known_fingerprints` (server-backed) to drop hash-
-//! matched candidates before paying validation LLM cost; the
-//! discovery prompt also tells the model about
-//! `query_prior_findings` so it can self-suppress on semantic
-//! matches the hash misses.
+//! Pipeline: walk source files → fan out one agent session per file →
+//! wait. Each session gets the full MCP tool surface — the agent reads
+//! the file, optionally cross-checks `query_prior_findings` /
+//! `get_finding_by_id` for duplicates, generates a regression-test
+//! PoC, and (only if it's confident) calls `submit_finding`. The MCP
+//! `submit_finding` tool POSTs straight to
+//! `/v1/jobs/{job_id}/findings`, so submissions land on the server
+//! before this scanner returns. The scanner's own return value is
+//! always an empty `Vec<Finding>` — its job is orchestration, not
+//! emission.
+//!
+//! Why no separate validation pass: the agent owns its own validation
+//! loop (it has tools to read prior findings and the worktree, and is
+//! asked to produce a regression-test PoC inline). A second worker-
+//! side parse would be a poor model of what the agent already did.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,17 +22,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use loupe_core::{Finding, Severity};
-use serde::Deserialize;
+use loupe_core::Finding;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::client::ServerClient;
-use crate::llm::prompts::{self, DISCOVERY, VALIDATE};
-use crate::llm::{LlmBackend, LlmRequest, LlmResponse, DEFAULT_REQUEST_TIMEOUT};
+use crate::llm::prompts::{self, DISCOVERY};
+use crate::llm::{LlmBackend, LlmRequest, DEFAULT_REQUEST_TIMEOUT};
 use crate::scanner::{ScanContext, Scanner};
 
-const SCANNER_ID: &str = "llm-code-review";
+pub const SCANNER_ID: &str = "llm-code-review";
 const CAPABILITIES: &[&str] = &["scan:llm"];
 
 /// Config knobs operators can set via the repo's `scanner_config`
@@ -158,30 +164,15 @@ fn default_excludes() -> Vec<String> {
 pub struct LlmCodeReviewScanner {
 	backend: Arc<dyn LlmBackend>,
 	config: ScannerConfig,
-	/// Optional handle to the server's findings DAO over HTTP. When
-	/// set, the scanner runs a hash-based dedup pass between
-	/// discovery and validation, dropping candidates whose
-	/// fingerprint already matches a prior finding on the same repo.
-	/// Skips paying validation LLM cost on duplicates. `None` (the
-	/// test path) makes the dedup pass a no-op.
-	client: Option<Arc<ServerClient>>,
 }
 
 impl LlmCodeReviewScanner {
 	pub fn new(backend: Arc<dyn LlmBackend>) -> Self {
-		Self { backend, config: ScannerConfig::default(), client: None }
+		Self { backend, config: ScannerConfig::default() }
 	}
 
 	pub fn with_config(mut self, config: ScannerConfig) -> Self {
 		self.config = config;
-		self
-	}
-
-	/// Plug in the server client used for the post-discovery dedup
-	/// pass. The runner does this when constructing the scanner;
-	/// stub-backend tests leave it unset.
-	pub fn with_server_client(mut self, client: Arc<ServerClient>) -> Self {
-		self.client = Some(client);
 		self
 	}
 }
@@ -216,100 +207,50 @@ impl Scanner for LlmCodeReviewScanner {
 		tracing::info!(
 			files = files.len(),
 			backend = self.backend.id(),
-			"llm-code-review starting discovery"
+			"llm-code-review starting agent fan-out"
 		);
 
-		let (discovered, discovery_errors) =
-			self.discover_all(&cfg, &ctx.workdir, &files, ctx.repo_id, &ctx.cancel).await;
-		// Hard-fail when every discovery call errored. Without this, an
+		let errors =
+			self.run_all(&cfg, &ctx.workdir, &files, ctx.repo_id, ctx.job_id, &ctx.cancel).await;
+		// Hard-fail when every agent session errored. Without this, an
 		// LLM scanner that's completely broken (sandbox can't reach the
-		// CLI, auth missing, network blocked) silently completes as
-		// "succeeded with 0 findings", which an operator can't tell
-		// apart from "this is a clean repo." Parse failures count as
-		// successes here (the call ran, the model just said nothing
-		// usable) — only backend / sandbox errors fail the scan.
-		if discovery_errors > 0 && discovery_errors == files.len() {
+		// CLI, auth missing, network blocked) would silently complete
+		// as "succeeded with 0 findings", which an operator can't tell
+		// apart from "this is a clean repo." The agent producing no
+		// findings on a healthy session is a success — only backend /
+		// sandbox errors fail the scan.
+		if errors > 0 && errors == files.len() {
 			anyhow::bail!(
-				"llm-code-review: every one of {n} discovery calls errored; \
+				"llm-code-review: every one of {n} agent sessions errored; \
 				 check worker logs for the underlying error (`RUST_LOG=loupe_worker=debug` \
 				 surfaces the per-call failures)",
 				n = files.len(),
 			);
 		}
-		if discovery_errors > 0 {
+		if errors > 0 {
 			tracing::warn!(
-				errored = discovery_errors,
+				errored = errors,
 				total = files.len(),
-				"llm-code-review: some discovery calls errored",
+				"llm-code-review: some agent sessions errored",
 			);
 		}
-		// Hash-dedup pass. For each surviving discovery, compute the
-		// candidate fingerprint (same shape `build_finding` will use
-		// post-validation) and ask the server which fingerprints it
-		// already has on this repo. Drop matches before paying
-		// validation LLM cost. No-op when `client` is None — that's
-		// the test path with the stub backend.
-		let after_dedup = if let Some(client) = self.client.as_ref() {
-			dedup_against_server(client, ctx.repo_id, &ctx.workdir, discovered).await
-		} else {
-			discovered
-		};
-		tracing::info!(candidates = after_dedup.len(), "llm-code-review entering validation");
-
-		let n_candidates = after_dedup.len();
-		let (validated, validation_errors) =
-			self.validate_all(&cfg, &ctx.workdir, after_dedup, ctx.repo_id, &ctx.cancel).await;
-		// Same fail-loud logic for validation, gated on the candidate
-		// count so a zero-candidate run (clean repo) doesn't trip it.
-		if validation_errors > 0 && validation_errors == n_candidates {
-			anyhow::bail!("llm-code-review: every one of {n_candidates} validation calls errored",);
-		}
-		if validation_errors > 0 {
-			tracing::warn!(
-				errored = validation_errors,
-				total = n_candidates,
-				"llm-code-review: some validation calls errored",
-			);
-		}
-		tracing::info!(emitted = validated.len(), "llm-code-review finished");
-
-		Ok(validated
-			.into_iter()
-			.map(|v| build_finding(&self.backend, v, &ctx.workdir, &ctx.head_sha))
-			.collect())
+		tracing::info!("llm-code-review finished; submissions arrived via MCP");
+		// The scanner's role is orchestration; agent submissions
+		// already landed on the server via the MCP `submit_finding`
+		// tool. The runner's `submit_findings` batch call (which
+		// follows scan(...)) thus has nothing to do for this scanner.
+		Ok(Vec::new())
 	}
 }
 
-/// One discovered (but un-validated) finding, post-JSON-parse.
-#[derive(Debug, Clone)]
-struct Discovered {
-	severity: Severity,
-	title: String,
-	file: String,
-	line_start: u32,
-	line_end: u32,
-	description: String,
-	cwe: Option<String>,
-}
-
-/// One validated finding, ready to emit.
-#[derive(Debug, Clone)]
-struct Validated {
-	d: Discovered,
-	poc_unified: String,
-	notes: Option<String>,
-}
-
 impl LlmCodeReviewScanner {
-	/// Returns `(discovered, error_count)`. `error_count` is the number
-	/// of per-file backend / sandbox call errors — distinct from
-	/// "call succeeded but the model returned no finding" (which
-	/// counts as a success). The caller fails the scan loud if every
-	/// attempt errored.
-	async fn discover_all(
-		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], repo_id: i64,
+	/// Fan out one agent session per file with bounded concurrency.
+	/// Returns the count of session-level errors; per-session "no
+	/// finding" is a success (not an error).
+	async fn run_all(
+		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], repo_id: i64, job_id: i64,
 		cancel: &CancellationToken,
-	) -> (Vec<Discovered>, usize) {
+	) -> usize {
 		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
 		let mut handles = Vec::with_capacity(files.len());
 		for path in files {
@@ -324,84 +265,37 @@ impl LlmCodeReviewScanner {
 			let cancel = cancel.clone();
 			handles.push(tokio::spawn(async move {
 				let _permit = permit;
-				discover_one(backend, &workdir, &path, &cfg_owned, repo_id, cancel).await
+				run_one(backend, &workdir, &path, &cfg_owned, repo_id, job_id, cancel).await
 			}));
 		}
 
-		let mut out = Vec::new();
 		let mut errors = 0usize;
 		for h in handles {
 			match h.await {
-				Ok(Ok(Some(d))) => out.push(d),
-				Ok(Ok(None)) => {},
+				Ok(Ok(())) => {},
 				Ok(Err(())) => errors += 1,
 				Err(e) => {
-					tracing::warn!(error = %e, "discovery task panicked");
+					tracing::warn!(error = %e, "agent session task panicked");
 					errors += 1;
 				},
 			}
 		}
-		(out, errors)
-	}
-
-	/// Returns `(validated, error_count)`. Same semantics as
-	/// `discover_all` for the error count.
-	async fn validate_all(
-		&self, cfg: &ScannerConfig, workdir: &Path, discovered: Vec<Discovered>, repo_id: i64,
-		cancel: &CancellationToken,
-	) -> (Vec<Validated>, usize) {
-		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
-		let mut handles = Vec::with_capacity(discovered.len());
-		for d in discovered {
-			if cancel.is_cancelled() {
-				break;
-			}
-			let permit = sem.clone().acquire_owned().await.expect("semaphore not closed");
-			let backend = self.backend.clone();
-			let cfg_owned = cfg.clone();
-			let workdir = workdir.to_path_buf();
-			let cancel = cancel.clone();
-			handles.push(tokio::spawn(async move {
-				let _permit = permit;
-				validate_one(backend, &workdir, d, &cfg_owned, repo_id, cancel).await
-			}));
-		}
-		let mut out = Vec::new();
-		let mut errors = 0usize;
-		for h in handles {
-			match h.await {
-				Ok(Ok(Some(v))) => out.push(v),
-				Ok(Ok(None)) => {},
-				Ok(Err(())) => errors += 1,
-				Err(e) => {
-					tracing::warn!(error = %e, "validation task panicked");
-					errors += 1;
-				},
-			}
-		}
-		(out, errors)
+		errors
 	}
 }
 
-/// How many leading characters of an LLM response to log at debug
-/// level. Long enough that a JSON parse failure usually prints the
-/// offending shape; short enough that GBs of model output don't
-/// drown the terminal.
-const RESPONSE_PREVIEW_CHARS: usize = 240;
-
-/// `Ok(Some(_))` = call ran, model produced a valid finding.
-/// `Ok(None)` = call ran, model said "no finding here" (or output was
-/// unparseable — we lump unparseable in with "no finding" because the
-/// call itself worked, the model just emitted garbage). `Err(())` =
-/// the backend / sandbox / network call itself failed; the caller
-/// counts these and fails the scan if every attempt errors.
-async fn discover_one(
+/// Run one agent session against `file`. Returns `Err(())` for
+/// session-level errors (sandbox / network / CLI failure); the call
+/// counts these and fails the scan when every attempt errors. A
+/// healthy session that produced no submission still returns `Ok(())`
+/// — the agent decided there was nothing to report.
+async fn run_one(
 	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &Path, cfg: &ScannerConfig, repo_id: i64,
-	cancel: CancellationToken,
-) -> Result<Option<Discovered>, ()> {
+	job_id: i64, cancel: CancellationToken,
+) -> Result<(), ()> {
 	let rel = file.strip_prefix(workdir).unwrap_or(file).to_string_lossy().into_owned();
 	let prompt = prompts::render(DISCOVERY, &[("file", &rel)]);
-	tracing::info!(file = %rel, "llm-code-review: running discovery");
+	tracing::info!(file = %rel, "llm-code-review: launching agent session");
 	let started = std::time::Instant::now();
 	let req = LlmRequest {
 		prompt,
@@ -409,292 +303,23 @@ async fn discover_one(
 		timeout: cfg.per_request_timeout,
 		cancel,
 		repo_id: Some(repo_id),
+		job_id: Some(job_id),
 	};
-	let resp = match backend.run(req).await {
-		Ok(r) => r,
-		Err(e) => {
-			tracing::warn!(file = %rel, error = %e, "discovery call failed");
-			return Err(());
-		},
-	};
-	tracing::debug!(
-		file = %rel,
-		elapsed_ms = started.elapsed().as_millis() as u64,
-		response_chars = resp.text.chars().count(),
-		preview = %resp.text.chars().take(RESPONSE_PREVIEW_CHARS).collect::<String>(),
-		"discovery response",
-	);
-	Ok(parse_discovery(&resp, &rel))
-}
-
-async fn validate_one(
-	backend: Arc<dyn LlmBackend>, workdir: &Path, d: Discovered, cfg: &ScannerConfig, repo_id: i64,
-	cancel: CancellationToken,
-) -> Result<Option<Validated>, ()> {
-	let finding_json = serde_json::json!({
-		"severity": d.severity.as_str(),
-		"title": d.title,
-		"file": d.file,
-		"line_start": d.line_start,
-		"line_end": d.line_end,
-		"description": d.description,
-		"cwe": d.cwe,
-	});
-	let prompt = prompts::render(
-		VALIDATE,
-		&[("file", &d.file), ("finding_json", &finding_json.to_string())],
-	);
-	tracing::info!(file = %d.file, title = %d.title, "llm-code-review: running validation");
-	let started = std::time::Instant::now();
-	let req = LlmRequest {
-		prompt,
-		workdir: workdir.to_path_buf(),
-		timeout: cfg.per_request_timeout,
-		cancel,
-		repo_id: Some(repo_id),
-	};
-	let resp = match backend.run(req).await {
-		Ok(r) => r,
-		Err(e) => {
-			tracing::warn!(file = %d.file, error = %e, "validation call failed");
-			return Err(());
-		},
-	};
-	tracing::debug!(
-		file = %d.file,
-		elapsed_ms = started.elapsed().as_millis() as u64,
-		response_chars = resp.text.chars().count(),
-		preview = %resp.text.chars().take(RESPONSE_PREVIEW_CHARS).collect::<String>(),
-		"validation response",
-	);
-	Ok(parse_validation(&resp, d))
-}
-
-#[derive(Debug, Deserialize)]
-struct DiscoveryRaw {
-	#[serde(default)]
-	found: bool,
-	#[serde(default)]
-	severity: Option<String>,
-	#[serde(default)]
-	title: Option<String>,
-	#[serde(default)]
-	file: Option<String>,
-	#[serde(default)]
-	line_start: Option<u32>,
-	#[serde(default)]
-	line_end: Option<u32>,
-	#[serde(default)]
-	description: Option<String>,
-	#[serde(default)]
-	cwe: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ValidationRaw {
-	verdict: String,
-	#[serde(default)]
-	notes: Option<String>,
-	#[serde(default)]
-	poc_unified: Option<String>,
-}
-
-fn parse_discovery(resp: &LlmResponse, expected_file: &str) -> Option<Discovered> {
-	let json = extract_json_object(&resp.text)?;
-	let raw: DiscoveryRaw = match serde_json::from_str(&json) {
-		Ok(r) => r,
-		Err(e) => {
-			tracing::warn!(file = %expected_file, error = %e, "discovery JSON parse failed");
-			return None;
-		},
-	};
-	if !raw.found {
-		return None;
-	}
-	let severity = raw.severity.as_deref().and_then(|s| s.parse().ok()).unwrap_or(Severity::Medium);
-	Some(Discovered {
-		severity,
-		title: raw.title.unwrap_or_else(|| "Possible vulnerability".into()),
-		file: raw.file.unwrap_or_else(|| expected_file.to_owned()),
-		line_start: raw.line_start.unwrap_or(1),
-		line_end: raw.line_end.unwrap_or(raw.line_start.unwrap_or(1)),
-		description: raw.description.unwrap_or_default(),
-		cwe: raw.cwe.filter(|s| !s.is_empty()),
-	})
-}
-
-fn parse_validation(resp: &LlmResponse, d: Discovered) -> Option<Validated> {
-	let json = extract_json_object(&resp.text)?;
-	let raw: ValidationRaw = match serde_json::from_str(&json) {
-		Ok(r) => r,
-		Err(e) => {
-			tracing::warn!(file = %d.file, error = %e, "validation JSON parse failed");
-			return None;
-		},
-	};
-	match raw.verdict.as_str() {
-		"confirmed" => {
-			let poc = raw.poc_unified.filter(|s| !s.trim().is_empty())?;
-			Some(Validated { d, poc_unified: poc, notes: raw.notes })
-		},
-		_ => None,
-	}
-}
-
-/// Pull the first balanced JSON object out of a possibly noisy text
-/// response. Tolerates prose before/after the object and a single
-/// markdown fence around it. Returns the slice as a `String` rather
-/// than a `&str` because the model occasionally emits trailing junk
-/// after the closing brace; we feed only what's inside the braces.
-pub(crate) fn extract_json_object(text: &str) -> Option<String> {
-	let bytes = text.as_bytes();
-	// Find first '{'.
-	let start = bytes.iter().position(|b| *b == b'{')?;
-	// Walk to the matching '}', respecting string literals.
-	let mut depth = 0i32;
-	let mut in_str = false;
-	let mut escape = false;
-	for (i, b) in bytes.iter().enumerate().skip(start) {
-		if in_str {
-			if escape {
-				escape = false;
-			} else if *b == b'\\' {
-				escape = true;
-			} else if *b == b'"' {
-				in_str = false;
-			}
-			continue;
-		}
-		match *b {
-			b'"' => in_str = true,
-			b'{' => depth += 1,
-			b'}' => {
-				depth -= 1;
-				if depth == 0 {
-					return std::str::from_utf8(&bytes[start..=i]).ok().map(|s| s.to_owned());
-				}
-			},
-			_ => {},
-		}
-	}
-	None
-}
-
-/// How many lines of context to take on each side of the bug-line
-/// range when computing the fingerprint window. Two lines is enough
-/// to keep the hash stable across `cargo fmt`-style reflows while
-/// staying narrow enough that touching the bug body shifts it.
-const FINGERPRINT_CONTEXT_LINES: u32 = 2;
-
-fn build_finding(
-	backend: &Arc<dyn LlmBackend>, v: Validated, workdir: &Path, head_sha: &str,
-) -> Finding {
-	let fingerprint = fingerprint_for(workdir, &v.d.file, v.d.line_start, v.d.line_end);
-
-	let description = if let Some(notes) = v.notes {
-		format!("{}\n\n_validation notes ({}): {}_", v.d.description, backend.id(), notes)
-	} else {
-		v.d.description
-	};
-	let _ = head_sha; // not currently part of the fingerprint; semantic dedup (stage 2) may reference it
-	Finding {
-		scanner_id: SCANNER_ID.into(),
-		severity: v.d.severity,
-		title: v.d.title,
-		description,
-		file_path: Some(v.d.file),
-		line_start: Some(v.d.line_start),
-		line_end: Some(v.d.line_end),
-		cwe: v.d.cwe,
-		patch_unified: None,
-		poc_unified: Some(v.poc_unified),
-		fingerprint,
-	}
-}
-
-/// Hash-dedup pass: compute fingerprints for each candidate, ask
-/// the server which ones already exist on the repo, drop matches.
-///
-/// On a server error we *don't* bail — we just skip dedup and let
-/// validation run as if every candidate were novel. The
-/// `INSERT OR IGNORE` on `(repo_id, fingerprint)` at the eventual
-/// submit_findings call still prevents duplicate rows; the only
-/// thing we lose by skipping dedup is the validation-cost saving.
-/// Fail-open is the right behaviour for an optimisation pass.
-async fn dedup_against_server(
-	client: &Arc<ServerClient>, repo_id: i64, workdir: &Path, candidates: Vec<Discovered>,
-) -> Vec<Discovered> {
-	if candidates.is_empty() {
-		return candidates;
-	}
-	// Compute the candidate fingerprint AND remember which
-	// `Discovered` it came from in one pass — `Vec<(Discovered, fp)>`.
-	let with_fps: Vec<(Discovered, String)> = candidates
-		.into_iter()
-		.map(|d| {
-			let fp = fingerprint_for(workdir, &d.file, d.line_start, d.line_end);
-			(d, fp)
-		})
-		.collect();
-	let fps: Vec<String> = with_fps.iter().map(|(_, f)| f.clone()).collect();
-
-	let known = match client.known_fingerprints(repo_id, fps).await {
-		Ok(resp) => resp.known.into_iter().collect::<std::collections::HashSet<_>>(),
-		Err(e) => {
-			tracing::warn!(error = %e, "dedup lookup failed; skipping (validation will run on all)");
-			return with_fps.into_iter().map(|(d, _)| d).collect();
-		},
-	};
-	let total = with_fps.len();
-	let kept: Vec<Discovered> =
-		with_fps.into_iter().filter(|(_, fp)| !known.contains(fp)).map(|(d, _)| d).collect();
-	let dropped = total - kept.len();
-	if dropped > 0 {
-		tracing::info!(
-			dropped,
-			total,
-			"llm-code-review: dedup skipped {dropped}/{total} candidates that hash-match prior findings",
-		);
-	} else {
-		tracing::debug!(total, "llm-code-review: dedup found no prior matches");
-	}
-	kept
-}
-
-/// Read the source window for `(file, line_start..=line_end)` from
-/// the worktree and produce the fingerprint via
-/// [`crate::fingerprint::compute`]. Falls back to a degenerate but
-/// safe input when the file can't be read (model hallucinated a
-/// path, file is non-UTF-8, etc.) so `build_finding` still produces
-/// *some* fingerprint rather than panicking — the line-range alone
-/// is the worst-case input.
-fn fingerprint_for(workdir: &Path, file: &str, line_start: u32, line_end: u32) -> String {
-	// Strip a leading "/workdir/" if the model echoed back the
-	// in-sandbox absolute path; we want the path relative to the
-	// host worktree.
-	let rel = file.strip_prefix("/workdir/").unwrap_or(file).trim_start_matches('/');
-	let abs = workdir.join(rel);
-	let source = match std::fs::read_to_string(&abs) {
-		Ok(s) => s,
-		Err(e) => {
-			tracing::warn!(
-				file = %rel, error = %e,
-				"fingerprint: could not read worktree file; falling back to line-range-only window",
+	match backend.run(req).await {
+		Ok(r) => {
+			tracing::debug!(
+				file = %rel,
+				elapsed_ms = started.elapsed().as_millis() as u64,
+				response_chars = r.text.chars().count(),
+				"agent session finished",
 			);
-			return crate::fingerprint::compute(
-				SCANNER_ID,
-				rel,
-				&format!("L{line_start}-L{line_end}"),
-			);
+			Ok(())
 		},
-	};
-	let window = crate::fingerprint::extract_window(
-		&source,
-		line_start,
-		line_end,
-		FINGERPRINT_CONTEXT_LINES,
-	);
-	crate::fingerprint::compute(SCANNER_ID, rel, &window)
+		Err(e) => {
+			tracing::warn!(file = %rel, error = %e, "agent session failed");
+			Err(())
+		},
+	}
 }
 
 /// Walk the worktree for source files. Strategy:
@@ -855,6 +480,7 @@ mod tests {
 		ScanContext {
 			workdir: workdir.to_path_buf(),
 			repo_id: 1,
+			job_id: 1,
 			repo: RepoSpec {
 				host: "github.com".into(),
 				owner: "a".into(),
@@ -950,38 +576,6 @@ mod tests {
 		assert!(names.iter().all(|n| !n.starts_with("dist/")), "leak: {names:?}");
 	}
 
-	#[tokio::test]
-	async fn ctx_config_override_changes_walked_extensions() {
-		// A C-only repo overrides include_extensions so a `.c` file is
-		// picked up even though the project has no Cargo.toml.
-		let tmp = tempfile::tempdir().unwrap();
-		std::fs::write(tmp.path().join("widget.c"), "/* stub */\n").unwrap();
-
-		// Stub backend that always reports a finding so we can tell
-		// whether the file was visited.
-		let backend = Arc::new(StubLlmBackend::new("stub", |req: &LlmRequest| {
-			if req.prompt.contains("validating a vulnerability report") {
-				Ok(r#"{"verdict":"confirmed","notes":"x","poc_unified":"--- diff ---"}"#.to_owned())
-			} else {
-				Ok(r#"{"found":true,"severity":"low","title":"stub","file":"widget.c","line_start":1,"line_end":1,"description":"d"}"#.to_owned())
-			}
-		}));
-		let scanner = LlmCodeReviewScanner::new(backend);
-
-		let mut ctx = make_ctx(tmp.path());
-		ctx.config = serde_json::json!({"include_extensions":["c"]});
-		let findings = scanner.scan(&ctx).await.unwrap();
-		assert_eq!(findings.len(), 1, "ctx.config override should have caught widget.c");
-		assert_eq!(findings[0].file_path.as_deref(), Some("widget.c"));
-	}
-
-	#[test]
-	fn extract_json_object_from_prose() {
-		let text = "Sure! Here you go:\n\n```json\n{\n  \"found\": true\n}\n```\nLet me know.";
-		let s = extract_json_object(text).unwrap();
-		assert!(s.contains("\"found\""));
-	}
-
 	#[test]
 	fn walk_picks_up_src_rs_files_only() {
 		let tmp = tempfile::tempdir().unwrap();
@@ -1007,170 +601,66 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn scanner_emits_validated_findings_via_stub() {
+	async fn scanner_returns_empty_findings_and_calls_backend_per_file() {
+		// Submissions go via MCP, not via the return value. The
+		// scanner-level test pins the orchestration contract: every
+		// matching file gets one backend call, scan returns [].
 		let tmp = tempfile::tempdir().unwrap();
-		write_crate(
-			tmp.path(),
-			&[("src/lib.rs", "pub fn idx(arr: &[u8], i: usize) -> u8 { arr[i] }\n")],
-		);
+		write_crate(tmp.path(), &[("src/lib.rs", "// a\n"), ("src/util.rs", "// b\n")]);
 
-		// Stub returns a discovery JSON for any DISCOVERY-style prompt
-		// and a confirmed validation with a PoC for any VALIDATE prompt.
-		// We tell them apart by looking for distinct phrases in the prompt.
-		let backend = Arc::new(StubLlmBackend::new("stub", |req: &LlmRequest| {
-			if req.prompt.contains("validating a vulnerability report") {
-				Ok(r#"{"verdict":"confirmed","notes":"reproduced","poc_unified":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n+#[test] fn oob() { idx(&[], 0); }\n"}"#.to_owned())
-			} else {
-				Ok(r#"{"found":true,"severity":"high","title":"oob index","file":"src/lib.rs","line_start":1,"line_end":1,"description":"unchecked index","cwe":"CWE-129"}"#.to_owned())
-			}
-		}));
-		let scanner = LlmCodeReviewScanner::new(backend);
-		let findings = scanner.scan(&make_ctx(tmp.path())).await.unwrap();
-		assert_eq!(findings.len(), 1);
-		let f = &findings[0];
-		assert_eq!(f.scanner_id, SCANNER_ID);
-		assert_eq!(f.severity, Severity::High);
-		assert_eq!(f.file_path.as_deref(), Some("src/lib.rs"));
-		assert_eq!(f.line_start, Some(1));
-		assert!(f.poc_unified.as_deref().unwrap().contains("#[test]"), "got: {:?}", f.poc_unified);
-		assert!(f.description.contains("validation notes"));
-	}
-
-	#[tokio::test]
-	async fn fingerprint_is_stable_across_cosmetic_edits_to_the_file() {
-		// Same bug body in both runs. Variant B inserts an unrelated
-		// helper *above* the bug, so the bug shifts down by 4 lines.
-		// The model picks up the new line numbers, but the content of
-		// the bug + its 2-line context window stays identical because
-		// the inserted code is far enough above to leave the context
-		// lines unchanged. Plus the model paraphrases the title
-		// between runs to mimic real LLM drift. Fingerprint must stay
-		// the same.
-		let backend = |line: u32, title: &'static str| {
-			Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
-				if req.prompt.contains("validating a vulnerability report") {
-					Ok(r#"{"verdict":"confirmed","notes":"r","poc_unified":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@\n+x\n"}"#.to_owned())
-				} else {
-					Ok(format!(
-						r#"{{"found":true,"severity":"high","title":"{title}","file":"src/lib.rs","line_start":{line},"line_end":{line},"description":"d"}}"#,
-					))
-				}
-			}))
-		};
-
-		// Source: a small module with several functions; the bug is
-		// inside `idx`, surrounded on both sides by other code that
-		// stays identical between variants A and B.
-		let prelude = "//! lib\n\npub fn add(a: u8, b: u8) -> u8 { a + b }\n\n\
-		               pub fn sub(a: u8, b: u8) -> u8 { a - b }\n\n";
-		let bug_block = "pub fn idx(arr: &[u8], i: usize) -> u8 { arr[i] }\n";
-		let tail = "\npub fn double(a: u8) -> u8 { a + a }\n";
-
-		let src_a = format!("{prelude}{bug_block}{tail}");
-		// Variant B: insert an unrelated helper at the very top, far
-		// enough above the bug that 2-line context lines don't drift.
-		let src_b = format!("// extra license header\n\n{prelude}{bug_block}{tail}",);
-
-		// Compute where `idx` actually lands so we hand realistic line
-		// numbers to the stub backend.
-		let line_a = src_a.lines().position(|l| l.starts_with("pub fn idx")).unwrap() + 1;
-		let line_b = src_b.lines().position(|l| l.starts_with("pub fn idx")).unwrap() + 1;
-		assert_ne!(line_a, line_b, "fixture must shift the line number to be a meaningful test");
-
-		let tmp_a = tempfile::tempdir().unwrap();
-		write_crate(tmp_a.path(), &[("src/lib.rs", &src_a)]);
-		let findings_a = LlmCodeReviewScanner::new(backend(line_a as u32, "oob index"))
-			.scan(&make_ctx(tmp_a.path()))
-			.await
-			.unwrap();
-		assert_eq!(findings_a.len(), 1);
-
-		let tmp_b = tempfile::tempdir().unwrap();
-		write_crate(tmp_b.path(), &[("src/lib.rs", &src_b)]);
-		let findings_b =
-			LlmCodeReviewScanner::new(backend(line_b as u32, "unchecked array indexing"))
-				.scan(&make_ctx(tmp_b.path()))
-				.await
-				.unwrap();
-		assert_eq!(findings_b.len(), 1);
-
-		assert_eq!(
-			findings_a[0].fingerprint, findings_b[0].fingerprint,
-			"fingerprint must be stable when a header is added far above the bug \
-			 (line_start drifts but the 2-line context stays identical); \
-			 got a={} b={}",
-			findings_a[0].fingerprint, findings_b[0].fingerprint,
-		);
-	}
-
-	#[tokio::test]
-	async fn fingerprint_changes_when_the_bug_body_is_edited() {
-		// Same file, same line, same title — but different code at the
-		// bug location. The fingerprint must shift so a fix doesn't
-		// inherit the prior approval state.
-		let stub = |body_response: &'static str| {
-			Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
-				if req.prompt.contains("validating a vulnerability report") {
-					Ok(r#"{"verdict":"confirmed","notes":"r","poc_unified":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@\n+x\n"}"#.to_owned())
-				} else {
-					Ok(body_response.to_owned())
-				}
-			}))
-		};
-
-		let discovery = r#"{"found":true,"severity":"high","title":"x","file":"src/lib.rs","line_start":1,"line_end":1,"description":"d"}"#;
-
-		let tmp_a = tempfile::tempdir().unwrap();
-		write_crate(tmp_a.path(), &[("src/lib.rs", "let v = unsafe { *raw };\n")]);
-		let a =
-			LlmCodeReviewScanner::new(stub(discovery)).scan(&make_ctx(tmp_a.path())).await.unwrap();
-
-		let tmp_b = tempfile::tempdir().unwrap();
-		write_crate(tmp_b.path(), &[("src/lib.rs", "let v = unsafe { *raw }.unwrap_or(0);\n")]);
-		let b =
-			LlmCodeReviewScanner::new(stub(discovery)).scan(&make_ctx(tmp_b.path())).await.unwrap();
-
-		assert_eq!(a.len(), 1);
-		assert_eq!(b.len(), 1);
-		assert_ne!(
-			a[0].fingerprint, b[0].fingerprint,
-			"fingerprint must shift when the bug body is touched",
-		);
-	}
-
-	#[tokio::test]
-	async fn scanner_drops_rejected_findings() {
-		let tmp = tempfile::tempdir().unwrap();
-		write_crate(tmp.path(), &[("src/lib.rs", "// nothing to see\n")]);
-		let backend = Arc::new(StubLlmBackend::new("stub", |req: &LlmRequest| {
-			if req.prompt.contains("validating a vulnerability report") {
-				Ok(r#"{"verdict":"rejected","notes":"hallucination","poc_unified":null}"#
-					.to_owned())
-			} else {
-				Ok(r#"{"found":true,"severity":"medium","title":"x","file":"src/lib.rs","line_start":1,"line_end":1,"description":"d"}"#.to_owned())
-			}
-		}));
-		let scanner = LlmCodeReviewScanner::new(backend);
-		let findings = scanner.scan(&make_ctx(tmp.path())).await.unwrap();
-		assert!(findings.is_empty(), "rejected verdicts must not emit findings");
-	}
-
-	#[tokio::test]
-	async fn scanner_drops_unparseable_discovery() {
-		let tmp = tempfile::tempdir().unwrap();
-		write_crate(tmp.path(), &[("src/lib.rs", "// content\n")]);
 		let calls = Arc::new(AtomicUsize::new(0));
 		let calls_for_stub = calls.clone();
-		let backend = Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
+		let backend = Arc::new(StubLlmBackend::new("stub", move |_req: &LlmRequest| {
 			calls_for_stub.fetch_add(1, Ordering::SeqCst);
-			if req.prompt.contains("validating a vulnerability report") {
-				panic!("validation should not run when discovery fails to parse");
-			}
-			Ok("not actually json".to_owned())
+			Ok(String::new())
 		}));
 		let scanner = LlmCodeReviewScanner::new(backend);
+
 		let findings = scanner.scan(&make_ctx(tmp.path())).await.unwrap();
-		assert!(findings.is_empty());
-		assert_eq!(calls.load(Ordering::SeqCst), 1, "only the discovery call should have run");
+		assert!(findings.is_empty(), "scanner returns no findings — submissions go via MCP");
+		assert_eq!(
+			calls.load(Ordering::SeqCst),
+			2,
+			"every walked file must produce one agent session"
+		);
+	}
+
+	#[tokio::test]
+	async fn scanner_fails_loud_when_every_session_errors() {
+		// Sandbox / network / CLI being completely broken must not
+		// silently complete as "0 findings" — that's
+		// indistinguishable from a clean repo.
+		let tmp = tempfile::tempdir().unwrap();
+		write_crate(tmp.path(), &[("src/lib.rs", "// a\n")]);
+		let backend = Arc::new(StubLlmBackend::new("stub", |_req: &LlmRequest| {
+			Err(anyhow::anyhow!("backend exploded"))
+		}));
+		let scanner = LlmCodeReviewScanner::new(backend);
+		let err = scanner.scan(&make_ctx(tmp.path())).await.expect_err("must fail");
+		assert!(err.to_string().contains("agent session"), "unexpected error: {err}");
+	}
+
+	#[tokio::test]
+	async fn ctx_config_override_changes_walked_extensions() {
+		// A C-only repo overrides include_extensions so a `.c` file
+		// is picked up even without a Cargo.toml. Pinned at the
+		// scanner level because the patch lookup is in scan().
+		let tmp = tempfile::tempdir().unwrap();
+		std::fs::write(tmp.path().join("widget.c"), "/* stub */\n").unwrap();
+		let calls = Arc::new(AtomicUsize::new(0));
+		let calls_for_stub = calls.clone();
+		let backend = Arc::new(StubLlmBackend::new("stub", move |_req: &LlmRequest| {
+			calls_for_stub.fetch_add(1, Ordering::SeqCst);
+			Ok(String::new())
+		}));
+		let scanner = LlmCodeReviewScanner::new(backend);
+		let mut ctx = make_ctx(tmp.path());
+		ctx.config = serde_json::json!({"include_extensions":["c"]});
+		scanner.scan(&ctx).await.unwrap();
+		assert_eq!(
+			calls.load(Ordering::SeqCst),
+			1,
+			"ctx.config override should have caught widget.c"
+		);
 	}
 }

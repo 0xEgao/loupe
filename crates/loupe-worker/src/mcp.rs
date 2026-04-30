@@ -1,5 +1,5 @@
 //! MCP server exposed to the agent (`claude` and friends) for the
-//! duration of a single discovery / validation call.
+//! duration of one scan session over one source file.
 //!
 //! Wire shape: JSON-RPC 2.0 over stdio. The agent is the JSON-RPC
 //! client; this module is the server. We hand-roll the protocol to
@@ -19,14 +19,25 @@
 //!   Used after `query_prior_findings` returns a summary and the
 //!   model wants to see the description / PoC of a hit before
 //!   deciding whether the new finding is a duplicate.
+//! - `submit_finding(severity, title, file, line_start, line_end,
+//!   description, poc_unified, cwe?)` — the agent's only path for
+//!   reporting a vulnerability. Computes the fingerprint server-
+//!   side (reading the source window from `--workdir`) and POSTs
+//!   to `/v1/jobs/{job_id}/findings`. Only registered when the
+//!   worker passed `--job-id` at MCP-server start; without a job
+//!   id, there's nowhere to attribute submissions to.
 
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use loupe_core::{Finding, Severity};
+use loupe_proto::{FindingsBatch, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::scanners::llm_code_review::SCANNER_ID;
 use crate::ServerClient;
 
 /// Identity emitted on `initialize`. The version is the loupe-worker
@@ -34,6 +45,28 @@ use crate::ServerClient;
 /// signal to the agent that the tool surface changed.
 const SERVER_NAME: &str = "loupe-mcp";
 const SERVER_VERSION: &str = "0.1.0";
+
+/// How many lines of context to take on each side of the bug-line
+/// range when computing the fingerprint window. Two lines is enough
+/// to keep the hash stable across `cargo fmt`-style reflows while
+/// staying narrow enough that touching the bug body shifts it.
+const FINGERPRINT_CONTEXT_LINES: u32 = 2;
+
+/// Per-call session state that flows into every tool handler. Built
+/// once at `run_stdio_server` start from CLI args; never mutated.
+struct Session {
+	client: Arc<ServerClient>,
+	repo_id: i64,
+	/// Job id the agent is reporting findings against. `None` means
+	/// `submit_finding` is unavailable — the MCP server is in
+	/// read-only mode (e.g. a future read-only diagnostic flow).
+	job_id: Option<i64>,
+	/// Worktree the agent is reasoning over. Used to read source
+	/// files for fingerprint window extraction in `submit_finding`.
+	/// Inside the bwrap sandbox this is `/workdir`; bare-mode
+	/// (`LOUPE_DISABLE_SANDBOX`) runs use the host worktree path.
+	workdir: PathBuf,
+}
 
 /// JSON-RPC 2.0 envelope shapes. Kept small — we don't need batch
 /// requests, notifications-with-body, or any of the optional MCP
@@ -69,12 +102,15 @@ struct RpcError {
 
 /// Run the MCP server against `client` until stdin closes.
 ///
-/// `repo_id` is baked into the server because the agent only ever
-/// reasons about the repo currently being scanned — there's no
-/// cross-repo lookup. The connection target (the loupe-server URL,
-/// mTLS cert) is similarly fixed at MCP-server start; tool calls
-/// don't re-specify it.
-pub async fn run_stdio_server(client: Arc<ServerClient>, repo_id: i64) -> Result<()> {
+/// `repo_id` scopes search/lookup tools to this repo. `job_id`, when
+/// `Some`, enables `submit_finding` — submissions POST to
+/// `/v1/jobs/{job_id}/findings`. `workdir` is the path the agent's
+/// file references resolve against (`/workdir` inside bwrap, the
+/// host worktree path in disable-sandbox mode).
+pub async fn run_stdio_server(
+	client: Arc<ServerClient>, repo_id: i64, job_id: Option<i64>, workdir: PathBuf,
+) -> Result<()> {
+	let session = Arc::new(Session { client, repo_id, job_id, workdir });
 	let stdin = std::io::stdin();
 	let mut stdout = std::io::stdout();
 
@@ -106,16 +142,14 @@ pub async fn run_stdio_server(client: Arc<ServerClient>, repo_id: i64) -> Result
 		// Notifications (no `id`) require no response per JSON-RPC.
 		let Some(id) = request.id.clone() else { continue };
 
-		let response = handle_request(&client, repo_id, &request, id).await;
+		let response = handle_request(&session, &request, id).await;
 		write_response(&mut stdout, &response)?;
 	}
 
 	Ok(())
 }
 
-async fn handle_request(
-	client: &Arc<ServerClient>, repo_id: i64, req: &Request, id: Value,
-) -> Response {
+async fn handle_request(session: &Arc<Session>, req: &Request, id: Value) -> Response {
 	match req.method.as_str() {
 		"initialize" => Response {
 			jsonrpc: "2.0",
@@ -130,10 +164,10 @@ async fn handle_request(
 		"tools/list" => Response {
 			jsonrpc: "2.0",
 			id,
-			result: Some(json!({ "tools": tool_definitions() })),
+			result: Some(json!({ "tools": tool_definitions(session.job_id.is_some()) })),
 			error: None,
 		},
-		"tools/call" => handle_tool_call(client, repo_id, req, id).await,
+		"tools/call" => handle_tool_call(session, req, id).await,
 		// Common no-op MCP notifications/requests we just ack.
 		"notifications/initialized" | "ping" => {
 			Response { jsonrpc: "2.0", id, result: Some(json!({})), error: None }
@@ -153,9 +187,12 @@ async fn handle_request(
 
 /// MCP tool catalogue. Each entry is the JSON Schema the agent uses
 /// to decide when to call the tool and what shape arguments to send.
-fn tool_definitions() -> Value {
-	json!([
-		{
+/// `submissions_enabled` gates `submit_finding` — without a job to
+/// attribute submissions to (i.e. when the worker didn't pass
+/// `--job-id`), the tool is hidden so the agent can't try to call it.
+fn tool_definitions(submissions_enabled: bool) -> Value {
+	let mut tools = vec![
+		json!({
 			"name": "query_prior_findings",
 			"description":
 				"Keyword search over prior security findings on the repo currently being scanned. \
@@ -163,9 +200,8 @@ fn tool_definitions() -> Value {
 				 surfaced in an earlier scan — same bug, possibly different wording. Returns up to \
 				 `limit` matches ranked by relevance, with the title, severity, file location, \
 				 state (e.g. 'reported', 'awaiting_approval', 'dismissed'), and finding id of each. \
-				 If a match looks like the same vulnerability you're investigating, mention the \
-				 matching id in your finding's description and consider whether emitting a fresh \
-				 finding adds value beyond re-confirming the existing one.",
+				 If a match looks like the same vulnerability you're investigating, do NOT submit \
+				 a duplicate — the agent surface is meant to suppress repeats, not amplify them.",
 			"inputSchema": {
 				"type": "object",
 				"required": ["query"],
@@ -185,8 +221,8 @@ fn tool_definitions() -> Value {
 					},
 				},
 			},
-		},
-		{
+		}),
+		json!({
 			"name": "get_finding_by_id",
 			"description":
 				"Fetch the full detail view for one prior finding — description, PoC unified diff, \
@@ -205,13 +241,87 @@ fn tool_definitions() -> Value {
 					},
 				},
 			},
-		},
-	])
+		}),
+	];
+	if submissions_enabled {
+		tools.push(json!({
+			"name": "submit_finding",
+			"description":
+				"Report a confirmed vulnerability. This is the only path for emitting a finding \
+				 from the agent — the worker does not parse findings out of your text response. \
+				 Call this once per real, exploitable vulnerability you've found in the file you're \
+				 reviewing, only after you've verified the bug is real and (where appropriate) \
+				 cross-checked against `query_prior_findings` to avoid duplicating an existing \
+				 report. The PoC must be a unified diff that adds a regression test demonstrating \
+				 the bug — failing on HEAD, would pass once the bug is fixed. Submitting a finding \
+				 you're not confident about is worse than not submitting one.",
+			"inputSchema": {
+				"type": "object",
+				"required": [
+					"severity", "title", "file", "line_start", "line_end",
+					"description", "poc_unified",
+				],
+				"properties": {
+					"severity": {
+						"type": "string",
+						"enum": ["info", "low", "medium", "high", "critical"],
+						"description": "Impact level. `critical` for unauthenticated RCE / mass data \
+							exposure; `high` for authenticated RCE / privilege escalation / serious \
+							data leaks; `medium` for typical exploitable bugs; `low` for hardening \
+							issues; `info` for advisory-only.",
+					},
+					"title": {
+						"type": "string",
+						"description":
+							"Short imperative title (under ~80 chars). E.g. \
+							 'Unchecked array index in request handler' — not a CVE-style ID.",
+					},
+					"file": {
+						"type": "string",
+						"description":
+							"Path to the vulnerable file, relative to the worktree root. \
+							 The same path you were asked to inspect in the prompt.",
+					},
+					"line_start": {
+						"type": "integer",
+						"description": "First line of the bug (1-indexed).",
+						"minimum": 1,
+					},
+					"line_end": {
+						"type": "integer",
+						"description":
+							"Last line of the bug (1-indexed, inclusive). Equal to line_start \
+							 when the bug spans one line.",
+						"minimum": 1,
+					},
+					"description": {
+						"type": "string",
+						"description":
+							"Mechanism + impact + reproduction sketch. Aim for ~200 words. \
+							 Mention any prior-finding ids you considered and ruled out.",
+					},
+					"poc_unified": {
+						"type": "string",
+						"description":
+							"Unified diff that adds a regression test demonstrating the bug. \
+							 The diff must apply against the worktree as it stands and the test \
+							 must fail on HEAD; once the bug is fixed the test passes. Use the \
+							 repo's existing test framework (`#[test]` for Rust, `pytest` for \
+							 Python, etc.).",
+					},
+					"cwe": {
+						"type": "string",
+						"description":
+							"Optional CWE-NNN string (e.g. 'CWE-129'). Omit if you're not sure.",
+					},
+				},
+			},
+		}));
+	}
+	Value::Array(tools)
 }
 
-async fn handle_tool_call(
-	client: &Arc<ServerClient>, repo_id: i64, req: &Request, id: Value,
-) -> Response {
+async fn handle_tool_call(session: &Arc<Session>, req: &Request, id: Value) -> Response {
 	let params = req.params.as_ref();
 	let tool_name = params.and_then(|p| p.get("name")).and_then(|n| n.as_str()).unwrap_or("");
 	let arguments = params
@@ -220,8 +330,11 @@ async fn handle_tool_call(
 		.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
 	let result: Result<String> = match tool_name {
-		"query_prior_findings" => tool_query_prior_findings(client, repo_id, &arguments).await,
-		"get_finding_by_id" => tool_get_finding_by_id(client, &arguments).await,
+		"query_prior_findings" => {
+			tool_query_prior_findings(&session.client, session.repo_id, &arguments).await
+		},
+		"get_finding_by_id" => tool_get_finding_by_id(&session.client, &arguments).await,
+		"submit_finding" => tool_submit_finding(session, &arguments).await,
 		other => Err(anyhow::anyhow!("unknown tool: {other}")),
 	};
 
@@ -325,6 +438,127 @@ async fn tool_query_prior_findings(
 	Ok(out)
 }
 
+/// Build a [`Finding`] from `submit_finding` arguments.
+///
+/// Pure function — extracted from `tool_submit_finding` so tests can
+/// exercise the fingerprint / clamp / parse logic without standing
+/// up an MCP server or a real HTTP backend.
+pub(crate) fn build_finding_from_args(workdir: &Path, args: &Value) -> Result<Finding> {
+	let severity_str = args
+		.get("severity")
+		.and_then(|v| v.as_str())
+		.context("`severity` is required and must be a string")?;
+	let severity: Severity =
+		severity_str.parse().with_context(|| format!("unknown severity: `{severity_str}`"))?;
+	let title = args
+		.get("title")
+		.and_then(|v| v.as_str())
+		.context("`title` is required and must be a string")?
+		.to_owned();
+	let file = args
+		.get("file")
+		.and_then(|v| v.as_str())
+		.context("`file` is required and must be a string")?;
+	let line_start = args
+		.get("line_start")
+		.and_then(|v| v.as_u64())
+		.context("`line_start` is required and must be a positive integer")?
+		.min(u32::MAX as u64) as u32;
+	let line_end = args
+		.get("line_end")
+		.and_then(|v| v.as_u64())
+		.context("`line_end` is required and must be a positive integer")?
+		.min(u32::MAX as u64) as u32;
+	let description = args
+		.get("description")
+		.and_then(|v| v.as_str())
+		.context("`description` is required and must be a string")?
+		.to_owned();
+	let poc_unified = args
+		.get("poc_unified")
+		.and_then(|v| v.as_str())
+		.context("`poc_unified` is required and must be a string")?
+		.to_owned();
+	let cwe = args.get("cwe").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
+
+	// Sandbox-leak guard: the agent occasionally echoes the in-bwrap
+	// path. Strip it so the file recorded on the server is repo-
+	// relative regardless of where the agent was looking from.
+	let rel_file = file.strip_prefix("/workdir/").unwrap_or(file).trim_start_matches('/');
+	let fingerprint = fingerprint_for(workdir, rel_file, line_start, line_end);
+
+	Ok(Finding {
+		scanner_id: SCANNER_ID.into(),
+		severity,
+		title,
+		description,
+		file_path: Some(rel_file.to_owned()),
+		line_start: Some(line_start),
+		line_end: Some(line_end),
+		cwe,
+		patch_unified: None,
+		poc_unified: Some(poc_unified),
+		fingerprint,
+	})
+}
+
+async fn tool_submit_finding(session: &Arc<Session>, args: &Value) -> Result<String> {
+	let job_id = session.job_id.context(
+		"submit_finding called but the MCP server was started without --job-id; \
+		 nowhere to attribute the submission. This is a worker-side configuration \
+		 bug — the tool should not have been advertised.",
+	)?;
+	let finding = build_finding_from_args(&session.workdir, args)?;
+	let title = finding.title.clone();
+	let file = finding.file_path.clone().unwrap_or_default();
+	let fingerprint = finding.fingerprint.clone();
+	let batch = FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: vec![finding] };
+	session
+		.client
+		.submit_findings(job_id, &batch)
+		.await
+		.with_context(|| format!("submitting finding for {file} to /v1/jobs/{job_id}/findings"))?;
+	tracing::info!(
+		job_id, repo_id = session.repo_id, %file, %title, fingerprint = %fingerprint,
+		"loupe-mcp: agent submitted a finding",
+	);
+	Ok(format!(
+		"Submitted. job={job_id} fingerprint={fingerprint}\n\
+		 The server applies UNIQUE(repo_id, fingerprint) on insert; if this finding hash-matches a \
+		 prior one, the row was silently skipped — that's the dedup floor and is fine."
+	))
+}
+
+/// Read `workdir/file` and compute the fingerprint for the bug at
+/// `line_start..=line_end`. Falls back to a degenerate-but-safe input
+/// when the file can't be read (model hallucinated a path, file is
+/// non-UTF-8, etc.) so submission still succeeds — the line range
+/// alone is the worst-case fingerprint input.
+fn fingerprint_for(workdir: &Path, file: &str, line_start: u32, line_end: u32) -> String {
+	let abs = workdir.join(file);
+	let source = match std::fs::read_to_string(&abs) {
+		Ok(s) => s,
+		Err(e) => {
+			tracing::warn!(
+				file, error = %e,
+				"fingerprint: could not read worktree file; falling back to line-range-only window",
+			);
+			return crate::fingerprint::compute(
+				SCANNER_ID,
+				file,
+				&format!("L{line_start}-L{line_end}"),
+			);
+		},
+	};
+	let window = crate::fingerprint::extract_window(
+		&source,
+		line_start,
+		line_end,
+		FINGERPRINT_CONTEXT_LINES,
+	);
+	crate::fingerprint::compute(SCANNER_ID, file, &window)
+}
+
 fn write_response<W: Write>(w: &mut W, resp: &Response) -> Result<()> {
 	let line = serde_json::to_string(resp)?;
 	tracing::debug!(response = %line, "loupe-mcp: sending response");
@@ -342,7 +576,7 @@ mod tests {
 		// The MCP client (claude) parses tools/list output as JSON
 		// against its own schema; pinning it here catches accidental
 		// breakage of the shape (e.g. forgetting `inputSchema`).
-		let v = tool_definitions();
+		let v = tool_definitions(true);
 		let arr = v.as_array().expect("tools must serialise as an array");
 		assert!(!arr.is_empty());
 		for t in arr {
@@ -354,5 +588,121 @@ mod tests {
 			let schema = t.get("inputSchema").expect("tool needs `inputSchema`");
 			assert_eq!(schema.get("type").and_then(|t| t.as_str()), Some("object"));
 		}
+	}
+
+	#[test]
+	fn submit_finding_only_appears_when_job_id_is_set() {
+		let with = tool_definitions(true);
+		let names: Vec<&str> =
+			with.as_array().unwrap().iter().filter_map(|t| t.get("name")?.as_str()).collect();
+		assert!(names.contains(&"submit_finding"), "got: {names:?}");
+
+		let without = tool_definitions(false);
+		let names: Vec<&str> =
+			without.as_array().unwrap().iter().filter_map(|t| t.get("name")?.as_str()).collect();
+		assert!(!names.contains(&"submit_finding"), "got: {names:?}");
+		// Read-only tools always advertised.
+		assert!(names.contains(&"query_prior_findings"));
+		assert!(names.contains(&"get_finding_by_id"));
+	}
+
+	#[test]
+	fn build_finding_extracts_window_and_fingerprints_it() {
+		// Two cosmetically-different fixtures with the same bug body
+		// must produce the same fingerprint — that's the whole point
+		// of the normalisation in `fingerprint::compute`. Pinned here
+		// because the fingerprint logic now lives in the MCP server,
+		// not the scanner; if the helper drifts off the normalisation
+		// contract we want this test to flag it.
+		let workdir_a = tempfile::tempdir().unwrap();
+		std::fs::create_dir_all(workdir_a.path().join("src")).unwrap();
+		std::fs::write(
+			workdir_a.path().join("src/lib.rs"),
+			"pub fn idx(arr: &[u8], i: usize) -> u8 { arr[i] }\n",
+		)
+		.unwrap();
+
+		let workdir_b = tempfile::tempdir().unwrap();
+		std::fs::create_dir_all(workdir_b.path().join("src")).unwrap();
+		std::fs::write(
+			workdir_b.path().join("src/lib.rs"),
+			"pub fn idx(arr: &[u8], i: usize) -> u8 {  arr[i]  }\n", // extra spaces
+		)
+		.unwrap();
+
+		let args = json!({
+			"severity": "high",
+			"title": "oob index",
+			"file": "src/lib.rs",
+			"line_start": 1,
+			"line_end": 1,
+			"description": "unchecked index",
+			"poc_unified": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@\n+#[test] fn t() {}\n",
+		});
+		let f_a = build_finding_from_args(workdir_a.path(), &args).expect("a");
+		let f_b = build_finding_from_args(workdir_b.path(), &args).expect("b");
+		assert_eq!(
+			f_a.fingerprint, f_b.fingerprint,
+			"whitespace-only difference must not shift the fingerprint",
+		);
+		assert_eq!(f_a.scanner_id, SCANNER_ID);
+		assert_eq!(f_a.severity, Severity::High);
+		assert_eq!(f_a.file_path.as_deref(), Some("src/lib.rs"));
+		assert!(f_a.poc_unified.as_deref().unwrap().contains("#[test]"));
+	}
+
+	#[test]
+	fn build_finding_strips_sandbox_workdir_prefix() {
+		// Agents sometimes echo back the in-sandbox absolute path
+		// (`/workdir/src/lib.rs`) instead of the repo-relative one we
+		// asked for. Storing the absolute form would confuse
+		// downstream consumers (issue trackers, etc.) — strip it.
+		let workdir = tempfile::tempdir().unwrap();
+		std::fs::create_dir_all(workdir.path().join("src")).unwrap();
+		std::fs::write(workdir.path().join("src/lib.rs"), "fn x() {}\n").unwrap();
+
+		let args = json!({
+			"severity": "low",
+			"title": "t",
+			"file": "/workdir/src/lib.rs",
+			"line_start": 1,
+			"line_end": 1,
+			"description": "d",
+			"poc_unified": "x",
+		});
+		let f = build_finding_from_args(workdir.path(), &args).expect("ok");
+		assert_eq!(f.file_path.as_deref(), Some("src/lib.rs"));
+	}
+
+	#[test]
+	fn build_finding_rejects_missing_required_fields() {
+		let workdir = tempfile::tempdir().unwrap();
+		// No `title`.
+		let args = json!({
+			"severity": "low",
+			"file": "src/x.rs",
+			"line_start": 1,
+			"line_end": 1,
+			"description": "d",
+			"poc_unified": "x",
+		});
+		let err = build_finding_from_args(workdir.path(), &args).expect_err("must fail");
+		assert!(err.to_string().contains("title"), "got: {err}");
+	}
+
+	#[test]
+	fn build_finding_rejects_unknown_severity() {
+		let workdir = tempfile::tempdir().unwrap();
+		let args = json!({
+			"severity": "extreme",
+			"title": "t",
+			"file": "src/x.rs",
+			"line_start": 1,
+			"line_end": 1,
+			"description": "d",
+			"poc_unified": "x",
+		});
+		let err = build_finding_from_args(workdir.path(), &args).expect_err("must fail");
+		assert!(err.to_string().to_lowercase().contains("severity"), "got: {err}");
 	}
 }

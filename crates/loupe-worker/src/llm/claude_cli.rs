@@ -70,12 +70,36 @@ struct McpScratch {
 	config_path: PathBuf,
 }
 
-fn prepare_mcp_scratch(ctx: &McpContext, repo_id: i64) -> Result<McpScratch> {
+fn prepare_mcp_scratch(
+	ctx: &McpContext, repo_id: i64, job_id: Option<i64>, sandbox_workdir: &str,
+) -> Result<McpScratch> {
 	let dir = tempfile::Builder::new()
 		.prefix("loupe-mcp-")
 		.tempdir()
 		.context("creating MCP scratch tempdir")?;
 	let config_path = dir.path().join("mcp-config.json");
+	// Build the args list. `--job-id` only goes in when the caller
+	// supplied one in the request; without it, `submit_finding` is
+	// not advertised on the MCP-server side.
+	let mut args: Vec<String> = vec![
+		"mcp-serve".into(),
+		"--server-url".into(),
+		ctx.server_url.clone(),
+		"--ca-cert".into(),
+		SANDBOX_CA_CERT.into(),
+		"--cert".into(),
+		SANDBOX_CLIENT_CERT.into(),
+		"--key".into(),
+		SANDBOX_CLIENT_KEY.into(),
+		"--repo-id".into(),
+		repo_id.to_string(),
+		"--workdir".into(),
+		sandbox_workdir.to_owned(),
+	];
+	if let Some(j) = job_id {
+		args.push("--job-id".into());
+		args.push(j.to_string());
+	}
 	let config = serde_json::json!({
 		"mcpServers": {
 			"loupe": {
@@ -84,14 +108,7 @@ fn prepare_mcp_scratch(ctx: &McpContext, repo_id: i64) -> Result<McpScratch> {
 				// SANDBOX_LOUPE_BIN, the cert files under /loupe/...
 				// — see the bind_ro calls above.
 				"command": SANDBOX_LOUPE_BIN,
-				"args": [
-					"mcp-serve",
-					"--server-url", ctx.server_url,
-					"--ca-cert", SANDBOX_CA_CERT,
-					"--cert", SANDBOX_CLIENT_CERT,
-					"--key", SANDBOX_CLIENT_KEY,
-					"--repo-id", repo_id.to_string(),
-				],
+				"args": args,
 				// The MCP child inherits the bwrap'd env, which has
 				// HOME=/home/scanner + the forwarded ANTHROPIC_API_KEY
 				// (irrelevant for the MCP child but harmless). No
@@ -105,6 +122,7 @@ fn prepare_mcp_scratch(ctx: &McpContext, repo_id: i64) -> Result<McpScratch> {
 	tracing::debug!(
 		config_path = %config_path.display(),
 		repo_id,
+		job_id = ?job_id,
 		"loupe-mcp: prepared per-call scratch config",
 	);
 	Ok(McpScratch { dir, config_path })
@@ -197,8 +215,19 @@ impl LlmBackend for ClaudeCliBackend {
 		// early would unlink the config file out from under claude.
 		let _mcp_scratch = match (&self.mcp, req.repo_id) {
 			(Some(ctx), Some(repo_id)) => {
-				let scratch =
-					prepare_mcp_scratch(ctx, repo_id).context("preparing MCP scratch directory")?;
+				// Inside bwrap the worktree is at `/workdir`; in dev-
+				// only `LOUPE_DISABLE_SANDBOX` mode the MCP child has
+				// the same filesystem view as the worker, so the host
+				// path works directly.
+				let sandbox_workdir = if std::env::var_os(crate::sandbox::DISABLE_SANDBOX_ENV)
+					.is_some_and(|v| !v.is_empty())
+				{
+					req.workdir.to_string_lossy().into_owned()
+				} else {
+					"/workdir".to_owned()
+				};
+				let scratch = prepare_mcp_scratch(ctx, repo_id, req.job_id, &sandbox_workdir)
+					.context("preparing MCP scratch directory")?;
 				sandbox = sandbox
 					.bind_ro(ctx.worker_binary.clone(), SANDBOX_LOUPE_BIN)
 					.bind_ro(ctx.ca_cert_path.clone(), SANDBOX_CA_CERT)
@@ -352,6 +381,7 @@ mod tests {
 			timeout: Duration::from_secs(60),
 			cancel: CancellationToken::new(),
 			repo_id: None,
+			job_id: None,
 		};
 		let resp = backend.run(req).await.expect("claude responded");
 		assert_eq!(resp.backend_id, BACKEND_ID);
@@ -369,6 +399,7 @@ mod tests {
 			timeout: Duration::from_secs(5),
 			cancel: CancellationToken::new(),
 			repo_id: None,
+			job_id: None,
 		};
 		let err = backend.run(req).await.expect_err("must error");
 		let msg = err.to_string().to_lowercase();

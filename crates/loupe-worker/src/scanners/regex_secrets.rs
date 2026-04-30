@@ -149,6 +149,7 @@ mod tests {
 		ScanContext {
 			workdir: workdir.to_path_buf(),
 			repo_id: 1,
+			job_id: 1,
 			repo: RepoSpec {
 				host: "github.com".into(),
 				owner: "a".into(),

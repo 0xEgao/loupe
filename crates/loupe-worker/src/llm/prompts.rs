@@ -1,17 +1,17 @@
-//! Discovery and validation prompts for the LLM code-review scanner.
+//! Prompts for the LLM code-review scanner.
 //!
-//! Both prompts ask for **structured JSON** as the only output format.
-//! The scanner's parser tolerates a JSON object embedded in surrounding
-//! prose (the model often emits "Here's the result: { … }" before its
-//! actual answer), but on parse failure the file's report is dropped
-//! and a warning is logged. We do not attempt to extract findings from
-//! free-form text.
+//! A single agent session does discovery, dedup-check, PoC generation,
+//! and submission. The model uses MCP tools — `query_prior_findings`,
+//! `get_finding_by_id`, `submit_finding` — to drive that loop. The
+//! worker doesn't parse findings out of the model's text response;
+//! emission only happens via `submit_finding`.
 
 /// Discovery prompt — runs once per source file.
 ///
-/// `{file}` is replaced with the worktree-relative path of the file the
-/// model should focus on. The file lives at `/workdir/{file}` inside
-/// the sandbox (worktree is bind-mounted read-only at `/workdir`).
+/// `{file}` is replaced with the worktree-relative path of the file
+/// the agent should focus on. The file lives at `/workdir/{file}`
+/// inside the sandbox (worktree is bind-mounted read-only at
+/// `/workdir`).
 pub const DISCOVERY: &str = r##"
 You are a security code reviewer playing in a CTF. Inspect the file
 `{file}` (located at `/workdir/{file}`) for the single most serious
@@ -19,86 +19,61 @@ exploitable vulnerability you can find. Look for: memory-safety bugs,
 auth/authorization flaws, injection (SQL, command, path traversal),
 secret leaks, broken cryptography, insecure deserialisation, race
 conditions with security impact, integer overflows reaching length
-checks, anything that lets an adversary escalate privileges or
+checks — anything that lets an adversary escalate privileges or
 exfiltrate data.
 
-Output **exactly one JSON object** and nothing else. No prose, no
-markdown fences, no follow-up. The object must have these fields:
+You have these MCP tools available (provided by the loupe MCP server):
 
-```
-{
-  "found": true | false,
-  "severity": "info" | "low" | "medium" | "high" | "critical",
-  "title": "<short title>",
-  "file": "<the path you were given, verbatim>",
-  "line_start": <1-based int>,
-  "line_end": <1-based int>,
-  "description": "<200 words max, mechanism + impact + reproduction sketch>",
-  "cwe": "<optional CWE-NNN string>"
-}
-```
+- `query_prior_findings(query, limit?)` — keyword-search prior findings
+  on this same repo. Use it before reporting anything to check whether
+  the bug you're seeing has already been surfaced. The repo may have
+  been scanned many times; a duplicate report is wasted spend.
+- `get_finding_by_id(id)` — fetch a prior finding's full body
+  (description + PoC) when a search hit looks like it might match
+  what you're investigating.
+- `submit_finding(severity, title, file, line_start, line_end,
+  description, poc_unified, cwe?)` — the **only** way to report a
+  finding. The worker does not parse your text response. If you don't
+  call this tool, no finding is emitted.
 
-If you found nothing serious, return `{"found": false}`.
+Your workflow:
 
-Before deciding `found: true`, you may use the `query_prior_findings`
-MCP tool (when available) to check whether the same vulnerability has
-already been reported on this repo in a previous scan. Search with
-keywords from the bug — function name, vulnerability class, CWE if
-known. If a prior finding clearly describes the same issue, the most
-useful thing is usually to NOT re-emit it: return `{"found": false}`
-so the run doesn't re-confirm a known bug. Only re-emit if you see
-something materially different about the current state of the code
-(e.g. the original was dismissed and the bug returned, or the
-location moved). The tool is optional — if it's not available or
-returns nothing, proceed with your usual judgment.
-"##;
+1. Read the target file.
+2. Identify the single most serious exploitable vulnerability, or
+   conclude that the file is clean.
+3. If you found something: search prior findings with relevant
+   keywords. If a hit clearly matches the bug you'd report, do NOT
+   submit — return without calling `submit_finding`.
+4. Otherwise: write a unified diff that adds a regression test
+   demonstrating the bug. The test must FAIL on the current HEAD and
+   would pass once the bug is fixed. Use the repo's existing test
+   framework (`#[test]` for Rust, `pytest` for Python, etc.). The diff
+   must be applicable with `git apply` against the worktree as it
+   stands.
+5. Call `submit_finding` once with the full report (severity, title,
+   location, description, your PoC diff, CWE if known).
 
-/// Validation prompt — runs once per discovered finding.
-///
-/// `{finding_json}` is replaced with the JSON object emitted by the
-/// discovery pass. `{file}` is the worktree-relative path. The model
-/// should re-read the file at `/workdir/{file}` (it can use whatever
-/// tools the backend provides — `claude` reads files itself).
-pub const VALIDATE: &str = r##"
-You are validating a vulnerability report for a CTF. Re-read the file
-`{file}` (located at `/workdir/{file}`) and decide whether the
-following finding is real and exploitable, or whether it's a
-false-positive.
+Constraints:
 
-Reported finding:
-{finding_json}
-
-If you confirm the finding, write a unified diff that adds a
-**regression test** demonstrating the bug. The test must FAIL on the
-current HEAD and would pass once the bug is fixed. Use any standard
-test framework already present in the repo (`#[test]` for Rust,
-`pytest` for Python, etc.). The diff must be applicable with
-`git apply` against the worktree as it stands.
-
-Output **exactly one JSON object** and nothing else:
-
-```
-{
-  "verdict": "confirmed" | "rejected" | "inconclusive",
-  "notes": "<one sentence on why>",
-  "poc_unified": "<unified diff text, or null if not confirmed>"
-}
-```
-
-When `verdict = "confirmed"`, `poc_unified` MUST be a non-empty unified
-diff. When the verdict is anything else, `poc_unified` MUST be null.
+- One vulnerability per file at most. Pick the most serious; don't
+  spray.
+- Do not call `submit_finding` for hardening notes, style issues, or
+  bugs you can't write a regression test for.
+- Your text response is logged but not parsed. Use it for diagnostic
+  notes if useful; do not put findings there.
 "##;
 
 /// Cross-model verification prompt — runs once per finding when the
 /// server has enqueued a `kind=verify` job. Independent second
 /// opinion: takes the original finding (rendered as JSON) and asks
 /// the model whether it agrees with the diagnosis. No PoC requested
-/// — the original validator already produced one (see `VALIDATE`).
+/// — the original session already produced one.
 ///
-/// `{file}` and `{finding_json}` placeholders match the validation
-/// prompt's. We keep the phrase "validating a vulnerability report"
-/// out of this template so a stub backend keying on prompt content
-/// can tell the verify and validate paths apart.
+/// `{file}` and `{finding_json}` placeholders are filled by the
+/// verifier scanner. The verifier still parses JSON out of the
+/// model's stdout because the verify path doesn't yet have an MCP
+/// surface — that wiring is independent of the discovery flow and
+/// can move to a tool-based shape later.
 pub const VERIFY: &str = r##"
 You are providing an independent second opinion on a vulnerability
 report from another security reviewer. Re-read the file `{file}`
@@ -124,7 +99,7 @@ caller's invariants). Prefer a definite verdict when you can.
 
 /// Substitute `{key}` placeholders in a template. Simple sentinel-
 /// based replacement — no escaping, no nested templates. Used for the
-/// two prompts above.
+/// prompts above.
 pub fn render(template: &str, vars: &[(&str, &str)]) -> String {
 	let mut out = template.to_owned();
 	for (k, v) in vars {
@@ -158,18 +133,19 @@ mod tests {
 	}
 
 	#[test]
-	fn validate_template_has_required_placeholders() {
-		assert!(VALIDATE.contains("{file}"));
-		assert!(VALIDATE.contains("{finding_json}"));
+	fn discovery_prompt_directs_agent_to_the_submit_tool() {
+		// The single most important contract of the new flow: the
+		// model knows submission goes through `submit_finding`, not
+		// stdout.
+		assert!(
+			DISCOVERY.contains("submit_finding"),
+			"discovery prompt must reference the submit_finding tool",
+		);
 	}
 
 	#[test]
-	fn verify_template_distinct_from_validate() {
-		// A stub backend that keys on prompt content must be able to
-		// tell a VERIFY call apart from a VALIDATE call. We rely on
-		// the "validating a vulnerability report" phrase appearing in
-		// VALIDATE only.
-		assert!(VALIDATE.contains("validating a vulnerability report"));
-		assert!(!VERIFY.contains("validating a vulnerability report"));
+	fn verify_template_has_required_placeholders() {
+		assert!(VERIFY.contains("{file}"));
+		assert!(VERIFY.contains("{finding_json}"));
 	}
 }
