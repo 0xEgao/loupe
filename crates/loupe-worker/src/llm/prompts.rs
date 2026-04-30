@@ -14,13 +14,13 @@
 /// `/workdir`).
 pub const DISCOVERY: &str = r##"
 You are a security code reviewer playing in a CTF. Inspect the file
-`{file}` (located at `/workdir/{file}`) for the single most serious
-exploitable vulnerability you can find. Look for: memory-safety bugs,
-auth/authorization flaws, injection (SQL, command, path traversal),
-secret leaks, broken cryptography, insecure deserialisation, race
-conditions with security impact, integer overflows reaching length
-checks — anything that lets an adversary escalate privileges or
-exfiltrate data.
+`{file}` (located at `/workdir/{file}`) for **every** real, exploitable
+vulnerability you can find. Look for: memory-safety bugs, auth /
+authorization flaws, injection (SQL, command, path traversal), secret
+leaks, broken cryptography, insecure deserialisation, race conditions
+with security impact, integer overflows reaching length checks —
+anything that lets an adversary escalate privileges or exfiltrate
+data.
 
 You have these MCP tools available (provided by the loupe MCP server):
 
@@ -34,7 +34,9 @@ You have these MCP tools available (provided by the loupe MCP server):
 - `submit_finding(severity, title, file, line_start, line_end,
   description, poc_unified, cwe?)` — the **only** way to report a
   finding. The worker does not parse your text response. If you don't
-  call this tool, no finding is emitted.
+  call this tool, no finding is emitted. You can call it multiple
+  times in one session — once per distinct vulnerability you've
+  confirmed.
 - `validate_poc(poc_unified)` — pre-flight your PoC diff: runs
   `git apply --check` against the worktree without writing anything
   and returns `{applies, error?}`. Call this before `submit_finding`;
@@ -43,29 +45,35 @@ You have these MCP tools available (provided by the loupe MCP server):
 
 Your workflow:
 
-1. Read the target file.
-2. Identify the single most serious exploitable vulnerability, or
-   conclude that the file is clean.
-3. If you found something: search prior findings with relevant
-   keywords. If a hit clearly matches the bug you'd report, do NOT
-   submit — return without calling `submit_finding`.
-4. Otherwise: write a unified diff that adds a regression test
-   demonstrating the bug. The test must FAIL on the current HEAD and
-   would pass once the bug is fixed. Use the repo's existing test
-   framework (`#[test]` for Rust, `pytest` for Python, etc.). The diff
-   must be applicable with `git apply` against the worktree as it
-   stands.
-5. Call `validate_poc` to check that your diff applies cleanly. If it
-   doesn't, revise the diff and re-check.
-6. Call `submit_finding` once with the full report (severity, title,
-   location, description, your PoC diff, CWE if known).
+1. Read the target file end-to-end.
+2. Enumerate the real, exploitable vulnerabilities you can find,
+   ordered by severity (critical → high → medium → low). If you
+   genuinely see nothing exploitable, you're done; return.
+3. For each candidate, in order:
+   a. Search prior findings (`query_prior_findings`) with keywords
+      from the bug — function name, vulnerability class, CWE if
+      known. If a hit clearly matches, fetch its body via
+      `get_finding_by_id` to confirm; if it really is the same bug,
+      **skip this candidate and move on to the next one** — do not
+      stop the session, and do not call `submit_finding`. A prior
+      finding suppresses *that one* report, not the whole file.
+   b. Otherwise, write a unified diff adding a regression test that
+      FAILS on HEAD and would pass once the bug is fixed. Use the
+      repo's existing test framework (`#[test]` for Rust, `pytest`
+      for Python, etc.).
+   c. Call `validate_poc` to confirm the diff applies cleanly. If it
+      doesn't, revise the diff and re-check.
+   d. Call `submit_finding` with the full report.
+4. Continue step 3 until every candidate has been either submitted
+   or skipped (as a duplicate). Then return.
 
 Constraints:
 
-- One vulnerability per file at most. Pick the most serious; don't
-  spray.
+- One `submit_finding` call per distinct vulnerability — don't bundle
+  multiple bugs into one report, and don't double-submit the same bug
+  under different titles.
 - Do not call `submit_finding` for hardening notes, style issues, or
-  bugs you can't write a regression test for.
+  bugs you can't write a regression test for. Quality over volume.
 - Your text response is logged but not parsed. Use it for diagnostic
   notes if useful; do not put findings there.
 "##;
@@ -147,6 +155,28 @@ mod tests {
 		assert!(
 			DISCOVERY.contains("submit_finding"),
 			"discovery prompt must reference the submit_finding tool",
+		);
+	}
+
+	#[test]
+	fn discovery_prompt_tells_agent_to_keep_going_after_a_dup() {
+		// Failure mode this test guards: under continuous scanning, if
+		// the model finds the most-serious bug, sees it's already
+		// reported, and exits, we never drill down to the second-most-
+		// serious bug. The prompt must explicitly say "skip this one,
+		// move on to the next" — not "you're done."
+		//
+		// Compare against a whitespace-collapsed copy so prose reflow
+		// (which moves "multiple times" across a line break, etc.)
+		// doesn't break the pin.
+		let collapsed: String = DISCOVERY.split_whitespace().collect::<Vec<_>>().join(" ");
+		assert!(
+			collapsed.contains("call it multiple times"),
+			"prompt must tell the agent submit_finding accepts multiple calls per session",
+		);
+		assert!(
+			collapsed.contains("move on to the next"),
+			"prompt must tell the agent a duplicate skips that finding, not the session",
 		);
 	}
 
