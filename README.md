@@ -11,8 +11,8 @@ mTLS:
 - **`loupe-server`** — long-running daemon. Holds the SQLite database
   (registered repos, jobs, findings, secrets), runs the scheduler, hands
   out leases, accepts findings + verdicts, and dispatches confirmed
-  findings to the configured reporter (GitHub issues today; sendmail
-  for plain email).
+  findings to the configured reporter — today: GitHub issues, or no
+  reporter at all (manual triage via `loupectl`).
 - **`loupe-worker`** — fleet of stateless workers. Authenticate with the
   server using a client cert minted at registration time, lease a job,
   clone the repo into a local cache, run the configured scanners, and
@@ -23,8 +23,9 @@ mTLS:
   otherwise be doing by hand: register repos, mint worker certs, trigger
   scans, inspect findings.
 
-The full design and milestone status (LLM-scanner pipeline, verification
-flow, deferred work) live in `LOUPE.md`.
+For the architecture in one page (component diagram, data lifecycle,
+mTLS topology), see `ARCH.md`. For milestone-by-milestone status —
+what's shipped, what's deferred — see `LOUPE.md`.
 
 ## Prerequisites
 
@@ -49,11 +50,11 @@ Before installing, the host needs:
   bubblewrap mount keeping each invocation's `/tmp` and `$HOME` fresh.
   See https://github.com/anthropics/claude-code for install
   instructions.
-- **`/usr/sbin/sendmail`** on the *server* host, only if you intend to
-  use the email reporter. The GitHub-issue reporter has no extra
-  prereq beyond outbound HTTPS to `api.github.com`.
 - **A GitHub personal access token** for each target tracker repo,
-  only if you intend to use the GitHub-issue reporter. The token is
+  only if you intend to use the GitHub-issue reporter (skip this
+  prereq when registering repos with `--no-reporting` for manual
+  triage). The GitHub-issue reporter has no extra prereq beyond
+  outbound HTTPS to `api.github.com`. The token is
   used by the server to call `POST /repos/{owner}/{repo}/issues`, so
   it needs scope to file issues on the *tracker* repo (not the source
   repo being scanned — those can be different). Required scopes:
@@ -275,9 +276,14 @@ triaged versus still pending.
 loupectl job list
 loupectl job get  <job-id>
 loupectl finding list <repo-id>
-loupectl finding show <finding-id>     # pretty-printed for human review
+loupectl finding show <finding-id>          # pretty-printed for human review
 loupectl finding show <finding-id> --json   # raw FindingDetail DTO
+loupectl finding search <repo-id> "<keywords>"  # FTS5 keyword search
 ```
+
+`finding search` is also reachable from inside the LLM scanner — the
+MCP tool `query_prior_findings` calls the same endpoint, so the
+agent can ask "have we seen anything like this before?" mid-scan.
 
 ### 8. Adjust an existing repo
 
@@ -381,11 +387,12 @@ crates/
   loupe-core      shared types: Finding, Verdict, ReportingDestination
   loupe-proto     wire-format DTOs (versioned protocol, X-Loupe-Protocol)
   loupe-tls       internal CA + cert minting + fingerprint helpers
-  loupe-storage   SQLite DAO surface, migrations, secrets table
-  loupe-server    daemon binary + routes + reporters + scheduler/reaper
-  loupe-worker    worker binary + scanner trait + LLM backend + sandbox
+  loupe-storage   SQLCipher DAO surface, FTS5 index, migrations
+  loupe-server    daemon binary + mTLS routes + reporters + scheduler/reaper
+  loupe-worker    worker binary (`run` + `mcp-serve` subcommands) +
+                  scanner trait + LLM backend + bwrap sandbox
   loupe-cli       loupectl admin CLI
 ```
 
-See each crate's module-level docs for the design intent and the
-public surface.
+See each crate's module-level docs for the design intent, and
+`ARCH.md` for the cross-crate flow at a glance.
