@@ -220,10 +220,20 @@ impl Runner {
 					tracing::info!(job_id = env.job_id, scanner = s.id(), "running scanner");
 					match s.scan(&ctx).await {
 						Ok(mut findings) => {
+							// `returned_count` is the number of findings the
+							// scanner handed back for the runner to batch-POST
+							// to `/v1/jobs/{id}/findings` below. It's NOT the
+							// total submission count for the job — agent-driven
+							// scanners (e.g. `llm-code-review`) submit
+							// mid-session via the MCP `submit_finding` tool and
+							// always return an empty `Vec`, so a zero here only
+							// means "nothing was added to the batch." Check the
+							// server's findings table for the actual emission
+							// count when an agent scanner runs.
 							tracing::info!(
 								job_id = env.job_id,
 								scanner = s.id(),
-								findings = findings.len(),
+								returned_count = findings.len(),
 								"scanner finished",
 							);
 							all.append(&mut findings);
