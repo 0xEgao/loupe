@@ -99,8 +99,32 @@ Scope of knowledge — read carefully:
   matches upstream's convention" about code you have no path to
   read, stop and re-frame: either the bug stands without that
   external check, or you are uncertain, in which case submit and
-  flag the uncertainty.
+  flag the uncertainty.{bkb_hint}
 "##;
+
+/// Conditional prompt section appended to `DISCOVERY` when the
+/// worker has detected `bkb-mcp` on PATH and attached it to the
+/// per-call MCP config. Tells the agent the bkb tools exist and
+/// how to honestly cite their output. Empty string when bkb is
+/// absent (the agent's tool catalog is the source of truth either
+/// way; we just want to bias usage when the option is real).
+pub const BKB_HINT_ATTACHED: &str = r#"
+- Additionally, this run has the `bkb` MCP server attached: tools
+  `bkb_search`, `bkb_lookup_bip`, `bkb_lookup_bolt`,
+  `bkb_lookup_lud`, `bkb_lookup_nut`, `bkb_lookup_blip`,
+  `bkb_find_commit`, `bkb_get_document`, `bkb_get_references`,
+  `bkb_timeline`. These give you spec + historical context for
+  bitcoin / lightning / cashu codebases (BIPs, BOLTs, LUDs, NUTs,
+  BLIPs, related repos, commits) that the worktree alone won't
+  carry. Use them when reasoning about protocol-conformance
+  questions, message-format invariants, or "is this a known
+  upstream convention" — these are exactly the cases where
+  worktree-only review would otherwise leave you uncertain. Treat
+  bkb's output as *external claims via a tool call*, not as direct
+  source: phrase findings as "per bkb's record of BIP-X" rather
+  than "BIP-X says." If you make a determination that hinges on
+  bkb output, name the call you made in the finding's
+  `description` so a human can audit the chain."#;
 
 /// Cross-model verification prompt — runs once per finding when the
 /// server has enqueued a `kind=verify` job. Independent second
@@ -208,6 +232,41 @@ mod tests {
 	fn verify_template_has_required_placeholders() {
 		assert!(VERIFY.contains("{file}"));
 		assert!(VERIFY.contains("{finding_json}"));
+	}
+
+	#[test]
+	fn bkb_hint_attaches_when_substituted_and_disappears_when_empty() {
+		// The discovery prompt has a `{bkb_hint}` placeholder. The
+		// scanner fills it with `BKB_HINT_ATTACHED` when the worker
+		// has detected bkb-mcp on PATH and attached it to the per-call
+		// MCP config — so the agent's prompt mentions the bkb tools
+		// only when those tools are actually in its tool catalog. With
+		// bkb absent we want zero references to bkb in the prompt;
+		// otherwise the agent would chase tools that aren't there.
+		let with_bkb =
+			render(DISCOVERY, &[("file", "src/foo.rs"), ("bkb_hint", BKB_HINT_ATTACHED)]);
+		assert!(
+			with_bkb.contains("bkb_search"),
+			"bkb-attached prompt must list at least one bkb tool",
+		);
+		assert!(
+			with_bkb.contains("bkb_lookup_bip"),
+			"bkb-attached prompt must list bkb_lookup_bip",
+		);
+		assert!(
+			with_bkb.contains("per bkb's record"),
+			"bkb-attached prompt must teach the agent to cite bkb output as external claims",
+		);
+
+		let without_bkb = render(DISCOVERY, &[("file", "src/foo.rs"), ("bkb_hint", "")]);
+		assert!(
+			!without_bkb.contains("bkb_search"),
+			"bkb-detached prompt must not reference bkb tools at all",
+		);
+		assert!(
+			!without_bkb.contains("bkb"),
+			"bkb-detached prompt must contain no `bkb` substring (would mislead the agent)",
+		);
 	}
 
 	#[test]

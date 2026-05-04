@@ -42,6 +42,7 @@ const SANDBOX_CA_CERT: &str = "/loupe/ca.pem";
 const SANDBOX_CLIENT_CERT: &str = "/loupe/worker.pem";
 const SANDBOX_CLIENT_KEY: &str = "/loupe/worker.key";
 const SANDBOX_MCP_CONFIG: &str = "/loupe/mcp-config.json";
+const SANDBOX_BKB_MCP_BIN: &str = "/loupe/bkb-mcp";
 
 /// Everything the MCP child needs to talk back to loupe-server.
 /// Built once at worker startup from the `loupe-worker run` CLI
@@ -58,6 +59,12 @@ pub struct McpContext {
 	pub ca_cert_path: PathBuf,
 	pub client_cert_path: PathBuf,
 	pub client_key_path: PathBuf,
+	/// Optional `bkb-mcp` binary path. When `Some`, the per-call MCP
+	/// config gets a second server entry exposing bkb's spec /
+	/// historical-context tools (`bkb_search`, `bkb_lookup_bip`, …)
+	/// alongside loupe's `submit_finding`. None means "host doesn't
+	/// have bkb-mcp installed; advertise loupe only."
+	pub bkb_mcp_path: Option<PathBuf>,
 }
 
 /// Per-call MCP scratch: a host-side tempdir holding the JSON
@@ -100,23 +107,44 @@ fn prepare_mcp_scratch(
 		args.push("--job-id".into());
 		args.push(j.to_string());
 	}
-	let config = serde_json::json!({
-		"mcpServers": {
-			"loupe": {
+	let mut servers = serde_json::Map::new();
+	servers.insert(
+		"loupe".to_string(),
+		serde_json::json!({
+			"type": "stdio",
+			// Inside the sandbox the worker binary is mounted at
+			// SANDBOX_LOUPE_BIN, the cert files under /loupe/...
+			// — see the bind_ro calls above.
+			"command": SANDBOX_LOUPE_BIN,
+			"args": args,
+			// The MCP child inherits the bwrap'd env, which has
+			// HOME=/home/scanner + the forwarded ANTHROPIC_API_KEY
+			// (irrelevant for the MCP child but harmless). No
+			// extra env needed at this layer.
+			"env": {}
+		}),
+	);
+	// Conditionally attach bkb-mcp. The binary is bind-mounted under
+	// /loupe/bkb-mcp by the caller (see `run` below). bkb-mcp itself
+	// is a thin client to a BKB HTTP API; the agent's network
+	// namespace is shared with the worker (allow_network), so a
+	// `127.0.0.1:3000` default — or whatever `BKB_API_URL` points at
+	// — is reachable from inside the sandbox.
+	if ctx.bkb_mcp_path.is_some() {
+		servers.insert(
+			"bkb".to_string(),
+			serde_json::json!({
 				"type": "stdio",
-				// Inside the sandbox the worker binary is mounted at
-				// SANDBOX_LOUPE_BIN, the cert files under /loupe/...
-				// — see the bind_ro calls above.
-				"command": SANDBOX_LOUPE_BIN,
-				"args": args,
-				// The MCP child inherits the bwrap'd env, which has
-				// HOME=/home/scanner + the forwarded ANTHROPIC_API_KEY
-				// (irrelevant for the MCP child but harmless). No
-				// extra env needed at this layer.
+				"command": SANDBOX_BKB_MCP_BIN,
+				"args": [],
+				// BKB_API_URL is forwarded into the sandbox by the caller
+				// when the operator has it set; bkb-mcp picks it up
+				// automatically (it reads the env var directly).
 				"env": {}
-			}
-		}
-	});
+			}),
+		);
+	}
+	let config = serde_json::json!({ "mcpServers": servers });
 	std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
 		.with_context(|| format!("writing MCP config at {}", config_path.display()))?;
 	tracing::debug!(
@@ -234,6 +262,16 @@ impl LlmBackend for ClaudeCliBackend {
 					.bind_ro(ctx.client_cert_path.clone(), SANDBOX_CLIENT_CERT)
 					.bind_ro(ctx.client_key_path.clone(), SANDBOX_CLIENT_KEY)
 					.bind_ro(scratch.config_path.clone(), SANDBOX_MCP_CONFIG);
+				// Optional bkb-mcp attachment. Bind-mount the host
+				// binary at a fixed sandbox path so the MCP config
+				// emitted by `prepare_mcp_scratch` can reference it
+				// without leaking the operator's actual install
+				// location. Forward `BKB_API_URL` so a non-default
+				// API endpoint flows through to the MCP child.
+				if let Some(bkb_path) = &ctx.bkb_mcp_path {
+					sandbox = sandbox.bind_ro(bkb_path.clone(), SANDBOX_BKB_MCP_BIN);
+					sandbox = sandbox.forward_env("BKB_API_URL");
+				}
 				Some(scratch)
 			},
 			(Some(_), None) => {
@@ -316,6 +354,30 @@ impl LlmBackend for ClaudeCliBackend {
 
 		let text = String::from_utf8(stdout)
 			.map_err(|e| anyhow!("claude CLI stdout was not UTF-8: {e}"))?;
+		// Debug instrumentation hooks (no-ops when env vars unset):
+		//
+		// - LOUPE_LOG_AGENT_OUTPUT=1 dumps the full agent stdout/stderr at
+		//   info level so a debugging session can see the agent's prose
+		//   (the regular flow only logs char counts).
+		// - claude's stderr on a *successful* exit is otherwise dropped;
+		//   we surface non-empty stderr content at info regardless when
+		//   the env var is set, which catches claude's own diagnostics
+		//   ("rate-limit hit, retrying", auth warnings, etc.).
+		if std::env::var_os("LOUPE_LOG_AGENT_OUTPUT").is_some_and(|v| !v.is_empty()) {
+			tracing::info!(
+				backend = BACKEND_ID,
+				agent_stdout = %text,
+				"claude-cli: agent stdout (full)"
+			);
+			if !stderr.is_empty() {
+				let stderr_text = String::from_utf8_lossy(&stderr);
+				tracing::info!(
+					backend = BACKEND_ID,
+					agent_stderr = %stderr_text,
+					"claude-cli: agent stderr (full)"
+				);
+			}
+		}
 		tracing::debug!(
 			backend = BACKEND_ID,
 			elapsed_ms = started.elapsed().as_millis() as u64,

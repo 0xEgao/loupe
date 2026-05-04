@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use loupe_worker::llm::claude_cli::McpContext;
 use loupe_worker::llm::{
-	build_verifier_backend, claude_available, codex_available, ClaudeCliBackend,
+	bkb_mcp_available, build_verifier_backend, claude_available, codex_available, ClaudeCliBackend,
 };
 use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecretsScanner};
 use loupe_worker::{mcp, sandbox, RepoCache, Runner, Scanner, ServerClient};
@@ -162,6 +162,25 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 		Err(e) => return Err(e.context("LLM scanner requires bubblewrap")),
 	}
 
+	// Optional bkb-mcp auto-attach. When the operator has installed
+	// `bkb-mcp` (cargo install bkb-mcp), the discovery agent gets the
+	// bkb tool surface alongside loupe's submit_finding for spec /
+	// historical-context lookups on bitcoin-shaped projects. The
+	// presence is a single PATH probe — no opt-in flag, no install at
+	// runtime; absence is silent.
+	let bkb_mcp_path = bkb_mcp_available();
+	if let Some(path) = &bkb_mcp_path {
+		tracing::info!(
+			path = %path.display(),
+			"bkb-mcp detected; attaching to discovery agent's MCP config"
+		);
+	} else {
+		tracing::info!(
+			"bkb-mcp not on PATH; discovery agent will run without Bitcoin-context tools \
+			 (install via `cargo install bkb-mcp` to enable)"
+		);
+	}
+
 	if claude {
 		// Resolve the worker binary's host path so the sandbox can
 		// bind-mount it for the MCP child to exec. `current_exe()`
@@ -176,9 +195,11 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 			ca_cert_path: ca_cert.clone(),
 			client_cert_path: cert.clone(),
 			client_key_path: key.clone(),
+			bkb_mcp_path: bkb_mcp_path.clone(),
 		};
 		let backend = Arc::new(ClaudeCliBackend::new().with_mcp_context(mcp_ctx));
-		scanners.push(Arc::new(LlmCodeReviewScanner::new(backend)));
+		scanners
+			.push(Arc::new(LlmCodeReviewScanner::new(backend).with_bkb(bkb_mcp_path.is_some())));
 		tracing::info!("LLM code-review scanner enabled (claude with MCP submit_finding)");
 	} else {
 		tracing::info!(

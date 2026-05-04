@@ -144,6 +144,41 @@ pub fn claude_available() -> bool {
 		.unwrap_or(false)
 }
 
+/// Probe PATH for `bkb-mcp` (Bitcoin Knowledge Base MCP server).
+/// Returns the resolved binary path (via `which`-style lookup) when
+/// available, `None` otherwise.
+///
+/// Optional auto-attached MCP server: when present, the discovery
+/// scanner advertises bkb's `bkb_search` / `bkb_lookup_bip` /
+/// `bkb_lookup_bolt` / etc. tools to the agent so it can pull spec
+/// + historical context for bitcoin/lightning code that the worktree
+/// alone won't surface. See [`crate::llm::claude_cli::McpContext`]
+/// for the attachment plumbing and [`crate::llm::prompts::DISCOVERY`]
+/// for the conditional prompt section.
+///
+/// Install via `cargo install bkb-mcp`; the binary needs to reach
+/// the BKB HTTP API server (default `http://127.0.0.1:3000`,
+/// override with `BKB_API_URL`).
+pub fn bkb_mcp_available() -> Option<PathBuf> {
+	let path = std::env::var_os("PATH")?;
+	for dir in std::env::split_paths(&path) {
+		let candidate = dir.join("bkb-mcp");
+		if candidate.is_file() {
+			let ok = std::process::Command::new(&candidate)
+				.arg("--help")
+				.stdout(Stdio::null())
+				.stderr(Stdio::null())
+				.status()
+				.map(|s| s.success())
+				.unwrap_or(false);
+			if ok {
+				return Some(candidate);
+			}
+		}
+	}
+	None
+}
+
 /// Probe PATH for `codex --version`. Returns `true` only if the
 /// invocation succeeds — a missing binary, non-zero exit, or any IO
 /// error all read as "not available."

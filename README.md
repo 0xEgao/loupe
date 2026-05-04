@@ -58,6 +58,19 @@ Before installing, the host needs:
   installed. The verifier shells out to `codex exec
   --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check`.
   See https://github.com/openai/codex for install instructions.
+- **`bkb-mcp`** (optional) on PATH on workers scanning bitcoin /
+  lightning / cashu codebases. When the binary is present at startup,
+  the discovery agent's per-call MCP config gets a second server
+  entry exposing the bkb tool surface (`bkb_search`, `bkb_lookup_bip`,
+  `bkb_lookup_bolt`, `bkb_lookup_lud`, `bkb_lookup_nut`,
+  `bkb_lookup_blip`, `bkb_find_commit`, `bkb_get_document`,
+  `bkb_get_references`, `bkb_timeline`) so the agent can pull spec +
+  historical context the worktree alone won't carry. Install with
+  `cargo install bkb-mcp`; the binary needs to reach the BKB HTTP
+  API server (default `http://127.0.0.1:3000`, override with
+  `BKB_API_URL` — the worker forwards that env var into the
+  sandbox). Absence is silent: workers without bkb-mcp run normally
+  and the agent's prompt doesn't mention bkb at all.
 - **A GitHub personal access token** for each target tracker repo,
   only if you intend to use the GitHub-issue reporter (skip this
   prereq when registering repos with `--no-reporting` for manual

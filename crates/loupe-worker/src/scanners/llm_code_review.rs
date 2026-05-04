@@ -55,8 +55,21 @@ pub struct ScannerConfig {
 
 impl Default for ScannerConfig {
 	fn default() -> Self {
+		// `LOUPE_MAX_CONCURRENT_FILES` is a debug knob: a personal
+		// Anthropic/OpenAI account can hit per-account concurrency
+		// limits with 8-way parallel claude invocations, which manifests
+		// as "every session in the first batch times out at 30s with
+		// empty stdout." Setting this env var to 1–2 lets an operator
+		// confirm the rate-limit theory without touching code.
+		// The per-repo `scanner_config` JSON override (applied via
+		// `apply_patch` later) still wins over this default.
+		let max_concurrent_files = std::env::var("LOUPE_MAX_CONCURRENT_FILES")
+			.ok()
+			.and_then(|v| v.parse::<usize>().ok())
+			.filter(|&n| n > 0)
+			.unwrap_or(8);
 		Self {
-			max_concurrent_files: 8,
+			max_concurrent_files,
 			max_file_bytes: 64 * 1024,
 			per_request_timeout: DEFAULT_REQUEST_TIMEOUT,
 			include_extensions: default_extensions(),
@@ -164,15 +177,31 @@ fn default_excludes() -> Vec<String> {
 pub struct LlmCodeReviewScanner {
 	backend: Arc<dyn LlmBackend>,
 	config: ScannerConfig,
+	/// Conditional `bkb_hint` substitution string for [`prompts::DISCOVERY`].
+	/// Either [`prompts::BKB_HINT_ATTACHED`] (when the worker has
+	/// attached bkb-mcp to the per-call MCP config — the agent gets
+	/// the bkb tool list spelled out in the prompt's "Scope of
+	/// knowledge" section) or empty (no mention of bkb at all, since
+	/// the agent's tool catalog won't list bkb tools either way).
+	bkb_hint: &'static str,
 }
 
 impl LlmCodeReviewScanner {
 	pub fn new(backend: Arc<dyn LlmBackend>) -> Self {
-		Self { backend, config: ScannerConfig::default() }
+		Self { backend, config: ScannerConfig::default(), bkb_hint: "" }
 	}
 
 	pub fn with_config(mut self, config: ScannerConfig) -> Self {
 		self.config = config;
+		self
+	}
+
+	/// Mark this scanner as having `bkb-mcp` attached to its per-call
+	/// MCP config. Toggles the conditional bkb section in the
+	/// discovery prompt so the agent knows the bkb tools exist and
+	/// how to honestly cite their output.
+	pub fn with_bkb(mut self, attached: bool) -> Self {
+		self.bkb_hint = if attached { prompts::BKB_HINT_ATTACHED } else { "" };
 		self
 	}
 }
@@ -210,8 +239,17 @@ impl Scanner for LlmCodeReviewScanner {
 			"llm-code-review starting agent fan-out"
 		);
 
-		let errors =
-			self.run_all(&cfg, &ctx.workdir, &files, ctx.repo_id, ctx.job_id, &ctx.cancel).await;
+		let errors = self
+			.run_all(
+				&cfg,
+				&ctx.workdir,
+				&files,
+				ctx.repo_id,
+				ctx.job_id,
+				self.bkb_hint,
+				&ctx.cancel,
+			)
+			.await;
 		// Hard-fail when every agent session errored. Without this, an
 		// LLM scanner that's completely broken (sandbox can't reach the
 		// CLI, auth missing, network blocked) would silently complete
@@ -249,7 +287,7 @@ impl LlmCodeReviewScanner {
 	/// finding" is a success (not an error).
 	async fn run_all(
 		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], repo_id: i64, job_id: i64,
-		cancel: &CancellationToken,
+		bkb_hint: &'static str, cancel: &CancellationToken,
 	) -> usize {
 		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
 		let mut handles = Vec::with_capacity(files.len());
@@ -265,7 +303,8 @@ impl LlmCodeReviewScanner {
 			let cancel = cancel.clone();
 			handles.push(tokio::spawn(async move {
 				let _permit = permit;
-				run_one(backend, &workdir, &path, &cfg_owned, repo_id, job_id, cancel).await
+				run_one(backend, &workdir, &path, &cfg_owned, repo_id, job_id, bkb_hint, cancel)
+					.await
 			}));
 		}
 
@@ -291,10 +330,10 @@ impl LlmCodeReviewScanner {
 /// — the agent decided there was nothing to report.
 async fn run_one(
 	backend: Arc<dyn LlmBackend>, workdir: &Path, file: &Path, cfg: &ScannerConfig, repo_id: i64,
-	job_id: i64, cancel: CancellationToken,
+	job_id: i64, bkb_hint: &'static str, cancel: CancellationToken,
 ) -> Result<(), ()> {
 	let rel = file.strip_prefix(workdir).unwrap_or(file).to_string_lossy().into_owned();
-	let prompt = prompts::render(DISCOVERY, &[("file", &rel)]);
+	let prompt = prompts::render(DISCOVERY, &[("file", &rel), ("bkb_hint", bkb_hint)]);
 	tracing::info!(file = %rel, "llm-code-review: launching agent session");
 	let started = std::time::Instant::now();
 	let req = LlmRequest {
