@@ -5,18 +5,33 @@
 //! tool loop (the `claude` CLI does this for us; an HTTP backend would
 //! manage one explicitly), and returns the model's final text response.
 //!
-//! The first concrete impl is [`ClaudeCliBackend`] which shells out to
-//! the `claude` CLI. Future impls (Codex CLI, direct Anthropic API)
-//! plug in without touching scanner code.
+//! Two concrete impls today:
+//!
+//! - [`ClaudeCliBackend`] shells out to Anthropic's `claude` CLI.
+//!   Carries optional MCP context so each invocation can call back
+//!   into `loupe-worker mcp-serve` over stdio JSON-RPC — used by the
+//!   discovery scanner to query prior findings and submit new ones.
+//! - [`CodexCliBackend`] shells out to OpenAI's `codex` CLI. No MCP
+//!   plumbing yet; used by the cross-model verifier where the prompt
+//!   is self-contained and the only output is a JSON verdict.
+//!
+//! Picking between them at runtime: see [`build_verifier_backend`],
+//! which probes PATH for `codex` and falls back to `claude` so a
+//! cross-model second opinion happens when both are available
+//! without mandating both.
 
 pub mod claude_cli;
+pub mod codex_cli;
 pub mod prompts;
 
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 pub use claude_cli::ClaudeCliBackend;
+pub use codex_cli::CodexCliBackend;
 use tokio_util::sync::CancellationToken;
 
 /// Default per-call wall-clock budget. Per-file LLM invocations should
@@ -100,6 +115,40 @@ pub trait LlmBackend: Send + Sync {
 	fn id(&self) -> &'static str;
 
 	async fn run(&self, req: LlmRequest) -> Result<LlmResponse>;
+}
+
+/// Probe PATH for `codex --version`. Returns `true` only if the
+/// invocation succeeds — a missing binary, non-zero exit, or any IO
+/// error all read as "not available."
+///
+/// Cheap to call at startup. Used by [`build_verifier_backend`] to
+/// pick between codex (preferred — the verifier's whole point is a
+/// *cross-model* second opinion) and a claude fallback.
+pub fn codex_available() -> bool {
+	std::process::Command::new("codex")
+		.arg("--version")
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.status()
+		.map(|s| s.success())
+		.unwrap_or(false)
+}
+
+/// Build the verifier's [`LlmBackend`]. Prefers codex (cross-model
+/// second opinion is the whole point of the verifier flow); falls
+/// back to claude when codex isn't installed so single-CLI hosts
+/// still get *some* verifier coverage even if it's same-family.
+///
+/// Logs the choice at info level so operators can see which backend
+/// is actually verifying without having to inspect process listings.
+pub fn build_verifier_backend() -> Arc<dyn LlmBackend> {
+	if codex_available() {
+		tracing::info!("verifier backend: codex (cross-model second opinion)");
+		Arc::new(CodexCliBackend::new())
+	} else {
+		tracing::info!("verifier backend: claude (codex CLI not on PATH; same-family fallback)");
+		Arc::new(ClaudeCliBackend::new())
+	}
 }
 
 pub mod testing {

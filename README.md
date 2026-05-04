@@ -46,11 +46,18 @@ Before installing, the host needs:
   bubblewrap`. macOS does not have a port; LLM scanning runs on Linux
   workers only.
 - **`claude` CLI** on PATH on every machine running `loupe-worker`
-  *with the LLM scanner enabled*. The first LLM backend shells out to
+  *with the LLM scanner enabled*. The discovery backend shells out to
   `claude --dangerously-skip-permissions -p`, with the worker's
   bubblewrap mount keeping each invocation's `/tmp` and `$HOME` fresh.
   See https://github.com/anthropics/claude-code for install
   instructions.
+- **`codex` CLI** (optional) on PATH on every machine running
+  `loupe-worker` *with the LLM verifier enabled*. The verifier prefers
+  codex so the cross-model second opinion comes from a different model
+  family than discovery; falls back to `claude` if `codex` isn't
+  installed. The verifier shells out to `codex exec
+  --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check`.
+  See https://github.com/openai/codex for install instructions.
 - **A GitHub personal access token** for each target tracker repo,
   only if you intend to use the GitHub-issue reporter (skip this
   prereq when registering repos with `--no-reporting` for manual
@@ -208,13 +215,21 @@ loupe-worker \
   --cert       /etc/loupe/worker.pem \
   --key        /etc/loupe/worker.key \
   --cache-dir  /var/lib/loupe/cache \
-  --enable-llm-scanner       # omit to run only the regex scanner
+  --enable-llm-scanner       # discovery; omit to run only the regex scanner
+  --enable-llm-verifier      # cross-model second opinion; advertises verify:llm
 ```
 
-The worker probes for `bwrap` at startup when `--enable-llm-scanner`
-is on and exits 1 if it is missing (set `LOUPE_DISABLE_SANDBOX=1` to
+The worker probes for `bwrap` at startup when either LLM scanner is
+on and exits 1 if it is missing (set `LOUPE_DISABLE_SANDBOX=1` to
 bypass for dev work). Cache size defaults to 40 GB and evicts LRU
 clones above the cap.
+
+`--enable-llm-verifier` prefers the `codex` CLI so the second
+opinion comes from a different model family than the discovery
+scanner's `claude`; if `codex` isn't on PATH it falls back to
+`claude` (same-family fallback — still better than no verification,
+but not a true cross-model check). Verifier jobs only get queued
+when a repo is registered with `--verification-enabled`.
 
 ### 6. Register a repo and trigger a scan
 
@@ -392,14 +407,12 @@ else stay in `validating`). The full state machine + reaper details
 are in `ARCH.md` and the `submit_verdict` / `complete` handlers in
 `crates/loupe-server/src/routes/jobs.rs`.
 
-> **Heads-up.** The `LlmVerifierScanner` exists in the codebase
-> (`loupe-worker::scanners::llm_verifier`) but is **not yet wired
-> into the `loupe-worker` binary's scanner list**, so no worker
-> currently advertises `verify:llm` out of the box. Until that's
-> wired (a small change mirroring `--enable-llm-scanner`), enabling
-> `verification_enabled` on a repo will queue verify jobs that no
-> worker can lease — they'll eventually be marked `inconclusive` by
-> the reaper. Leave `verification_enabled` off for the first run.
+Run a worker with `--enable-llm-verifier` (or
+`LOUPE_ENABLE_LLM_VERIFIER=1`) to advertise `verify:llm` and lease
+those jobs; see step 5 above for the flag's CLI/codex selection
+behaviour. A deployment can run discovery and verifier on the same
+worker, on separate workers, or share a single worker with both —
+the lease loop matches by capability, not by binary.
 
 ## Continuous integration
 
