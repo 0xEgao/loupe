@@ -156,6 +156,8 @@ impl Runner {
 					workdir: workdir.path().to_path_buf(),
 					repo: env.repo.clone(),
 					repo_id: env.repo_id,
+					job_id: env.job_id,
+					finding_id,
 					finding,
 					config: env.scanner_config,
 					cancel: cancel.clone(),
@@ -173,19 +175,35 @@ impl Runner {
 							"verify lease arrived but worker advertises no verify:* scanner"
 						)
 					})?;
-				let verdict = verifier.verify(&vctx).await?;
-				tracing::info!(
-					job_id = env.job_id,
-					finding_id,
-					verifier = verifier.id(),
-					"submitting verdict"
-				);
-				self.client
-					.submit_verdict(
-						env.job_id,
-						&VerdictSubmission { protocol_version: PROTOCOL_VERSION, verdict },
-					)
-					.await?;
+				let outcome = verifier.verify(&vctx).await?;
+				match outcome {
+					crate::VerifyOutcome::Verdict(verdict) => {
+						tracing::info!(
+							job_id = env.job_id,
+							finding_id,
+							verifier = verifier.id(),
+							"submitting verdict (in-process verifier)"
+						);
+						self.client
+							.submit_verdict(
+								env.job_id,
+								&VerdictSubmission { protocol_version: PROTOCOL_VERSION, verdict },
+							)
+							.await?;
+					},
+					crate::VerifyOutcome::Submitted => {
+						// MCP-driven verifier already POSTed via the MCP
+						// child's session-end flush. POSTing again from
+						// here would land a duplicate verification row;
+						// the runner stays out of the way.
+						tracing::info!(
+							job_id = env.job_id,
+							finding_id,
+							verifier = verifier.id(),
+							"verifier submitted verdict via MCP (runner skipping POST)"
+						);
+					},
+				}
 				Ok((head_sha, 0))
 			},
 			LeasePayload::Scan { since_sha } => {

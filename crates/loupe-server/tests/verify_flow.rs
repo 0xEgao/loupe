@@ -17,11 +17,48 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use git2::{Repository, Signature};
-use loupe_core::{Finding, Severity};
+use loupe_core::{Finding, Severity, Verdict, VerdictPatch};
 use loupe_proto::{
 	FindingsBatch, RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse,
 	ReportingSetup, ScanRequest, PROTOCOL_VERSION,
 };
+use serde::Deserialize;
+
+/// Test-input shape mirroring what the verifier agent would call
+/// `submit_verdict` (and optionally `submit_patch`) with. The stub
+/// backend in `run_flow` parses one of these out of the
+/// `verify_response` string each test passes in, builds a real
+/// `Verdict`, and POSTs it via the worker mTLS client — same wire
+/// shape the production MCP child uses at session-end flush.
+#[derive(Debug, Deserialize)]
+struct VerifyStubInput {
+	verdict: String,
+	notes: String,
+	#[serde(default)]
+	patch: Option<VerifyStubPatch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerifyStubPatch {
+	patch_unified: String,
+	notes: String,
+}
+
+impl VerifyStubInput {
+	fn into_verdict(self) -> Verdict {
+		match self.verdict.as_str() {
+			"confirmed" => Verdict::Confirmed {
+				notes: Some(self.notes),
+				patch: self
+					.patch
+					.map(|p| VerdictPatch { patch_unified: p.patch_unified, notes: p.notes }),
+			},
+			"dismissed" => Verdict::Dismissed { notes: Some(self.notes) },
+			"inconclusive" => Verdict::Inconclusive { reason: self.notes },
+			other => panic!("unknown verdict in test input: {other}"),
+		}
+	}
+}
 use loupe_server::init::run_init;
 use loupe_server::reporters::GithubReporter;
 use loupe_server::{serve, AppState, Config};
@@ -191,19 +228,42 @@ async fn run_flow(
 		.await
 		.unwrap();
 
-	// Stub backend: two paths.
-	//   * Discovery (one-pass agent flow) — the agent's MCP
-	//     `submit_finding` tool is the only emit path; the stub
-	//     simulates it by POSTing directly to the server.
-	//   * Verify (still uses prompt+parse — the verifier scanner
-	//     hasn't been migrated to MCP yet) — returns the caller-
-	//     supplied verdict JSON in stdout for the verifier to parse.
+	// Stub backend: two paths, both simulating what the agent's
+	// MCP child would POST in production.
+	//   * Discovery — the agent's `submit_finding` tool POSTs to
+	//     `/v1/jobs/{job_id}/findings`; the stub does the same call
+	//     directly.
+	//   * Verify — the agent's `submit_verdict` (and optional
+	//     `submit_patch`) get buffered by the MCP server and
+	//     flushed at session end as a single
+	//     `POST /v1/jobs/{job_id}/verdict` carrying
+	//     `Verdict::Confirmed { ..., patch: Some(...) }`. The stub
+	//     parses the test-supplied JSON into a real `Verdict` and
+	//     POSTs it.
 	let server_client_for_stub = server_client.clone();
 	let backend = Arc::new(StubLlmBackend::new_async("stub", move |req: LlmRequest| {
 		let server_client = server_client_for_stub.clone();
 		async move {
 			if req.prompt.contains("independent second opinion") {
-				return Ok(verify_response.to_owned());
+				let job_id = req.job_id.expect("verify sessions must carry a job_id");
+				assert!(
+					req.finding_id.is_some(),
+					"verify sessions must carry finding_id (otherwise MCP wouldn't \
+					 enter verify mode); got finding_id=None",
+				);
+				let stub: VerifyStubInput = serde_json::from_str(verify_response)
+					.expect("verify_response must be valid VerifyStubInput JSON");
+				let verdict = stub.into_verdict();
+				server_client
+					.submit_verdict(
+						job_id,
+						&loupe_proto::VerdictSubmission {
+							protocol_version: PROTOCOL_VERSION,
+							verdict,
+						},
+					)
+					.await?;
+				return Ok(String::new());
 			}
 			// Discovery: simulate the agent calling submit_finding.
 			let job_id = req.job_id.expect("discovery sessions must carry a job_id");

@@ -13,4 +13,4 @@ pub mod scanners;
 pub use client::ServerClient;
 pub use repo_cache::{RepoCache, RepoKey};
 pub use runner::Runner;
-pub use scanner::{ScanContext, Scanner, VerifyContext};
+pub use scanner::{ScanContext, Scanner, VerifyContext, VerifyOutcome};

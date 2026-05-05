@@ -208,15 +208,31 @@ pub fn codex_available() -> bool {
 /// back to claude when codex isn't installed so single-CLI hosts
 /// still get *some* verifier coverage even if it's same-family.
 ///
+/// `mcp` (optional) attaches the loupe MCP server to the backend's
+/// per-call invocation. Required for the verify-mode tool surface
+/// (`submit_verdict` / `submit_patch` / `validate_patch`) — without
+/// MCP, the agent has no way to commit a verdict and the runner
+/// would receive no feedback to POST. Production callers should
+/// always pass `Some(...)`; the `None` form is kept for tests that
+/// stub the backend wholesale.
+///
 /// Logs the choice at info level so operators can see which backend
 /// is actually verifying without having to inspect process listings.
-pub fn build_verifier_backend() -> Arc<dyn LlmBackend> {
+pub fn build_verifier_backend(mcp: Option<McpContext>) -> Arc<dyn LlmBackend> {
 	if codex_available() {
 		tracing::info!("verifier backend: codex (cross-model second opinion)");
-		Arc::new(CodexCliBackend::new())
+		let mut backend = CodexCliBackend::new();
+		if let Some(ctx) = mcp {
+			backend = backend.with_mcp_context(ctx);
+		}
+		Arc::new(backend)
 	} else {
 		tracing::info!("verifier backend: claude (codex CLI not on PATH; same-family fallback)");
-		Arc::new(ClaudeCliBackend::new())
+		let mut backend = ClaudeCliBackend::new();
+		if let Some(ctx) = mcp {
+			backend = backend.with_mcp_context(ctx);
+		}
+		Arc::new(backend)
 	}
 }
 

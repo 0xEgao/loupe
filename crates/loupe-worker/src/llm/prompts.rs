@@ -129,35 +129,119 @@ pub const BKB_HINT_ATTACHED: &str = r#"
 /// Cross-model verification prompt — runs once per finding when the
 /// server has enqueued a `kind=verify` job. Independent second
 /// opinion: takes the original finding (rendered as JSON) and asks
-/// the model whether it agrees with the diagnosis. No PoC requested
-/// — the original session already produced one.
+/// the model whether it agrees with the diagnosis, with an optional
+/// follow-up "propose a fix" phase on confirmation.
+///
+/// MCP-driven, two-phase. Phase 1 (mandatory) is `submit_verdict`;
+/// phase 2 (optional, only on confirmed) is `submit_patch`. The
+/// session-end flush in `loupe-worker mcp-serve` POSTs both at once
+/// so the agent can never see "patch landed" before the verdict
+/// commits — the ordering is enforced at the protocol level, not
+/// by the prompt alone.
 ///
 /// `{file}` and `{finding_json}` placeholders are filled by the
-/// verifier scanner. The verifier still parses JSON out of the
-/// model's stdout because the verify path doesn't yet have an MCP
-/// surface — that wiring is independent of the discovery flow and
-/// can move to a tool-based shape later.
+/// verifier scanner; the agent's tool catalog comes from the loupe
+/// MCP server in verify mode.
 pub const VERIFY: &str = r##"
 You are providing an independent second opinion on a vulnerability
 report from another security reviewer. Re-read the file `{file}`
 (located at `/workdir/{file}`) and decide whether the report is real
-and exploitable, or whether it's a false-positive.
+and exploitable, then optionally propose a candidate fix.
 
 Original report:
 {finding_json}
 
-Output **exactly one JSON object** and nothing else:
+You have these MCP tools available (provided by the loupe MCP server):
 
-```
-{
-  "verdict": "confirmed" | "dismissed" | "inconclusive",
-  "notes": "<one sentence on why>"
-}
-```
+- `submit_verdict(verdict, notes)` — phase 1, MANDATORY, FIRST.
+  `verdict` is one of `"confirmed"`, `"dismissed"`, or `"inconclusive"`;
+  `notes` is a one-sentence justification. Calling this tool LOCKS
+  your verdict for the session — a second call returns an error.
+  This ordering is deliberate: it prevents you from rationalising
+  the verdict to match a fix you've already started writing.
+- `submit_patch(patch_unified, notes)` — phase 2, OPTIONAL. Only
+  available after `submit_verdict("confirmed", ...)`. **Failure
+  is acceptable** — skipping this tool is a normal, valid outcome.
+- `validate_patch(patch_unified)` — pre-flight `git apply --check`
+  for a candidate fix. Use this before `submit_patch` to catch
+  path drift, fuzzy context, and malformed hunks.
+- `query_prior_findings(query, limit?)` — keyword-search prior
+  findings on this repo. Useful for spotting whether the bug
+  you're verifying duplicates an earlier reported one.
+- `get_finding_by_id(id)` — full detail view of a prior finding.
 
-Use `"inconclusive"` only when the file's behaviour genuinely
-depends on context outside the file itself (e.g. a downstream
-caller's invariants). Prefer a definite verdict when you can.
+Your workflow has two phases.
+
+PHASE 1 — VERDICT (mandatory, do this first):
+
+Decide whether the bug is real and exploitable, then call
+`submit_verdict(verdict, notes)` exactly once. Use:
+
+  - `"confirmed"`    — the bug is real and exploitable as described.
+  - `"dismissed"`    — the report is wrong (false positive,
+                       misread of the code, etc.).
+  - `"inconclusive"` — the file's behaviour genuinely depends on
+                       context outside the file itself (downstream
+                       caller invariants, pinned dependency
+                       internals you cannot read). Prefer a
+                       definite verdict when you can.
+
+Your verdict is locked the moment you call `submit_verdict`. Think
+hard before calling.
+
+PHASE 2 — PATCH (only if verdict was "confirmed", and only if you
+are confident — otherwise skip this phase):
+
+If the verdict was `"confirmed"`, you MAY propose a fix by calling
+`submit_patch(patch_unified, notes)`. **You are not required to.**
+Skipping this phase is a normal, acceptable outcome — the verdict
+already stands on its own.
+
+Skip the patch (end the session without calling `submit_patch`) if
+ANY of the following are true:
+
+  - You are uncertain how to fix the bug correctly.
+  - The fix would require changes outside the immediate vicinity of
+    the bug, or touch code you don't fully understand.
+  - You can think of more than one plausible fix and cannot tell
+    which is right.
+  - The right fix depends on a design decision that should be made
+    by a human (API change, behaviour-altering policy choice).
+
+A missing patch never invalidates the verdict. A wrong patch
+attached to a real bug is worse than no patch at all — it costs
+the human reviewer extra cycles to debunk.
+
+If you do propose a patch, it must:
+
+  - Be **minimally invasive**: the smallest change that fixes the
+    bug. Do not refactor surrounding code, rename symbols, "improve"
+    style, or fix unrelated issues you noticed along the way.
+  - **Match the surrounding coding style** of this project — the
+    same indentation, naming convention, error-handling pattern,
+    and idioms used in the file you're patching. Read the
+    neighbouring code if you're unsure.
+  - Touch production code only — do not modify tests in the patch.
+    The PoC diff already covers the regression test.
+  - Apply cleanly against the worktree at `/workdir`. Pre-flight
+    with `validate_patch(patch_unified)` and revise until
+    `applies=true` before calling `submit_patch`.
+  - Come with a 1–2 sentence `notes` rationale: what the fix does
+    and why this is the minimal correct change.
+
+Scope of knowledge — read carefully:
+
+- Your only filesystem access is the worktree mounted at `/workdir`.
+  You cannot read external repositories, dependency source from
+  `cargo registry`, vendored crates outside this tree, system docs,
+  the internet, or anything else off-tree.
+- Do not claim to have "verified against" or "checked" any
+  out-of-tree source you cannot actually open through this
+  worktree. If a determination depends on an invariant the
+  *caller* of this code is supposed to uphold, on a downstream
+  crate's behaviour, or on a pinned dependency's internals, treat
+  that as **uncertainty** — return `"inconclusive"` rather than
+  dismissing the report.
 "##;
 
 /// Substitute `{key}` placeholders in a template. Simple sentinel-
@@ -232,6 +316,59 @@ mod tests {
 	fn verify_template_has_required_placeholders() {
 		assert!(VERIFY.contains("{file}"));
 		assert!(VERIFY.contains("{finding_json}"));
+	}
+
+	#[test]
+	fn verify_prompt_directs_agent_to_the_two_phase_mcp_tools() {
+		// Pin the contract: the verify prompt has to mention all
+		// three new MCP tools by name. Discovery's tools
+		// (`submit_finding` / `validate_poc`) are gone in verify
+		// mode; if they leak back into the prompt by accident the
+		// agent will try to call tools that aren't advertised.
+		assert!(VERIFY.contains("submit_verdict"), "verify prompt must reference submit_verdict");
+		assert!(VERIFY.contains("submit_patch"), "verify prompt must reference submit_patch");
+		assert!(VERIFY.contains("validate_patch"), "verify prompt must reference validate_patch");
+		assert!(
+			!VERIFY.contains("submit_finding"),
+			"verify prompt must NOT reference submit_finding (discovery tool)"
+		);
+		assert!(
+			!VERIFY.contains("validate_poc"),
+			"verify prompt must NOT reference validate_poc (discovery tool)"
+		);
+	}
+
+	#[test]
+	fn verify_prompt_pins_the_three_user_negotiated_patch_rules() {
+		// These three properties were the explicit deal the user
+		// negotiated for verifier-proposed patches:
+		//   1. Failure (skipping the patch) is an acceptable outcome.
+		//   2. Patches must be minimally invasive.
+		//   3. Patches must match the project's coding style.
+		// Every one of these is load-bearing — drifting on (1) would
+		// produce wrong-but-confident patches; drifting on (2) gives
+		// drive-by refactors mixed into security fixes; drifting on
+		// (3) makes patches awkward to merge without rework. If any
+		// of these go missing in a future prompt edit, the user
+		// experience regresses silently. Compare against a
+		// whitespace-collapsed copy so prose reflow doesn't break the
+		// pin.
+		let collapsed: String = VERIFY.split_whitespace().collect::<Vec<_>>().join(" ");
+		assert!(
+			collapsed.contains("Failure is acceptable")
+				|| collapsed.contains("failure is acceptable")
+				|| collapsed.contains("acceptable outcome")
+				|| collapsed.contains("Skipping this phase"),
+			"verify prompt must tell the agent that skipping the patch is acceptable"
+		);
+		assert!(
+			collapsed.contains("minimally invasive") || collapsed.contains("smallest change"),
+			"verify prompt must require minimally invasive patches"
+		);
+		assert!(
+			collapsed.contains("coding style") || collapsed.contains("surrounding"),
+			"verify prompt must require patches to match the project's coding style"
+		);
 	}
 
 	#[test]

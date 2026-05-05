@@ -5,6 +5,15 @@
 //! response carries the target Finding, and this scanner asks a
 //! (potentially different) LLM backend whether the finding holds up.
 //!
+//! Two-phase MCP-driven flow. The agent is given the loupe MCP
+//! server in verify mode (`--finding-id` + `--job-id` set), which
+//! advertises `submit_verdict`, `submit_patch`, and `validate_patch`.
+//! The agent locks a verdict first, optionally proposes a patch on
+//! confirm, then exits. The MCP server's session-end flush POSTs
+//! the buffered `VerdictSubmission` to `/v1/jobs/:id/verdict` —
+//! the runner gets back a `VerifyOutcome::Submitted` and stays out
+//! of the way (no double POST).
+//!
 //! The scanner intentionally returns an empty `Vec<Finding>` from
 //! `scan()` — a verifier is not also a discoverer, even though the
 //! trait surface allows it to be. Wiring a verifier worker to also
@@ -15,12 +24,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use loupe_core::{Finding, Verdict, VerdictPatch};
-use serde::Deserialize;
+use loupe_core::Finding;
 
 use crate::llm::prompts::{self, VERIFY};
 use crate::llm::{LlmBackend, LlmRequest};
-use crate::scanner::{ScanContext, Scanner, VerifyContext};
+use crate::scanner::{ScanContext, Scanner, VerifyContext, VerifyOutcome};
 
 const SCANNER_ID: &str = "llm-verifier";
 const CAPABILITIES: &[&str] = &["verify:llm"];
@@ -33,28 +41,6 @@ impl LlmVerifierScanner {
 	pub fn new(backend: Arc<dyn LlmBackend>) -> Self {
 		Self { backend }
 	}
-}
-
-#[derive(Debug, Deserialize)]
-struct VerifyRaw {
-	verdict: String,
-	#[serde(default)]
-	notes: Option<String>,
-	/// Optional candidate fix on a confirmed verdict. Today the
-	/// production prompt doesn't ask for it (the next commit moves
-	/// the verifier to MCP, where `submit_patch` is the real surface);
-	/// this field is parsed eagerly so the integration tests in
-	/// `verify_flow.rs` can drive the server-side patch-attachment
-	/// path through the existing JSON-stdout shape without first
-	/// landing the MCP rewrite.
-	#[serde(default)]
-	patch: Option<VerifyRawPatch>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VerifyRawPatch {
-	patch_unified: String,
-	notes: String,
 }
 
 #[async_trait]
@@ -71,7 +57,11 @@ impl Scanner for LlmVerifierScanner {
 		Ok(Vec::new())
 	}
 
-	async fn verify(&self, ctx: &VerifyContext) -> Result<Verdict> {
+	async fn verify(&self, ctx: &VerifyContext) -> Result<VerifyOutcome> {
+		// Render the original finding so the agent has the context
+		// it needs to decide whether the report holds up. The MCP
+		// server's `query_prior_findings` / `get_finding_by_id`
+		// tools cover everything else.
 		let finding_json = serde_json::json!({
 			"severity": ctx.finding.severity.as_str(),
 			"title": ctx.finding.title,
@@ -84,49 +74,35 @@ impl Scanner for LlmVerifierScanner {
 		let file = ctx.finding.file_path.as_deref().unwrap_or("(unknown)");
 		let prompt =
 			prompts::render(VERIFY, &[("file", file), ("finding_json", &finding_json.to_string())]);
+
+		// `finding_id` + `job_id` are what flip the MCP server into
+		// verify mode — the verify-mode tool catalog
+		// (submit_verdict / submit_patch / validate_patch) only
+		// shows up when both are set. The MCP server bails at
+		// startup if it sees only `--finding-id`, so passing both
+		// here is load-bearing.
 		let req = LlmRequest {
 			prompt,
 			workdir: ctx.workdir.clone(),
 			timeout: crate::llm::DEFAULT_REQUEST_TIMEOUT,
 			cancel: ctx.cancel.clone(),
 			repo_id: Some(ctx.repo_id),
-			// Verify flow doesn't submit findings via MCP — it
-			// returns a Verdict to the runner instead — so
-			// `submit_finding` is intentionally unavailable here.
-			job_id: None,
-			// Today's verifier still parses stdout-JSON (no MCP). The
-			// next commit (4c) flips this to `Some(ctx.finding_id)`
-			// to put the MCP server into verify mode. Leave None
-			// here so 4b's tool plumbing can land independently.
-			finding_id: None,
+			job_id: Some(ctx.job_id),
+			finding_id: Some(ctx.finding_id),
 		};
-		let resp = self.backend.run(req).await?;
+		let _resp = self.backend.run(req).await?;
 
-		let json = crate::llm::extract_json_object(&resp.text).unwrap_or_else(|| resp.text.clone());
-		let raw: VerifyRaw = serde_json::from_str(&json).map_err(|e| {
-			anyhow::anyhow!(
-				"verify response did not parse as VerifyRaw JSON: {e}; got: {}",
-				resp.text
-			)
-		})?;
-		Ok(match raw.verdict.as_str() {
-			"confirmed" => Verdict::Confirmed {
-				notes: raw.notes,
-				patch: raw
-					.patch
-					.map(|p| VerdictPatch { patch_unified: p.patch_unified, notes: p.notes }),
-			},
-			"dismissed" => Verdict::Dismissed { notes: raw.notes },
-			_ => Verdict::Inconclusive {
-				reason: raw.notes.unwrap_or_else(|| "model returned inconclusive".into()),
-			},
-		})
+		// The MCP server's session-end flush already POSTed the
+		// verdict (with the optional patch embedded). Tell the
+		// runner not to POST again.
+		Ok(VerifyOutcome::Submitted)
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use std::path::PathBuf;
+	use std::sync::Mutex;
 
 	use loupe_core::{Finding, RepoSpec, Severity};
 	use tokio_util::sync::CancellationToken;
@@ -138,6 +114,8 @@ mod tests {
 		VerifyContext {
 			workdir: PathBuf::from("/tmp"),
 			repo_id: 1,
+			job_id: 42,
+			finding_id: 7,
 			repo: RepoSpec {
 				host: "github.com".into(),
 				owner: "a".into(),
@@ -164,29 +142,35 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn confirms_when_backend_says_confirmed() {
-		let backend = Arc::new(StubLlmBackend::new("stub", |_req: &LlmRequest| {
-			Ok(r#"{"verdict":"confirmed","notes":"reproduced"}"#.to_owned())
-		}));
-		let v = LlmVerifierScanner::new(backend).verify(&ctx()).await.unwrap();
-		assert!(matches!(v, Verdict::Confirmed { .. }));
+	async fn returns_submitted_outcome_so_runner_skips_its_post() {
+		// MCP-driven verifier: the backend stub doesn't have to emit
+		// any verdict JSON — that path is gone. The contract this
+		// test pins is just "scanner returns Submitted, runner won't
+		// post again." If a future refactor accidentally returns
+		// `Verdict(...)` instead, the runner would POST a duplicate
+		// verification row.
+		let backend = Arc::new(StubLlmBackend::new("stub", |_req: &LlmRequest| Ok(String::new())));
+		let outcome = LlmVerifierScanner::new(backend).verify(&ctx()).await.unwrap();
+		assert!(matches!(outcome, VerifyOutcome::Submitted));
 	}
 
 	#[tokio::test]
-	async fn dismisses_when_backend_says_dismissed() {
-		let backend = Arc::new(StubLlmBackend::new("stub", |_req: &LlmRequest| {
-			Ok(r#"{"verdict":"dismissed","notes":"hallucination"}"#.to_owned())
+	async fn forwards_finding_id_and_job_id_to_backend_so_mcp_enters_verify_mode() {
+		// Pin the load-bearing wiring: the MCP server only flips into
+		// verify mode when BOTH `--finding-id` and `--job-id` reach
+		// it (via the LlmRequest fields). Capture what the backend
+		// sees and assert both are populated. If a future refactor
+		// drops one, the agent silently falls into discovery mode and
+		// the verifier surface disappears.
+		let captured: Arc<Mutex<Option<(Option<i64>, Option<i64>, Option<i64>)>>> =
+			Arc::new(Mutex::new(None));
+		let captured_for_stub = captured.clone();
+		let backend = Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
+			*captured_for_stub.lock().unwrap() = Some((req.repo_id, req.job_id, req.finding_id));
+			Ok(String::new())
 		}));
-		let v = LlmVerifierScanner::new(backend).verify(&ctx()).await.unwrap();
-		assert!(matches!(v, Verdict::Dismissed { .. }));
-	}
-
-	#[tokio::test]
-	async fn unknown_verdict_is_treated_as_inconclusive() {
-		let backend = Arc::new(StubLlmBackend::new("stub", |_req: &LlmRequest| {
-			Ok(r#"{"verdict":"???","notes":"shrug"}"#.to_owned())
-		}));
-		let v = LlmVerifierScanner::new(backend).verify(&ctx()).await.unwrap();
-		assert!(matches!(v, Verdict::Inconclusive { .. }));
+		LlmVerifierScanner::new(backend).verify(&ctx()).await.unwrap();
+		let seen = captured.lock().unwrap().clone().expect("backend invoked");
+		assert_eq!(seen, (Some(1), Some(42), Some(7)));
 	}
 }

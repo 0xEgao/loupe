@@ -190,23 +190,25 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 		);
 	}
 
+	// Build the MCP context once: same paths feed both the
+	// discovery and verifier backends. Resolve the worker binary's
+	// host path so the sandbox can bind-mount it for the MCP child
+	// to exec. `current_exe()` returns the executable currently
+	// running; the agent's MCP child will be `loupe-worker
+	// mcp-serve`, served by the same binary.
+	let worker_binary = std::env::current_exe()
+		.context("resolving the loupe-worker binary path for MCP bind-mount")?;
+	let mcp_ctx = McpContext {
+		worker_binary,
+		server_url: server_url.to_string(),
+		ca_cert_path: ca_cert.clone(),
+		client_cert_path: cert.clone(),
+		client_key_path: key.clone(),
+		bkb_mcp_path: bkb_mcp_path.clone(),
+	};
+
 	if claude {
-		// Resolve the worker binary's host path so the sandbox can
-		// bind-mount it for the MCP child to exec. `current_exe()`
-		// returns the executable currently running; the agent's MCP
-		// child will be `loupe-worker mcp-serve`, served by the same
-		// binary.
-		let worker_binary = std::env::current_exe()
-			.context("resolving the loupe-worker binary path for MCP bind-mount")?;
-		let mcp_ctx = McpContext {
-			worker_binary,
-			server_url: server_url.to_string(),
-			ca_cert_path: ca_cert.clone(),
-			client_cert_path: cert.clone(),
-			client_key_path: key.clone(),
-			bkb_mcp_path: bkb_mcp_path.clone(),
-		};
-		let backend = Arc::new(ClaudeCliBackend::new().with_mcp_context(mcp_ctx));
+		let backend = Arc::new(ClaudeCliBackend::new().with_mcp_context(mcp_ctx.clone()));
 		scanners
 			.push(Arc::new(LlmCodeReviewScanner::new(backend).with_bkb(bkb_mcp_path.is_some())));
 		tracing::info!("LLM code-review scanner enabled (claude with MCP submit_finding)");
@@ -218,10 +220,13 @@ async fn run_worker(args: RunArgs) -> Result<()> {
 	}
 
 	// Verifier always wires up when *either* CLI is present. The
-	// helper logs which backend it picked.
-	let backend = build_verifier_backend();
+	// helper logs which backend it picked. MCP context is required
+	// for the new verify-mode tool surface (`submit_verdict` /
+	// `submit_patch` / `validate_patch`); without it, the agent
+	// has no way to commit a verdict.
+	let backend = build_verifier_backend(Some(mcp_ctx));
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
-	tracing::info!("LLM verifier scanner enabled (verify:llm advertised)");
+	tracing::info!("LLM verifier scanner enabled (verify:llm advertised, MCP-driven)");
 
 	let runner = Runner::new(client, cache, scanners);
 
