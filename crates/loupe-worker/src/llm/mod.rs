@@ -111,6 +111,11 @@ pub struct LlmRequest {
 	/// advertised. `None` falls back to query-only MCP usage (the
 	/// agent can read prior findings but can't write new ones).
 	pub job_id: Option<i64>,
+	/// Finding id for a verify-kind session. When `Some`, the MCP
+	/// server enters verify mode: `submit_finding` is hidden;
+	/// `submit_verdict`, `submit_patch`, and `validate_patch` are
+	/// advertised instead. `None` keeps the discovery-mode catalog.
+	pub finding_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

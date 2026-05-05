@@ -175,7 +175,8 @@ impl LlmBackend for CodexCliBackend {
 					"/workdir".to_owned()
 				};
 				sandbox = bind_mcp_into_sandbox(sandbox, ctx);
-				let args = mcp_serve_args(ctx, repo_id, req.job_id, &sandbox_workdir);
+				let args =
+					mcp_serve_args(ctx, repo_id, req.job_id, req.finding_id, &sandbox_workdir);
 				let mut overrides = Vec::new();
 				overrides.push(format!(
 					"mcp_servers.loupe.command={}",
@@ -347,6 +348,7 @@ mod tests {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			job_id: None,
+			finding_id: None,
 		};
 		let resp = backend.run(req).await.expect("codex responded");
 		assert_eq!(resp.backend_id, BACKEND_ID);
@@ -365,6 +367,7 @@ mod tests {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			job_id: None,
+			finding_id: None,
 		};
 		let err = backend.run(req).await.expect_err("must error");
 		let msg = err.to_string().to_lowercase();

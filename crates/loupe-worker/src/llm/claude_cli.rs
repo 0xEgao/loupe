@@ -53,14 +53,15 @@ struct McpScratch {
 }
 
 fn prepare_mcp_scratch(
-	ctx: &McpContext, repo_id: i64, job_id: Option<i64>, sandbox_workdir: &str,
+	ctx: &McpContext, repo_id: i64, job_id: Option<i64>, finding_id: Option<i64>,
+	sandbox_workdir: &str,
 ) -> Result<McpScratch> {
 	let dir = tempfile::Builder::new()
 		.prefix("loupe-mcp-")
 		.tempdir()
 		.context("creating MCP scratch tempdir")?;
 	let config_path = dir.path().join("mcp-config.json");
-	let args = mcp_serve_args(ctx, repo_id, job_id, sandbox_workdir);
+	let args = mcp_serve_args(ctx, repo_id, job_id, finding_id, sandbox_workdir);
 	let mut servers = serde_json::Map::new();
 	servers.insert(
 		"loupe".to_string(),
@@ -206,8 +207,9 @@ impl LlmBackend for ClaudeCliBackend {
 				} else {
 					"/workdir".to_owned()
 				};
-				let scratch = prepare_mcp_scratch(ctx, repo_id, req.job_id, &sandbox_workdir)
-					.context("preparing MCP scratch directory")?;
+				let scratch =
+					prepare_mcp_scratch(ctx, repo_id, req.job_id, req.finding_id, &sandbox_workdir)
+						.context("preparing MCP scratch directory")?;
 				sandbox = bind_mcp_into_sandbox(sandbox, ctx)
 					.bind_ro(scratch.config_path.clone(), SANDBOX_MCP_CONFIG);
 				Some(scratch)
@@ -382,6 +384,7 @@ mod tests {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			job_id: None,
+			finding_id: None,
 		};
 		let resp = backend.run(req).await.expect("claude responded");
 		assert_eq!(resp.backend_id, BACKEND_ID);
@@ -400,6 +403,7 @@ mod tests {
 			cancel: CancellationToken::new(),
 			repo_id: None,
 			job_id: None,
+			finding_id: None,
 		};
 		let err = backend.run(req).await.expect_err("must error");
 		let msg = err.to_string().to_lowercase();

@@ -98,7 +98,11 @@ fn format_location(path: Option<&str>, line_start: Option<u32>, line_end: Option
 }
 
 /// Per-call session state that flows into every tool handler. Built
-/// once at `run_stdio_server` start from CLI args; never mutated.
+/// once at `run_stdio_server` start from CLI args. Discovery-mode
+/// fields are immutable; verify-mode state lives behind a mutex
+/// because the agent can issue `submit_verdict` and `submit_patch`
+/// across multiple tool calls and the second-call locks need to
+/// consult what the first call set.
 struct Session {
 	client: Arc<ServerClient>,
 	repo_id: i64,
@@ -111,6 +115,40 @@ struct Session {
 	/// Inside the bwrap sandbox this is `/workdir`; bare-mode
 	/// (`LOUPE_DISABLE_SANDBOX`) runs use the host worktree path.
 	workdir: PathBuf,
+	/// Verify-mode state. `Some` flips the tool catalog: hides
+	/// `submit_finding` / `validate_poc`, advertises `submit_verdict`
+	/// / `submit_patch` / `validate_patch`. `None` keeps the
+	/// discovery-mode catalog.
+	verify: Option<VerifySessionState>,
+}
+
+/// Verify-mode buffer. The agent calls `submit_verdict` first
+/// (mandatory, locks for the rest of the session), then optionally
+/// `submit_patch` (only valid after a Confirmed verdict). Both
+/// tools just write to this buffer — nothing reaches the server
+/// until session end, when [`flush_verify_session`] POSTs one
+/// `VerdictSubmission` carrying the verdict (with the patch
+/// embedded on Confirmed).
+///
+/// This buffer-and-flush pattern is what enforces the "verdict
+/// first, patch maybe" ordering at the protocol level: the agent
+/// can't see a "patch_unified row already populated" outcome and
+/// then revise its verdict, because nothing has hit the server yet.
+struct VerifySessionState {
+	finding_id: i64,
+	inner: tokio::sync::Mutex<VerifySessionInner>,
+}
+
+#[derive(Debug, Default)]
+struct VerifySessionInner {
+	/// Locked on first `submit_verdict`. A second call returns an
+	/// error so the agent can't revise mid-session.
+	verdict: Option<loupe_core::Verdict>,
+	/// Locked on first `submit_patch`. Held separately from the
+	/// verdict's own `patch` field so we can pin "patch tool was
+	/// called once" even if the merge into Verdict::Confirmed
+	/// happens later, at flush time.
+	patch: Option<loupe_core::VerdictPatch>,
 }
 
 /// JSON-RPC 2.0 envelope shapes. Kept small — we don't need batch
@@ -164,13 +202,37 @@ struct RpcError {
 ///
 /// `repo_id` scopes search/lookup tools to this repo. `job_id`, when
 /// `Some`, enables `submit_finding` — submissions POST to
-/// `/v1/jobs/{job_id}/findings`. `workdir` is the path the agent's
-/// file references resolve against (`/workdir` inside bwrap, the
-/// host worktree path in disable-sandbox mode).
+/// `/v1/jobs/{job_id}/findings`. `finding_id`, when `Some`, flips
+/// the server into verify mode (the agent sees `submit_verdict` /
+/// `submit_patch` / `validate_patch` instead of the discovery
+/// tools); `job_id` MUST also be set in verify mode so the verdict
+/// POST has a job to attribute to. `workdir` is the path the
+/// agent's file references resolve against (`/workdir` inside
+/// bwrap, the host worktree path in disable-sandbox mode).
+///
+/// In verify mode, the verdict (and the optional patch) is buffered
+/// during the session and flushed in a single `POST /v1/jobs/:id/
+/// verdict` after stdin closes. If the agent never called
+/// `submit_verdict`, the function returns an error so the runner
+/// posts `complete(failed)` and the validating-deadline reaper
+/// later marks the verdict inconclusive.
 pub async fn run_stdio_server(
-	client: Arc<ServerClient>, repo_id: i64, job_id: Option<i64>, workdir: PathBuf,
+	client: Arc<ServerClient>, repo_id: i64, job_id: Option<i64>, finding_id: Option<i64>,
+	workdir: PathBuf,
 ) -> Result<()> {
-	let session = Arc::new(Session { client, repo_id, job_id, workdir });
+	let verify = match (finding_id, job_id) {
+		(Some(fid), Some(_)) => Some(VerifySessionState {
+			finding_id: fid,
+			inner: tokio::sync::Mutex::new(VerifySessionInner::default()),
+		}),
+		(Some(_), None) => {
+			anyhow::bail!(
+				"verify-mode MCP server requires both --finding-id and --job-id; got finding-id only"
+			);
+		},
+		(None, _) => None,
+	};
+	let session = Arc::new(Session { client, repo_id, job_id, workdir, verify });
 	let stdin = std::io::stdin();
 	let mut stdout = std::io::stdout();
 
@@ -199,6 +261,10 @@ pub async fn run_stdio_server(
 		write_response(&mut stdout, &response)?;
 	}
 
+	if session.verify.is_some() {
+		flush_verify_session(&session).await?;
+	}
+
 	Ok(())
 }
 
@@ -212,9 +278,12 @@ async fn handle_request(session: &Arc<Session>, req: &Request, id: Value) -> Res
 				"serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
 			}),
 		),
-		"tools/list" => {
-			Response::ok(id, json!({ "tools": tool_definitions(session.job_id.is_some()) }))
-		},
+		"tools/list" => Response::ok(
+			id,
+			json!({
+				"tools": tool_definitions(session.job_id.is_some(), session.verify.is_some())
+			}),
+		),
 		"tools/call" => handle_tool_call(session, req, id).await,
 		// Common no-op MCP notifications/requests we just ack.
 		"notifications/initialized" | "ping" => Response::ok(id, json!({})),
@@ -224,10 +293,19 @@ async fn handle_request(session: &Arc<Session>, req: &Request, id: Value) -> Res
 
 /// MCP tool catalogue. Each entry is the JSON Schema the agent uses
 /// to decide when to call the tool and what shape arguments to send.
-/// `submissions_enabled` gates `submit_finding` — without a job to
-/// attribute submissions to (i.e. when the worker didn't pass
-/// `--job-id`), the tool is hidden so the agent can't try to call it.
-fn tool_definitions(submissions_enabled: bool) -> Value {
+///
+/// `submissions_enabled` gates the discovery-mode `submit_finding`
+/// — without a job to attribute submissions to (i.e. when the
+/// worker didn't pass `--job-id`), the tool is hidden so the agent
+/// can't try to call it.
+///
+/// `verify_mode` flips the catalog into a different shape entirely:
+/// `submit_finding` and `validate_poc` are hidden; `submit_verdict`,
+/// `submit_patch`, and `validate_patch` are advertised instead.
+/// `query_prior_findings` and `get_finding_by_id` stay in both
+/// modes — they're read-only and useful for the verifier to
+/// cross-check the bug it's verifying against the repo's history.
+fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
 	let mut tools = vec![
 		json!({
 			"name": "query_prior_findings",
@@ -280,6 +358,102 @@ fn tool_definitions(submissions_enabled: bool) -> Value {
 			},
 		}),
 	];
+	if verify_mode {
+		// Verify-mode catalog. The ordering in the agent's tool list
+		// is just a hint, but listing submit_verdict before
+		// submit_patch nudges the agent toward the intended phase
+		// ordering ("verdict first, patch maybe").
+		tools.push(json!({
+			"name": "submit_verdict",
+			"description":
+				"Phase 1 of the verifier flow — MANDATORY, FIRST. Record your verdict on the \
+				 finding under review. Locks for the rest of the session: a second call returns \
+				 an error. The lock is deliberate so you can't revise the verdict to match a \
+				 fix you've already started drafting. Decide on the verdict before calling.",
+			"inputSchema": {
+				"type": "object",
+				"required": ["verdict", "notes"],
+				"properties": {
+					"verdict": {
+						"type": "string",
+						"enum": ["confirmed", "dismissed", "inconclusive"],
+						"description":
+							"`confirmed` — the bug is real and exploitable as described. \
+							 `dismissed` — the report is wrong (false positive, misread of the \
+							 code, etc.). `inconclusive` — the file's behaviour genuinely \
+							 depends on context outside the file itself (downstream caller \
+							 invariants, pinned dependency internals you cannot read). Prefer a \
+							 definite verdict when you can.",
+					},
+					"notes": {
+						"type": "string",
+						"description":
+							"One-sentence justification for the verdict. Surfaced to human \
+							 reviewers and persisted alongside the verification row.",
+					},
+				},
+			},
+		}));
+		tools.push(json!({
+			"name": "submit_patch",
+			"description":
+				"Phase 2 of the verifier flow — OPTIONAL. Propose a candidate fix for a \
+				 confirmed finding. Only available after `submit_verdict(\"confirmed\", ...)`; \
+				 calling before, or after a non-confirmed verdict, returns an error. **Failure \
+				 is acceptable**: if you are uncertain how to fix the bug correctly, end the \
+				 session without calling this tool — the verdict still stands and the human \
+				 reviewer takes it from there. A wrong patch attached to a real bug is worse \
+				 than no patch. The patch must be **minimally invasive** (smallest change that \
+				 fixes the bug; don't refactor neighbouring code or fix unrelated issues) and \
+				 **match the surrounding coding style** of the project (indentation, naming, \
+				 error-handling patterns, idioms — read the neighbouring code if unsure). Pre- \
+				 flight with `validate_patch` first; the server-side check rejects diffs that \
+				 don't apply against the worktree.",
+			"inputSchema": {
+				"type": "object",
+				"required": ["patch_unified", "notes"],
+				"properties": {
+					"patch_unified": {
+						"type": "string",
+						"description":
+							"Unified diff of the proposed fix, in `git diff` format with \
+							 `a/`/`b/` prefixes. Touch production code only — the PoC diff \
+							 already covers the regression test.",
+					},
+					"notes": {
+						"type": "string",
+						"description":
+							"1–2 sentence rationale: what the fix does and why this is the \
+							 minimal correct change. Surfaced to human reviewers alongside \
+							 the diff.",
+					},
+				},
+			},
+		}));
+		tools.push(json!({
+			"name": "validate_patch",
+			"description":
+				"Pre-flight check for a candidate patch diff. Runs `git apply --check` against \
+				 the worktree without writing anything; returns `{applies: true}` when the diff \
+				 would cleanly apply, or `{applies: false, error: ...}` with git's stderr. Use \
+				 this before `submit_patch` to catch path drift, fuzzy context, and malformed \
+				 hunks. Equivalent to discovery's `validate_poc` — same machinery, different \
+				 field name to match `submit_patch`'s input.",
+			"inputSchema": {
+				"type": "object",
+				"required": ["patch_unified"],
+				"properties": {
+					"patch_unified": {
+						"type": "string",
+						"description":
+							"Unified diff to check. Same string you'd pass as `submit_patch`'s \
+							 `patch_unified`.",
+					},
+				},
+			},
+		}));
+		return Value::Array(tools);
+	}
 	if submissions_enabled {
 		tools.push(json!({
 			"name": "submit_finding",
@@ -399,7 +573,10 @@ async fn handle_tool_call(session: &Arc<Session>, req: &Request, id: Value) -> R
 		},
 		"get_finding_by_id" => tool_get_finding_by_id(&session.client, &arguments).await,
 		"submit_finding" => tool_submit_finding(session, &arguments).await,
-		"validate_poc" => tool_validate_poc(&session.workdir, &arguments).await,
+		"validate_poc" => tool_validate_diff(&session.workdir, &arguments, "poc_unified").await,
+		"submit_verdict" => tool_submit_verdict(session, &arguments).await,
+		"submit_patch" => tool_submit_patch(session, &arguments).await,
+		"validate_patch" => tool_validate_diff(&session.workdir, &arguments, "patch_unified").await,
 		other => Err(anyhow::anyhow!("unknown tool: {other}")),
 	};
 
@@ -551,8 +728,13 @@ async fn tool_submit_finding(session: &Arc<Session>, args: &Value) -> Result<Str
 	))
 }
 
-async fn tool_validate_poc(workdir: &Path, args: &Value) -> Result<String> {
-	let diff = arg_str(args, "poc_unified")?;
+/// Shared `git apply --check` runner. Discovery uses it via
+/// `validate_poc(poc_unified)`; verify uses it via
+/// `validate_patch(patch_unified)`. The field name is the only
+/// difference, so both tools dispatch into this with the
+/// appropriate `field` argument.
+async fn tool_validate_diff(workdir: &Path, args: &Value, field: &str) -> Result<String> {
+	let diff = arg_str(args, field)?;
 
 	let outcome = check_diff_applies(workdir, diff).await?;
 	let payload = match outcome {
@@ -568,6 +750,118 @@ async fn tool_validate_poc(workdir: &Path, args: &Value) -> Result<String> {
 	// Tools return a string `text` per MCP convention; serialise the
 	// JSON payload so the agent gets a structured-looking response.
 	Ok(serde_json::to_string(&payload).expect("payload serialises"))
+}
+
+async fn tool_submit_verdict(session: &Arc<Session>, args: &Value) -> Result<String> {
+	let verify = session.verify.as_ref().context(
+		"submit_verdict called but the MCP server is in discovery mode \
+		 (no --finding-id was passed). This is a worker-side configuration \
+		 bug — the tool should not have been advertised.",
+	)?;
+
+	let verdict_str = arg_str(args, "verdict")?;
+	let notes = arg_str(args, "notes")?.to_owned();
+	let verdict = match verdict_str {
+		"confirmed" => loupe_core::Verdict::Confirmed { notes: Some(notes), patch: None },
+		"dismissed" => loupe_core::Verdict::Dismissed { notes: Some(notes) },
+		"inconclusive" => loupe_core::Verdict::Inconclusive { reason: notes },
+		other => anyhow::bail!(
+			"unknown verdict `{other}`; must be one of `confirmed`, `dismissed`, `inconclusive`"
+		),
+	};
+
+	let mut inner = verify.inner.lock().await;
+	if inner.verdict.is_some() {
+		anyhow::bail!(
+			"verdict already locked for this session; cannot submit a second verdict. \
+			 The first call's outcome is the one that will reach the server."
+		);
+	}
+	let is_confirmed = matches!(&verdict, loupe_core::Verdict::Confirmed { .. });
+	inner.verdict = Some(verdict);
+
+	tracing::info!(
+		finding_id = verify.finding_id,
+		verdict = verdict_str,
+		"loupe-mcp: agent submitted verify verdict",
+	);
+
+	if is_confirmed {
+		Ok("Verdict locked: confirmed. You may now optionally call `submit_patch` \
+		    with a candidate fix; skipping it is fine — the verdict still stands. \
+		    If you propose a patch, it must be minimally invasive and match the \
+		    project's coding style; abort the patch attempt rather than guessing."
+			.into())
+	} else {
+		Ok(format!(
+			"Verdict locked: {verdict_str}. `submit_patch` is not applicable for this \
+			 verdict — patches only attach to `confirmed` verdicts. End the session \
+			 when you're done."
+		))
+	}
+}
+
+async fn tool_submit_patch(session: &Arc<Session>, args: &Value) -> Result<String> {
+	let verify = session.verify.as_ref().context(
+		"submit_patch called but the MCP server is in discovery mode \
+		 (no --finding-id was passed). This is a worker-side configuration \
+		 bug — the tool should not have been advertised.",
+	)?;
+
+	let patch_unified = arg_str(args, "patch_unified")?.to_owned();
+	let notes = arg_str(args, "notes")?.to_owned();
+
+	// Cheap state checks first — verdict shape, then "patch slot
+	// already taken." Saves spawning `git apply --check` when the
+	// call is going to be rejected on the verdict alone. Hold the
+	// lock across the diff check too so a concurrent submit_patch
+	// (impossible today since the agent's MCP session is
+	// single-threaded over stdin, but cheap insurance against future
+	// regressions) can't race past the patch.is_some() guard.
+	let mut inner = verify.inner.lock().await;
+	match &inner.verdict {
+		None => anyhow::bail!(
+			"submit_patch called before submit_verdict. Lock a verdict first, \
+			 then propose a patch (only valid after a `confirmed` verdict)."
+		),
+		Some(loupe_core::Verdict::Confirmed { .. }) => {},
+		Some(other) => {
+			let kind = match other {
+				loupe_core::Verdict::Dismissed { .. } => "dismissed",
+				loupe_core::Verdict::Inconclusive { .. } => "inconclusive",
+				loupe_core::Verdict::Confirmed { .. } => unreachable!("handled above"),
+			};
+			anyhow::bail!(
+				"submit_patch is only valid after a `confirmed` verdict; current verdict \
+				 is `{kind}`. End the session — no patch is applicable."
+			);
+		},
+	}
+	if inner.patch.is_some() {
+		anyhow::bail!("patch already submitted for this session; one patch per verify session");
+	}
+
+	// Now the expensive check. The server-side
+	// `attach_proposed_patch` won't catch a bad diff because storage
+	// doesn't validate; surfacing the failure here gives the agent a
+	// chance to revise.
+	match check_diff_applies(&session.workdir, &patch_unified).await? {
+		DiffCheck::Applies => {},
+		DiffCheck::Rejects { stderr } => {
+			anyhow::bail!(
+				"patch_unified does not apply against the worktree (`git apply --check` \
+				 rejected it). Revise and re-call `validate_patch` first. stderr: {stderr}"
+			);
+		},
+	}
+
+	inner.patch = Some(loupe_core::VerdictPatch { patch_unified, notes });
+
+	tracing::info!(finding_id = verify.finding_id, "loupe-mcp: agent submitted verifier patch",);
+
+	Ok("Patch buffered. End the session when you're done; the verdict and patch \
+	    will be POSTed together to the server in a single request."
+		.into())
 }
 
 #[derive(Debug)]
@@ -657,6 +951,71 @@ fn write_response<W: Write>(w: &mut W, resp: &Response) -> Result<()> {
 	Ok(())
 }
 
+/// End-of-session flush for verify mode: take the buffered verdict
+/// (and patch, if any), merge them into a single
+/// `Verdict::Confirmed { ..., patch }` (or pass through unchanged
+/// for non-Confirmed variants), and POST one `VerdictSubmission` to
+/// `/v1/jobs/{job_id}/verdict`.
+///
+/// Errors propagate up through `run_stdio_server`'s return so the
+/// runner posts `complete(failed)` and the validating-deadline
+/// reaper later marks the verdict inconclusive. In particular: if
+/// the agent never called `submit_verdict`, that's a verifier
+/// failure — the agent didn't do its job — and we surface the
+/// failure rather than silently letting the verify slot stay open.
+async fn flush_verify_session(session: &Arc<Session>) -> Result<()> {
+	let verify = session.verify.as_ref().expect("flush_verify_session: verify state required");
+	let job_id = session
+		.job_id
+		.context("flush_verify_session: verify mode requires --job-id (checked at startup)")?;
+
+	let inner = verify.inner.lock().await;
+	let verdict = inner.verdict.clone().context(
+		"verify session ended without `submit_verdict` being called. \
+		 The verifier agent didn't produce a verdict — treating as a \
+		 session failure so the runner reports the job failed and the \
+		 validating-deadline reaper picks up the slack.",
+	)?;
+	let patch = inner.patch.clone();
+	drop(inner);
+
+	// Merge: a buffered patch only attaches to a Confirmed verdict.
+	// `submit_patch` already enforces this (it refuses to buffer when
+	// the verdict isn't Confirmed), but the merge makes the invariant
+	// explicit at flush time too.
+	let final_verdict = match verdict {
+		loupe_core::Verdict::Confirmed { notes, patch: existing } => {
+			loupe_core::Verdict::Confirmed {
+				notes,
+				// If somehow both fields carry a patch (impossible by the
+				// tool plumbing), prefer the buffered one — the in-session
+				// `submit_patch` is the path the operator wired the audit
+				// columns through.
+				patch: patch.or(existing),
+			}
+		},
+		other => other,
+	};
+
+	tracing::info!(
+		finding_id = verify.finding_id,
+		job_id,
+		"loupe-mcp: flushing verify session verdict",
+	);
+	session
+		.client
+		.submit_verdict(
+			job_id,
+			&loupe_proto::VerdictSubmission {
+				protocol_version: loupe_proto::PROTOCOL_VERSION,
+				verdict: final_verdict,
+			},
+		)
+		.await
+		.context("POSTing buffered verdict to /v1/jobs/:id/verdict")?;
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -666,7 +1025,7 @@ mod tests {
 		// The MCP client (claude) parses tools/list output as JSON
 		// against its own schema; pinning it here catches accidental
 		// breakage of the shape (e.g. forgetting `inputSchema`).
-		let v = tool_definitions(true);
+		let v = tool_definitions(true, false);
 		let arr = v.as_array().expect("tools must serialise as an array");
 		assert!(!arr.is_empty());
 		for t in arr {
@@ -682,18 +1041,130 @@ mod tests {
 
 	#[test]
 	fn submit_finding_only_appears_when_job_id_is_set() {
-		let with = tool_definitions(true);
+		let with = tool_definitions(true, false);
 		let names: Vec<&str> =
 			with.as_array().unwrap().iter().filter_map(|t| t.get("name")?.as_str()).collect();
 		assert!(names.contains(&"submit_finding"), "got: {names:?}");
 
-		let without = tool_definitions(false);
+		let without = tool_definitions(false, false);
 		let names: Vec<&str> =
 			without.as_array().unwrap().iter().filter_map(|t| t.get("name")?.as_str()).collect();
 		assert!(!names.contains(&"submit_finding"), "got: {names:?}");
 		// Read-only tools always advertised.
 		assert!(names.contains(&"query_prior_findings"));
 		assert!(names.contains(&"get_finding_by_id"));
+	}
+
+	fn fake_session_for_verify(finding_id: i64) -> Arc<Session> {
+		// `submit_verdict` / `submit_patch` only buffer locally; they
+		// don't hit the network until `flush_verify_session` runs at
+		// session end. So a no-op ServerClient (default reqwest +
+		// any URL) is fine for the locking tests below.
+		let client = Arc::new(ServerClient::from_parts(
+			reqwest::Client::new(),
+			"http://invalid.example/".parse().unwrap(),
+		));
+		Arc::new(Session {
+			client,
+			repo_id: 1,
+			job_id: Some(42),
+			workdir: tempfile::tempdir().unwrap().keep(),
+			verify: Some(VerifySessionState {
+				finding_id,
+				inner: tokio::sync::Mutex::new(VerifySessionInner::default()),
+			}),
+		})
+	}
+
+	#[tokio::test]
+	async fn submit_verdict_locks_after_first_call() {
+		let session = fake_session_for_verify(7);
+		let first =
+			tool_submit_verdict(&session, &json!({ "verdict": "confirmed", "notes": "real bug" }))
+				.await
+				.expect("first verdict accepted");
+		assert!(first.contains("locked"), "first call must report the lock; got: {first}");
+
+		let err = tool_submit_verdict(
+			&session,
+			&json!({ "verdict": "dismissed", "notes": "second thoughts" }),
+		)
+		.await
+		.expect_err("second verdict must be rejected");
+		assert!(
+			err.to_string().contains("already locked"),
+			"second call must mention the lock; got: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn submit_patch_requires_a_prior_confirmed_verdict() {
+		let session = fake_session_for_verify(7);
+		// No verdict yet → patch must be rejected.
+		let err = tool_submit_patch(
+			&session,
+			&json!({
+				"patch_unified": "--- a/x\n+++ b/x\n@@\n-old\n+new\n",
+				"notes": "fix"
+			}),
+		)
+		.await
+		.expect_err("patch before verdict must be rejected");
+		assert!(
+			err.to_string().contains("submit_verdict") || err.to_string().contains("verdict"),
+			"got: {err}"
+		);
+
+		// Dismissed verdict → patch still rejected (patches only ride
+		// on confirmed verdicts).
+		tool_submit_verdict(
+			&session,
+			&json!({ "verdict": "dismissed", "notes": "false positive" }),
+		)
+		.await
+		.expect("verdict accepted");
+		let err = tool_submit_patch(
+			&session,
+			&json!({
+				"patch_unified": "--- a/x\n+++ b/x\n@@\n-old\n+new\n",
+				"notes": "fix"
+			}),
+		)
+		.await
+		.expect_err("patch after dismissed must be rejected");
+		assert!(
+			err.to_string().to_lowercase().contains("confirmed"),
+			"error must mention the `confirmed` requirement; got: {err}"
+		);
+	}
+
+	#[test]
+	fn verify_mode_swaps_the_tool_catalog() {
+		// Discovery and verify expose disjoint write surfaces. If a
+		// future refactor accidentally leaves both on at once, a
+		// verifier agent could call submit_finding (no `--job-id` for
+		// discovery) and a discovery agent could call submit_verdict
+		// (verdict POSTs would 400 server-side, but the prompt would
+		// be confused). Pin the disjointness here.
+		let verify = tool_definitions(true, true);
+		let verify_names: Vec<&str> =
+			verify.as_array().unwrap().iter().filter_map(|t| t.get("name")?.as_str()).collect();
+		assert!(verify_names.contains(&"submit_verdict"), "got: {verify_names:?}");
+		assert!(verify_names.contains(&"submit_patch"), "got: {verify_names:?}");
+		assert!(verify_names.contains(&"validate_patch"), "got: {verify_names:?}");
+		assert!(!verify_names.contains(&"submit_finding"), "got: {verify_names:?}");
+		assert!(!verify_names.contains(&"validate_poc"), "got: {verify_names:?}");
+		// Read-only tools stay on in verify mode too — useful to
+		// cross-check the bug under review against prior findings.
+		assert!(verify_names.contains(&"query_prior_findings"));
+		assert!(verify_names.contains(&"get_finding_by_id"));
+
+		let discovery = tool_definitions(true, false);
+		let discovery_names: Vec<&str> =
+			discovery.as_array().unwrap().iter().filter_map(|t| t.get("name")?.as_str()).collect();
+		assert!(!discovery_names.contains(&"submit_verdict"));
+		assert!(!discovery_names.contains(&"submit_patch"));
+		assert!(!discovery_names.contains(&"validate_patch"));
 	}
 
 	#[test]
@@ -828,7 +1299,8 @@ mod tests {
 			" world\n",
 		);
 		let args = json!({ "poc_unified": diff });
-		let result = tool_validate_poc(workdir.path(), &args).await.expect("tool ok");
+		let result =
+			tool_validate_diff(workdir.path(), &args, "poc_unified").await.expect("tool ok");
 		let parsed: Value = serde_json::from_str(&result).expect("json");
 		assert_eq!(parsed["applies"], json!(true), "expected applies=true, got: {parsed}");
 	}
@@ -850,7 +1322,8 @@ mod tests {
 +added\n\
 ";
 		let args = json!({ "poc_unified": diff });
-		let result = tool_validate_poc(workdir.path(), &args).await.expect("tool ok");
+		let result =
+			tool_validate_diff(workdir.path(), &args, "poc_unified").await.expect("tool ok");
 		let parsed: Value = serde_json::from_str(&result).expect("json");
 		assert_eq!(parsed["applies"], json!(false), "expected applies=false");
 		let err = parsed["error"].as_str().unwrap_or("");
@@ -865,7 +1338,8 @@ mod tests {
 		}
 		let workdir = tempfile::tempdir().unwrap();
 		let args = json!({ "poc_unified": "this is not a unified diff" });
-		let result = tool_validate_poc(workdir.path(), &args).await.expect("tool ok");
+		let result =
+			tool_validate_diff(workdir.path(), &args, "poc_unified").await.expect("tool ok");
 		let parsed: Value = serde_json::from_str(&result).expect("json");
 		assert_eq!(parsed["applies"], json!(false));
 	}
@@ -877,7 +1351,7 @@ mod tests {
 		// diagnostics. Pinned because future "tighten the surface"
 		// refactors might be tempted to gate it.
 		for enabled in [true, false] {
-			let v = tool_definitions(enabled);
+			let v = tool_definitions(enabled, false);
 			let names: Vec<&str> =
 				v.as_array().unwrap().iter().filter_map(|t| t.get("name")?.as_str()).collect();
 			assert!(

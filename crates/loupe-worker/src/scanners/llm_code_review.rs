@@ -343,6 +343,7 @@ async fn run_one(
 		cancel,
 		repo_id: Some(repo_id),
 		job_id: Some(job_id),
+		finding_id: None,
 	};
 	match backend.run(req).await {
 		Ok(r) => {

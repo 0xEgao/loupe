@@ -94,6 +94,11 @@ impl Scanner for LlmVerifierScanner {
 			// returns a Verdict to the runner instead — so
 			// `submit_finding` is intentionally unavailable here.
 			job_id: None,
+			// Today's verifier still parses stdout-JSON (no MCP). The
+			// next commit (4c) flips this to `Some(ctx.finding_id)`
+			// to put the MCP server into verify mode. Leave None
+			// here so 4b's tool plumbing can land independently.
+			finding_id: None,
 		};
 		let resp = self.backend.run(req).await?;
 

@@ -89,6 +89,15 @@ struct McpServeArgs {
 	/// read-only MCP usage) the tool is not advertised.
 	#[arg(long, env = "LOUPE_JOB_ID")]
 	job_id: Option<i64>,
+	/// Finding id this verify session is reasoning about. When set,
+	/// the MCP server enters verify mode: `submit_finding` is
+	/// hidden; `submit_verdict`, `submit_patch`, and `validate_patch`
+	/// are advertised instead. Setting this without `--job-id` is a
+	/// configuration bug — verdict POSTs need a job to attribute the
+	/// verification row to — and the MCP server bails at startup
+	/// rather than silently degrading.
+	#[arg(long, env = "LOUPE_FINDING_ID")]
+	finding_id: Option<i64>,
 	/// Path to the worktree the agent is reasoning over. The MCP
 	/// server reads source files from here to compute fingerprints
 	/// for `submit_finding`. Inside the bwrap sandbox this is
@@ -238,13 +247,21 @@ async fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
 		.with_context(|| format!("reading worker key at {}", args.key.display()))?;
 
 	let client = Arc::new(ServerClient::new(&ca_cert_pem, &cert_pem, &key_pem, args.server_url)?);
+	if args.finding_id.is_some() && args.job_id.is_none() {
+		anyhow::bail!(
+			"--finding-id requires --job-id (verdict POSTs need a job to attribute \
+			 the verification row to). This is a worker-side configuration bug; \
+			 caller should pass both or neither."
+		);
+	}
 	tracing::info!(
 		repo_id = args.repo_id,
 		job_id = ?args.job_id,
+		finding_id = ?args.finding_id,
 		workdir = %args.workdir.display(),
 		"loupe-mcp: starting stdio server",
 	);
-	mcp::run_stdio_server(client, args.repo_id, args.job_id, args.workdir).await
+	mcp::run_stdio_server(client, args.repo_id, args.job_id, args.finding_id, args.workdir).await
 }
 
 /// Initialise tracing. Defaults to the human-readable formatter; set

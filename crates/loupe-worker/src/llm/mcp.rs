@@ -70,14 +70,19 @@ pub struct McpContext {
 /// Build the args list that gets appended to `loupe-worker
 /// mcp-serve` for one MCP-attached agent invocation. Cert + binary
 /// paths come from the sandbox fixed paths above; per-call data
-/// (`repo_id`, `job_id`, `sandbox_workdir`) is wired by the caller.
+/// (`repo_id`, `job_id`, `finding_id`, `sandbox_workdir`) is wired
+/// by the caller.
 ///
 /// `job_id` is optional — the MCP server hides `submit_finding` when
 /// it isn't supplied (e.g. a future read-only diagnostic flow).
+/// `finding_id`, when present, flips the MCP server into verify
+/// mode: it advertises `submit_verdict` / `submit_patch` /
+/// `validate_patch` instead of `submit_finding` / `validate_poc`.
 /// Both backends emit the same args list; only the wrapper around
 /// it (a JSON file vs. `-c` overrides) differs.
 pub fn mcp_serve_args(
-	ctx: &McpContext, repo_id: i64, job_id: Option<i64>, sandbox_workdir: &str,
+	ctx: &McpContext, repo_id: i64, job_id: Option<i64>, finding_id: Option<i64>,
+	sandbox_workdir: &str,
 ) -> Vec<String> {
 	let mut args: Vec<String> = vec![
 		"mcp-serve".into(),
@@ -97,6 +102,10 @@ pub fn mcp_serve_args(
 	if let Some(j) = job_id {
 		args.push("--job-id".into());
 		args.push(j.to_string());
+	}
+	if let Some(f) = finding_id {
+		args.push("--finding-id".into());
+		args.push(f.to_string());
 	}
 	args
 }
