@@ -154,21 +154,23 @@ async fn registering_with_non_https_clone_url_400s() {
 	let f = bring_up().await;
 	let admin = admin_client(&f.ca_cert_pem, &f.admin_cert_pem, &f.admin_key_pem, f.addr);
 
-	let req = RegisterRepoRequest {
-		protocol_version: PROTOCOL_VERSION,
-		clone_url: "git@github.com:acme/widget.git".into(),
-		branch: None,
-		scan_interval_seconds: None,
-		reporting: ReportingSetup::GithubIssue {
-			target_owner: "a".into(),
-			target_repo: "b".into(),
-			github_pat: "ghp".into(),
-		},
-		scanner_config: serde_json::Value::Null,
-		verification_enabled: false,
-		require_approval: None,
-	};
-	let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
-	assert_eq!(resp.status(), 400);
+	for clone_url in ["git@github.com:acme/widget.git", "http://github.com/acme/widget.git"] {
+		let req = RegisterRepoRequest {
+			protocol_version: PROTOCOL_VERSION,
+			clone_url: clone_url.into(),
+			branch: None,
+			scan_interval_seconds: None,
+			reporting: ReportingSetup::GithubIssue {
+				target_owner: "a".into(),
+				target_repo: "b".into(),
+				github_pat: "ghp".into(),
+			},
+			scanner_config: serde_json::Value::Null,
+			verification_enabled: false,
+			require_approval: None,
+		};
+		let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
+		assert_eq!(resp.status(), 400, "{clone_url} should be rejected");
+	}
 	f.handle.shutdown().await;
 }

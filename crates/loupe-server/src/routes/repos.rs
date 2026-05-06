@@ -43,7 +43,7 @@ pub async fn create(
 		));
 	}
 	let parsed = parse_github_clone_url(&req.clone_url)
-		.ok_or((StatusCode::BAD_REQUEST, "clone_url must be an https github URL".into()))?;
+		.ok_or((StatusCode::BAD_REQUEST, "clone_url must be an https or file URL".into()))?;
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 
 	let new_repo_id = state
@@ -198,7 +198,7 @@ fn parse_github_clone_url(url: &str) -> Option<(String, String, String)> {
 		}
 		return Some(("local".into(), "local".into(), repo));
 	}
-	let without_scheme = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+	let without_scheme = url.strip_prefix("https://")?;
 	let mut parts = without_scheme.splitn(2, '/');
 	let host = parts.next()?.to_owned();
 	let path = parts.next()?;
@@ -235,6 +235,7 @@ mod tests {
 	fn rejects_non_https_or_file_url() {
 		assert!(parse_github_clone_url("git@github.com:acme/widget.git").is_none());
 		assert!(parse_github_clone_url("ssh://github.com/acme/widget").is_none());
+		assert!(parse_github_clone_url("http://github.com/acme/widget").is_none());
 	}
 
 	#[test]
