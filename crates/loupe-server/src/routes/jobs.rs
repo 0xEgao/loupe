@@ -635,82 +635,18 @@ pub async fn complete(
 pub(super) async fn dispatch_finding(
 	state: &AppState, finding_id: i64, now: i64,
 ) -> anyhow::Result<()> {
-	use loupe_core::{Finding, ReportingDestination};
-
 	let row = state
 		.db
-		.with_conn(|c| {
-			Ok(findings::list_for_job(
-				c,
-				c.query_row(
-					"SELECT job_id FROM findings WHERE id = ?1 AND state = 'confirmed'",
-					[finding_id],
-					|r| r.get::<_, i64>(0),
-				)?,
-			)?)
-		})?
-		.into_iter()
-		.find(|r| r.id == finding_id)
-		.ok_or_else(|| {
-			anyhow::anyhow!("finding {finding_id} disappeared between confirm and dispatch")
-		})?;
+		.with_conn(|c| Ok(findings::get(c, finding_id)?))?
+		.ok_or_else(|| anyhow::anyhow!("finding {finding_id} disappeared before dispatch"))?;
+	if row.state != "confirmed" {
+		anyhow::bail!("finding {finding_id} is not confirmed; current state is {}", row.state);
+	}
 	let repo = state.db.with_conn(|c| Ok(repos::get(c, row.repo_id)?))?.ok_or_else(|| {
 		anyhow::anyhow!("repo {} for finding {} missing", row.repo_id, finding_id)
 	})?;
-	// Manual mode short-circuits: terminate the finding's lifecycle but
-	// don't poke any external system. Operator handled it (or will
-	// handle it) out-of-band.
-	if matches!(repo.reporting, ReportingDestination::Manual) {
-		state.db.with_conn(|c| {
-			c.execute(
-				"UPDATE findings SET reported_at = ?1, state = 'reported'
-				 WHERE id = ?2 AND state = 'confirmed'",
-				(now, finding_id),
-			)?;
-			Ok(())
-		})?;
-		tracing::info!(finding_id, "manual mode: finding terminated without external dispatch");
-		return Ok(());
-	}
-	let pat = match &repo.reporting {
-		ReportingDestination::GithubIssue { pat_secret_id, .. } => {
-			let bytes = state
-				.db
-				.with_conn(|c| Ok(secrets::read(c, *pat_secret_id)?))?
-				.ok_or_else(|| anyhow::anyhow!("pat secret {pat_secret_id} not found"))?;
-			String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?
-		},
-		ReportingDestination::Email { .. } => String::new(),
-		ReportingDestination::Manual => unreachable!("Manual handled above"),
-	};
-
-	let f = Finding {
-		scanner_id: row.scanner_id.clone(),
-		severity: row.severity,
-		title: row.title.clone(),
-		description: row.description.clone(),
-		file_path: row.file_path.clone(),
-		line_start: row.line_start,
-		line_end: row.line_end,
-		cwe: row.cwe.clone(),
-		patch_unified: row.patch_unified.clone(),
-		poc_unified: row.poc_unified.clone(),
-		fingerprint: row.fingerprint.clone(),
-	};
-	let reporter =
-		reporters::select(&repo, state.github_reporter.clone(), state.email_reporter.clone())
-			.ok_or_else(|| anyhow::anyhow!("no reporter for destination kind"))?;
-	let receipt = reporter.dispatch(&repo, std::slice::from_ref(&f), &pat).await?;
-	tracing::info!(finding_id, external_id = receipt.external_id.as_deref(), "dispatched finding");
-
-	state.db.with_conn(|c| {
-		c.execute(
-			"UPDATE findings SET reported_at = ?1, state = 'reported'
-			 WHERE id = ?2 AND state = 'confirmed'",
-			(now, finding_id),
-		)?;
-		Ok(())
-	})?;
+	dispatch_confirmed_rows(state, &repo, vec![row], DispatchScope::Finding(finding_id), now)
+		.await?;
 	Ok(())
 }
 
@@ -722,88 +658,120 @@ pub(super) async fn dispatch_finding(
 async fn dispatch_for_job(
 	state: &AppState, repo_id: i64, job_id: i64, now: i64,
 ) -> anyhow::Result<()> {
-	use loupe_core::{Finding, ReportingDestination};
-
 	let repo = state
 		.db
 		.with_conn(|c| Ok(repos::get(c, repo_id)?))?
 		.ok_or_else(|| anyhow::anyhow!("repo {repo_id} disappeared before dispatch"))?;
-	// Manual mode short-circuits: terminate every confirmed finding
-	// from this scan job without poking any external system.
+	let rows = state.db.with_conn(|c| Ok(findings::list_for_job(c, job_id)?))?;
+	dispatch_confirmed_rows(state, &repo, rows, DispatchScope::Job(job_id), now).await?;
+	Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DispatchScope {
+	Finding(i64),
+	Job(i64),
+}
+
+async fn dispatch_confirmed_rows(
+	state: &AppState, repo: &repos::RepoRow, rows: Vec<findings::FindingRow>, scope: DispatchScope,
+	now: i64,
+) -> anyhow::Result<()> {
+	use loupe_core::ReportingDestination;
+
+	let confirmed_rows: Vec<_> = rows.into_iter().filter(|r| r.state == "confirmed").collect();
+	if confirmed_rows.is_empty() {
+		return Ok(());
+	}
+	let ids: Vec<i64> = confirmed_rows.iter().map(|r| r.id).collect();
+	let findings_for_report: Vec<_> = confirmed_rows.into_iter().map(finding_from_row).collect();
+
 	if matches!(repo.reporting, ReportingDestination::Manual) {
-		let n = state.db.with_conn(|c| {
-			Ok(c.execute(
-				"UPDATE findings SET reported_at = ?1, state = 'reported'
-				 WHERE job_id = ?2 AND state = 'confirmed'",
-				(now, job_id),
-			)?)
-		})?;
+		let n = mark_reported(state, &ids, now)?;
 		if n > 0 {
-			tracing::info!(
-				job_id,
-				count = n,
-				"manual mode: findings terminated without external dispatch"
-			);
+			match scope {
+				DispatchScope::Finding(finding_id) => tracing::info!(
+					finding_id,
+					"manual mode: finding terminated without external dispatch"
+				),
+				DispatchScope::Job(job_id) => tracing::info!(
+					job_id,
+					count = n,
+					"manual mode: findings terminated without external dispatch"
+				),
+			}
 		}
 		return Ok(());
 	}
-	let pat = match &repo.reporting {
+
+	let pat = reporter_secret(state, repo)?;
+	let reporter =
+		reporters::select(repo, state.github_reporter.clone(), state.email_reporter.clone())
+			.ok_or_else(|| anyhow::anyhow!("no reporter for destination kind"))?;
+	let receipt = reporter.dispatch(repo, &findings_for_report, &pat).await?;
+	match scope {
+		DispatchScope::Finding(finding_id) => tracing::info!(
+			finding_id,
+			external_id = receipt.external_id.as_deref(),
+			"dispatched finding"
+		),
+		DispatchScope::Job(job_id) => tracing::info!(
+			job_id,
+			count = findings_for_report.len(),
+			external_id = receipt.external_id.as_deref(),
+			"dispatched findings"
+		),
+	}
+
+	mark_reported(state, &ids, now)?;
+	Ok(())
+}
+
+fn reporter_secret(state: &AppState, repo: &repos::RepoRow) -> anyhow::Result<String> {
+	use loupe_core::ReportingDestination;
+
+	match &repo.reporting {
 		ReportingDestination::GithubIssue { pat_secret_id, .. } => {
 			let bytes = state
 				.db
 				.with_conn(|c| Ok(secrets::read(c, *pat_secret_id)?))?
 				.ok_or_else(|| anyhow::anyhow!("pat secret {pat_secret_id} not found"))?;
-			String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?
+			String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))
 		},
-		ReportingDestination::Email { .. } => String::new(),
-		ReportingDestination::Manual => unreachable!("Manual handled above"),
-	};
-
-	let rows = state.db.with_conn(|c| Ok(findings::list_for_job(c, job_id)?))?;
-	let findings_for_report: Vec<Finding> = rows
-		.into_iter()
-		// Only dispatch findings that have been confirmed (auto-confirm
-		// for repos with verification_enabled = false, or successful
-		// verify-job verdict for repos with it on). Findings still in
-		// `validating` will be picked up by the verdict handler when
-		// they flip to `confirmed`. Already-reported findings are skipped.
-		.filter(|r| r.state == "confirmed")
-		.map(|r| Finding {
-			scanner_id: r.scanner_id,
-			severity: r.severity,
-			title: r.title,
-			description: r.description,
-			file_path: r.file_path,
-			line_start: r.line_start,
-			line_end: r.line_end,
-			cwe: r.cwe,
-			patch_unified: r.patch_unified,
-			poc_unified: r.poc_unified,
-			fingerprint: r.fingerprint,
-		})
-		.collect();
-	if findings_for_report.is_empty() {
-		return Ok(());
+		ReportingDestination::Email { .. } => Ok(String::new()),
+		ReportingDestination::Manual => unreachable!("Manual handled before reporter_secret"),
 	}
+}
 
-	let reporter =
-		reporters::select(&repo, state.github_reporter.clone(), state.email_reporter.clone())
-			.ok_or_else(|| anyhow::anyhow!("no reporter for destination kind"))?;
-	let receipt = reporter.dispatch(&repo, &findings_for_report, &pat).await?;
-	tracing::info!(
-		job_id,
-		count = findings_for_report.len(),
-		external_id = receipt.external_id.as_deref(),
-		"dispatched findings"
-	);
+fn finding_from_row(row: findings::FindingRow) -> loupe_core::Finding {
+	loupe_core::Finding {
+		scanner_id: row.scanner_id,
+		severity: row.severity,
+		title: row.title,
+		description: row.description,
+		file_path: row.file_path,
+		line_start: row.line_start,
+		line_end: row.line_end,
+		cwe: row.cwe,
+		patch_unified: row.patch_unified,
+		poc_unified: row.poc_unified,
+		fingerprint: row.fingerprint,
+	}
+}
 
-	state.db.with_conn(|c| {
-		c.execute(
-			"UPDATE findings SET reported_at = ?1, state = 'reported'
-			 WHERE job_id = ?2 AND state = 'confirmed'",
-			(now, job_id),
-		)?;
-		Ok(())
+fn mark_reported(state: &AppState, ids: &[i64], now: i64) -> anyhow::Result<usize> {
+	let n = state.db.with_conn(|c| {
+		let tx = c.transaction()?;
+		let mut n = 0usize;
+		for id in ids {
+			n += tx.execute(
+				"UPDATE findings SET reported_at = ?1, state = 'reported'
+				 WHERE id = ?2 AND state = 'confirmed'",
+				(now, id),
+			)?;
+		}
+		tx.commit()?;
+		Ok(n)
 	})?;
-	Ok(())
+	Ok(n)
 }
