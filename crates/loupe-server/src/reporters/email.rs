@@ -71,6 +71,11 @@ impl Reporter for EmailReporter {
 			repo.owner,
 			repo.repo,
 		);
+		validate_header_value("From", &from)?;
+		for recipient in &to {
+			validate_header_value("To", recipient)?;
+		}
+		validate_header_value("Subject", &subject)?;
 		let message = render_message(&from, &to, &subject, repo, findings);
 
 		let mut child = Command::new(&self.sendmail_bin)
@@ -93,6 +98,13 @@ impl Reporter for EmailReporter {
 		}
 		Ok(DispatchReceipt { kind: self.kind(), external_id: None })
 	}
+}
+
+fn validate_header_value(name: &str, value: &str) -> Result<()> {
+	if value.bytes().any(|b| matches!(b, b'\r' | b'\n')) {
+		bail!("{name} header contains a newline");
+	}
+	Ok(())
 }
 
 fn render_message(
@@ -131,4 +143,73 @@ fn render_message(
 
 fn max_severity(findings: &[Finding]) -> Severity {
 	findings.iter().map(|f| f.severity).max().unwrap_or(Severity::Info)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn repo_with_email(from: Option<String>, to: Vec<String>, subject_prefix: Option<String>) -> RepoRow {
+		RepoRow {
+			id: 1,
+			clone_url: "https://github.com/acme/widget.git".into(),
+			host: "github.com".into(),
+			owner: "acme".into(),
+			repo: "widget".into(),
+			default_branch: None,
+			scan_interval_seconds: None,
+			scanner_config: serde_json::Value::Null,
+			reporting: ReportingDestination::Email { to, from, subject_prefix },
+			verification_enabled: false,
+			require_approval: None,
+			last_scanned_sha: None,
+			last_scanned_at: None,
+			created_at: 0,
+			disabled_at: None,
+		}
+	}
+
+	fn finding() -> Finding {
+		Finding {
+			scanner_id: "test".into(),
+			severity: Severity::High,
+			title: "bug".into(),
+			description: "description".into(),
+			file_path: Some("src/lib.rs".into()),
+			line_start: Some(1),
+			line_end: Some(1),
+			cwe: None,
+			patch_unified: None,
+			poc_unified: None,
+			fingerprint: "fp".into(),
+		}
+	}
+
+	#[tokio::test]
+	async fn dispatch_rejects_header_injection_values() {
+		let reporter = EmailReporter::with_bin("/definitely/missing/sendmail");
+		let cases = [
+			repo_with_email(
+				Some("loupe@example.com\r\nBcc: attacker@example.com".into()),
+				vec!["security@example.com".into()],
+				None,
+			),
+			repo_with_email(
+				Some("loupe@example.com".into()),
+				vec!["security@example.com\nBcc: attacker@example.com".into()],
+				None,
+			),
+			repo_with_email(
+				Some("loupe@example.com".into()),
+				vec!["security@example.com".into()],
+				Some("[loupe]\r\nBcc: attacker@example.com".into()),
+			),
+		];
+
+		for repo in cases {
+			let err = reporter.dispatch(&repo, &[finding()], "").await.expect_err("must reject");
+			let msg = err.to_string();
+			assert!(msg.contains("header contains a newline"), "got: {msg}");
+		}
+	}
 }
