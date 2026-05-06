@@ -35,7 +35,7 @@
 //!   "regression test" doesn't actually apply.
 
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -81,6 +81,47 @@ fn arg_u32(args: &Value, key: &str) -> Result<u32> {
 		.and_then(|v| v.as_u64())
 		.with_context(|| format!("`{key}` argument is required and must be a positive integer"))?;
 	Ok(v.min(u32::MAX as u64) as u32)
+}
+
+fn normalize_submitted_file(workdir: &Path, file: &str) -> Result<String> {
+	let stripped = file.strip_prefix("/workdir/").unwrap_or(file);
+	let path = Path::new(stripped);
+	if stripped.trim().is_empty() {
+		anyhow::bail!("`file` must not be empty");
+	}
+	if path.is_absolute() {
+		anyhow::bail!("`file` must be repo-relative or under /workdir");
+	}
+
+	let mut rel = PathBuf::new();
+	for component in path.components() {
+		match component {
+			Component::Normal(part) => rel.push(part),
+			Component::CurDir => {},
+			Component::ParentDir => anyhow::bail!("`file` must not contain `..` components"),
+			Component::RootDir | Component::Prefix(_) => {
+				anyhow::bail!("`file` must be repo-relative or under /workdir")
+			},
+		}
+	}
+	if rel.as_os_str().is_empty() {
+		anyhow::bail!("`file` must name a file inside the workdir");
+	}
+
+	let workdir = workdir.canonicalize().with_context(|| {
+		format!("canonicalizing workdir {} before validating submitted path", workdir.display())
+	})?;
+	let candidate = workdir.join(&rel);
+	if candidate.exists() {
+		let canonical = candidate
+			.canonicalize()
+			.with_context(|| format!("canonicalizing submitted file {}", candidate.display()))?;
+		if !canonical.starts_with(&workdir) {
+			anyhow::bail!("`file` resolves outside the workdir: {}", rel.display());
+		}
+	}
+
+	Ok(rel.to_string_lossy().into_owned())
 }
 
 /// Format a finding's location as `path:line[-end]` for human display
@@ -681,17 +722,17 @@ pub(crate) fn build_finding_from_args(workdir: &Path, args: &Value) -> Result<Fi
 	let cwe = args.get("cwe").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
 
 	// Sandbox-leak guard: the agent occasionally echoes the in-bwrap
-	// path. Strip it so the file recorded on the server is repo-
-	// relative regardless of where the agent was looking from.
-	let rel_file = file.strip_prefix("/workdir/").unwrap_or(file).trim_start_matches('/');
-	let fingerprint = fingerprint_for(workdir, rel_file, line_start, line_end);
+	// path. Normalize it to a repo-relative path and reject traversal
+	// before reading source for the fingerprint.
+	let rel_file = normalize_submitted_file(workdir, file)?;
+	let fingerprint = fingerprint_for(workdir, &rel_file, line_start, line_end);
 
 	Ok(Finding {
 		scanner_id: SCANNER_ID.into(),
 		severity,
 		title,
 		description,
-		file_path: Some(rel_file.to_owned()),
+		file_path: Some(rel_file),
 		line_start: Some(line_start),
 		line_end: Some(line_end),
 		cwe,
@@ -1233,6 +1274,64 @@ mod tests {
 		});
 		let f = build_finding_from_args(workdir.path(), &args).expect("ok");
 		assert_eq!(f.file_path.as_deref(), Some("src/lib.rs"));
+	}
+
+	#[test]
+	fn build_finding_rejects_path_traversal() {
+		let workdir = tempfile::tempdir().unwrap();
+		let args = json!({
+			"severity": "low",
+			"title": "t",
+			"file": "../outside.rs",
+			"line_start": 1,
+			"line_end": 1,
+			"description": "d",
+			"poc_unified": "x",
+		});
+		let err = build_finding_from_args(workdir.path(), &args).expect_err("must fail");
+		assert!(err.to_string().contains(".."), "got: {err}");
+	}
+
+	#[test]
+	fn build_finding_rejects_host_absolute_paths() {
+		let workdir = tempfile::tempdir().unwrap();
+		std::fs::create_dir_all(workdir.path().join("src")).unwrap();
+		let host_path = workdir.path().join("src/lib.rs");
+		std::fs::write(&host_path, "fn x() {}\n").unwrap();
+		let args = json!({
+			"severity": "low",
+			"title": "t",
+			"file": host_path.to_string_lossy(),
+			"line_start": 1,
+			"line_end": 1,
+			"description": "d",
+			"poc_unified": "x",
+		});
+		let err = build_finding_from_args(workdir.path(), &args).expect_err("must fail");
+		assert!(err.to_string().contains("repo-relative"), "got: {err}");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn build_finding_rejects_symlink_escape() {
+		let workdir = tempfile::tempdir().unwrap();
+		std::fs::create_dir_all(workdir.path().join("src")).unwrap();
+		let outside = tempfile::tempdir().unwrap();
+		let outside_file = outside.path().join("outside.rs");
+		std::fs::write(&outside_file, "fn outside() {}\n").unwrap();
+		std::os::unix::fs::symlink(&outside_file, workdir.path().join("src/link.rs")).unwrap();
+
+		let args = json!({
+			"severity": "low",
+			"title": "t",
+			"file": "src/link.rs",
+			"line_start": 1,
+			"line_end": 1,
+			"description": "d",
+			"poc_unified": "x",
+		});
+		let err = build_finding_from_args(workdir.path(), &args).expect_err("must fail");
+		assert!(err.to_string().contains("outside the workdir"), "got: {err}");
 	}
 
 	#[test]
