@@ -74,6 +74,10 @@ Constraints:
   under different titles.
 - Do not call `submit_finding` for hardening notes, style issues, or
   bugs you can't write a regression test for. Quality over volume.
+- Keep claims conservative and non-sensationalist. When rating
+  severity, err on the side of conservatism: very few bugs are true
+  vulnerabilities, and only a small fraction of those should be
+  considered high or critical severity.
 - Your text response is logged but not parsed. Use it for diagnostic
   notes if useful; do not put findings there.
 
@@ -309,6 +313,28 @@ mod tests {
 		assert!(
 			collapsed.contains("move on to the next"),
 			"prompt must tell the agent a duplicate skips that finding, not the session",
+		);
+	}
+
+	#[test]
+	fn discovery_prompt_requires_conservative_severity_claims() {
+		// Security triage gets noisy fast if the discovery agent
+		// dresses ordinary bugs up as vulnerabilities or inflates
+		// severity. Pin the desired bias directly in the discovery
+		// prompt so future edits don't quietly remove it.
+		let collapsed: String = DISCOVERY.split_whitespace().collect::<Vec<_>>().join(" ");
+		assert!(
+			collapsed.contains("conservative and non-sensationalist"),
+			"discovery prompt must require conservative, non-sensational claims",
+		);
+		assert!(
+			collapsed.contains("err on the side of conservatism"),
+			"discovery prompt must tell the agent to rate severity conservatively",
+		);
+		assert!(
+			collapsed.contains("only a small fraction")
+				&& collapsed.contains("high or critical severity"),
+			"discovery prompt must discourage inflated high/critical severity ratings",
 		);
 	}
 
