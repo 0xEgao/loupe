@@ -874,6 +874,7 @@ dependencies = [
  "clap",
  "loupe-core",
  "loupe-proto",
+ "loupe-tls",
  "reqwest",
  "serde_json",
  "tokio",

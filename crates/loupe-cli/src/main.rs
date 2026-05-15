@@ -12,7 +12,8 @@ use clap::{Args, Parser, Subcommand};
 use loupe_proto::{
 	FindingDetail, JobInfo, ListFindingsResponse, ListReposResponse, RegisterRepoRequest,
 	RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	ScanRequest, ScanResponse, UpdateRepoRequest, PROTOCOL_VERSION,
+	RotateRepoPatRequest, ScanRequest, ScanResponse, SetRepoGithubReportingRequest,
+	UpdateRepoRequest, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -27,7 +28,7 @@ struct Cli {
 #[derive(Debug, Args)]
 struct ConnArgs {
 	#[arg(long, env = "LOUPE_SERVER_URL")]
-	server_url: reqwest::Url,
+	server_url: Option<reqwest::Url>,
 	#[arg(long, env = "LOUPE_CA_CERT")]
 	ca_cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
@@ -58,6 +59,8 @@ enum Cmd {
 	Job(JobCmd),
 	#[command(subcommand)]
 	Finding(FindingCmd),
+	#[command(subcommand)]
+	Cert(CertCmd),
 }
 
 #[derive(Debug, Subcommand)]
@@ -71,12 +74,38 @@ enum RepoCmd {
 	/// Patch a repo's scheduling / verification settings. Each flag is
 	/// optional and only present fields are applied.
 	Update(RepoUpdateArgs),
+	/// Replace the GitHub PAT used by this repo's issue reporter.
+	RotatePat(RepoRotatePatArgs),
+	/// Configure or replace this repo's GitHub issue reporter.
+	SetGithubReporting(RepoSetGithubReportingArgs),
 	/// Trigger a scan now.
 	Scan {
 		id: i64,
 		#[arg(long, default_value_t = false)]
 		incremental: bool,
 	},
+}
+
+#[derive(Debug, Args)]
+struct RepoRotatePatArgs {
+	id: i64,
+	/// Replacement PAT for this repo's GitHub issue reporter. Read
+	/// from LOUPE_TRACKER_PAT if omitted.
+	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
+	pat: String,
+}
+
+#[derive(Debug, Args)]
+struct RepoSetGithubReportingArgs {
+	id: i64,
+	#[arg(long)]
+	target_owner: String,
+	#[arg(long)]
+	target_repo: String,
+	/// PAT for the target tracker repo. Read from LOUPE_TRACKER_PAT if
+	/// omitted.
+	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
+	pat: String,
 }
 
 #[derive(Debug, Args)]
@@ -134,16 +163,18 @@ struct RepoAddArgs {
 	/// var `LOUPE_TRACKER_PAT` if not supplied — never echo it on the
 	/// command line in shared shells. Required unless `--no-reporting`
 	/// is set.
-	#[arg(long, env = "LOUPE_TRACKER_PAT", required_unless_present = "no_reporting")]
+	#[arg(
+		long,
+		env = "LOUPE_TRACKER_PAT",
+		hide_env_values = true,
+		required_unless_present = "no_reporting"
+	)]
 	pat: Option<String>,
 	/// Skip configuring an automatic reporter. Findings still go
-	/// through the full scan + verification + approval pipeline; on
-	/// dispatch they go straight to `reported` without poking any
-	/// external system. Operators triage via `loupectl finding show /
-	/// approve / reject` and act on findings out-of-band. Implies
-	/// `--require-approval` unless explicitly overridden — pairing
-	/// manual mode with auto-dispatch would silently mark every
-	/// finding `reported` before a human ever sees it.
+	/// through the full scan + verification + approval pipeline.
+	/// Confirmed findings remain `confirmed` so operators can configure
+	/// reporting later and run `loupectl finding retry-report`, or
+	/// triage manually with `loupectl finding show / approve / reject`.
 	#[arg(
 		long,
 		default_value_t = false,
@@ -160,8 +191,7 @@ struct RepoAddArgs {
 	require_approval: bool,
 	/// Pin per-repo require_approval = false at registration time.
 	/// If neither flag is set, the repo inherits the server-level
-	/// `require_approval_default` (or implicit `true` when paired with
-	/// `--no-reporting`).
+	/// `require_approval_default`.
 	#[arg(long, conflicts_with = "require_approval")]
 	no_require_approval: bool,
 }
@@ -219,48 +249,138 @@ enum FindingCmd {
 	/// Approve a finding parked in `awaiting_approval`. Transitions
 	/// it to `confirmed` and immediately runs the dispatcher.
 	Approve { id: i64 },
+	/// Retry external reporting for a confirmed finding.
+	RetryReport { id: i64 },
 	/// Reject a finding parked in `awaiting_approval`. Transitions
 	/// it to terminal `dismissed` with the rejection audit trail
 	/// stamped (distinct from a verifier-issued dismiss).
 	Reject { id: i64 },
 }
 
+#[derive(Debug, Subcommand)]
+enum CertCmd {
+	/// Mint a replacement server certificate signed by the existing CA.
+	MintServer(CertMintServerArgs),
+}
+
+#[derive(Debug, Args)]
+struct CertMintServerArgs {
+	/// DNS name to include in the server certificate SAN. Repeat for
+	/// every hostname clients will use.
+	#[arg(long = "hostname", required = true)]
+	hostnames: Vec<String>,
+	#[arg(long, default_value = "loupe-server")]
+	common_name: String,
+	#[arg(long, default_value_t = false)]
+	emit_env: bool,
+	#[arg(long, env = "LOUPE_CA_CERT")]
+	ca_cert: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
+	ca_cert_pem: Option<String>,
+	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true)]
+	ca_cert_pem_b64: Option<String>,
+	#[arg(long, env = "LOUPE_CA_KEY")]
+	ca_key: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_CA_KEY_PEM", hide_env_values = true)]
+	ca_key_pem: Option<String>,
+	#[arg(long, env = "LOUPE_CA_KEY_PEM_B64", hide_env_values = true)]
+	ca_key_pem_b64: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-	let cli = Cli::parse();
-	let client = build_client(&cli.conn)?;
-	match cli.cmd {
+	let Cli { conn, cmd } = Cli::parse();
+	match cmd {
 		Cmd::Repo(c) => match c {
-			RepoCmd::Add(a) => repo_add(&client, &cli.conn.server_url, a).await,
-			RepoCmd::List => repo_list(&client, &cli.conn.server_url).await,
-			RepoCmd::Rm { id } => repo_rm(&client, &cli.conn.server_url, id).await,
-			RepoCmd::Update(a) => repo_update(&client, &cli.conn.server_url, a).await,
+			RepoCmd::Add(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_add(&client, base, a).await
+			},
+			RepoCmd::List => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_list(&client, base).await
+			},
+			RepoCmd::Rm { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_rm(&client, base, id).await
+			},
+			RepoCmd::Update(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_update(&client, base, a).await
+			},
+			RepoCmd::RotatePat(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_rotate_pat(&client, base, a).await
+			},
+			RepoCmd::SetGithubReporting(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_set_github_reporting(&client, base, a).await
+			},
 			RepoCmd::Scan { id, incremental } => {
-				repo_scan(&client, &cli.conn.server_url, id, incremental).await
+				let (client, base) = client_and_url(&conn)?;
+				repo_scan(&client, base, id, incremental).await
 			},
 		},
 		Cmd::Worker(c) => match c {
-			WorkerCmd::Register(a) => worker_register(&client, &cli.conn.server_url, a).await,
-			WorkerCmd::Rm { id } => worker_rm(&client, &cli.conn.server_url, id).await,
+			WorkerCmd::Register(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				worker_register(&client, base, a).await
+			},
+			WorkerCmd::Rm { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				worker_rm(&client, base, id).await
+			},
 		},
 		Cmd::Job(c) => match c {
-			JobCmd::List => job_list(&client, &cli.conn.server_url).await,
-			JobCmd::Get { id } => job_get(&client, &cli.conn.server_url, id).await,
+			JobCmd::List => {
+				let (client, base) = client_and_url(&conn)?;
+				job_list(&client, base).await
+			},
+			JobCmd::Get { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				job_get(&client, base, id).await
+			},
 		},
 		Cmd::Finding(c) => match c {
 			FindingCmd::List { repo_id } => {
-				finding_list(&client, &cli.conn.server_url, repo_id).await
+				let (client, base) = client_and_url(&conn)?;
+				finding_list(&client, base, repo_id).await
 			},
 			FindingCmd::Search { repo_id, query, limit } => {
-				finding_search(&client, &cli.conn.server_url, repo_id, &query, limit).await
+				let (client, base) = client_and_url(&conn)?;
+				finding_search(&client, base, repo_id, &query, limit).await
 			},
 			FindingCmd::Show { id, json } => {
-				finding_show(&client, &cli.conn.server_url, id, json).await
+				let (client, base) = client_and_url(&conn)?;
+				finding_show(&client, base, id, json).await
 			},
-			FindingCmd::Approve { id } => finding_approve(&client, &cli.conn.server_url, id).await,
-			FindingCmd::Reject { id } => finding_reject(&client, &cli.conn.server_url, id).await,
+			FindingCmd::Approve { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				finding_approve(&client, base, id).await
+			},
+			FindingCmd::RetryReport { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				finding_retry_report(&client, base, id).await
+			},
+			FindingCmd::Reject { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				finding_reject(&client, base, id).await
+			},
+		},
+		Cmd::Cert(c) => match c {
+			CertCmd::MintServer(a) => cert_mint_server(a),
 		},
 	}
+}
+
+fn client_and_url(c: &ConnArgs) -> Result<(reqwest::Client, &reqwest::Url)> {
+	let base = server_url(c)?;
+	let client = build_client(c)?;
+	Ok((client, base))
+}
+
+fn server_url(c: &ConnArgs) -> Result<&reqwest::Url> {
+	c.server_url.as_ref().context("server URL missing — set LOUPE_SERVER_URL or pass --server-url")
 }
 
 fn build_client(c: &ConnArgs) -> Result<reqwest::Client> {
@@ -326,15 +446,9 @@ fn url(base: &reqwest::Url, path: &str) -> reqwest::Url {
 }
 
 async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs) -> Result<()> {
-	// Manual mode implies require_approval = true unless the operator
-	// explicitly opts out. Pairing manual mode with auto-dispatch
-	// would flip every finding to `reported` before a human ever sees
-	// it — almost certainly not what someone passing --no-reporting
-	// wants.
 	let require_approval = match (a.require_approval, a.no_require_approval) {
 		(true, false) => Some(true),
 		(false, true) => Some(false),
-		_ if a.no_reporting => Some(true),
 		_ => None,
 	};
 	let reporting = if a.no_reporting {
@@ -430,6 +544,47 @@ async fn repo_update(
 	Ok(())
 }
 
+async fn repo_rotate_pat(
+	client: &reqwest::Client, base: &reqwest::Url, a: RepoRotatePatArgs,
+) -> Result<()> {
+	let req = RotateRepoPatRequest { protocol_version: PROTOCOL_VERSION, github_pat: a.pat };
+	let resp = client
+		.post(url(base, &format!("/v1/repos/{}/reporting/github-pat", a.id)))
+		.json(&req)
+		.send()
+		.await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!("rotate repo PAT: {} — {}", status, resp.text().await.unwrap_or_default());
+	}
+	Ok(())
+}
+
+async fn repo_set_github_reporting(
+	client: &reqwest::Client, base: &reqwest::Url, a: RepoSetGithubReportingArgs,
+) -> Result<()> {
+	let req = SetRepoGithubReportingRequest {
+		protocol_version: PROTOCOL_VERSION,
+		target_owner: a.target_owner,
+		target_repo: a.target_repo,
+		github_pat: a.pat,
+	};
+	let resp = client
+		.put(url(base, &format!("/v1/repos/{}/reporting/github", a.id)))
+		.json(&req)
+		.send()
+		.await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!(
+			"set GitHub reporting: {} — {}",
+			status,
+			resp.text().await.unwrap_or_default()
+		);
+	}
+	Ok(())
+}
+
 async fn repo_scan(
 	client: &reqwest::Client, base: &reqwest::Url, id: i64, incremental: bool,
 ) -> Result<()> {
@@ -491,6 +646,51 @@ fn worker_env_assignments(
 fn b64(value: &str) -> String {
 	use base64::Engine as _;
 	base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+}
+
+fn cert_mint_server(a: CertMintServerArgs) -> Result<()> {
+	let bundle = mint_server_cert(&a)?;
+	if a.emit_env {
+		for (name, value) in server_cert_env_assignments(&bundle) {
+			println!("{name}={value}");
+		}
+		return Ok(());
+	}
+
+	println!(
+		"{}",
+		serde_json::to_string_pretty(&serde_json::json!({
+			"server_cert_pem": bundle.cert_pem,
+			"server_key_pem": bundle.key_pem,
+		}))?
+	);
+	Ok(())
+}
+
+fn mint_server_cert(a: &CertMintServerArgs) -> Result<loupe_tls::CertBundle> {
+	let ca_cert = pem_from_env_or_file(
+		"CA cert",
+		&a.ca_cert_pem,
+		&a.ca_cert_pem_b64,
+		a.ca_cert.as_ref(),
+		"CA cert missing — set LOUPE_CA_CERT_PEM, LOUPE_CA_CERT_PEM_B64, or LOUPE_CA_CERT",
+	)?;
+	let ca_key = pem_from_env_or_file(
+		"CA key",
+		&a.ca_key_pem,
+		&a.ca_key_pem_b64,
+		a.ca_key.as_ref(),
+		"CA key missing — set LOUPE_CA_KEY_PEM, LOUPE_CA_KEY_PEM_B64, or LOUPE_CA_KEY",
+	)?;
+	let ca = loupe_tls::Ca::from_pem(&ca_cert, &ca_key)?;
+	ca.mint_server(&a.common_name, &a.hostnames)
+}
+
+fn server_cert_env_assignments(bundle: &loupe_tls::CertBundle) -> Vec<(&'static str, String)> {
+	vec![
+		("LOUPE_SERVER_CERT_PEM_B64", b64(&bundle.cert_pem)),
+		("LOUPE_SERVER_KEY_PEM_B64", b64(&bundle.key_pem)),
+	]
 }
 
 async fn worker_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
@@ -588,6 +788,17 @@ async fn finding_approve(client: &reqwest::Client, base: &reqwest::Url, id: i64)
 	Ok(())
 }
 
+async fn finding_retry_report(
+	client: &reqwest::Client, base: &reqwest::Url, id: i64,
+) -> Result<()> {
+	let resp = client.post(url(base, &format!("/v1/findings/{id}/retry-report"))).send().await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!("retry report: {} — {}", status, resp.text().await.unwrap_or_default());
+	}
+	Ok(())
+}
+
 async fn finding_reject(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.post(url(base, &format!("/v1/findings/{id}/reject"))).send().await?;
 	let status = resp.status();
@@ -628,6 +839,134 @@ mod tests {
 		])
 		.expect_err("clap should reject --out with --emit-env");
 		assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+	}
+
+	#[test]
+	fn repo_rotate_pat_parses_explicit_pat() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"rotate-pat",
+			"7",
+			"--pat",
+			"ghp_replacement",
+		])
+		.unwrap();
+		let Cmd::Repo(RepoCmd::RotatePat(args)) = cli.cmd else {
+			panic!("expected repo rotate-pat command");
+		};
+		assert_eq!(args.id, 7);
+		assert_eq!(args.pat, "ghp_replacement");
+	}
+
+	#[test]
+	fn repo_set_github_reporting_parses_explicit_pat() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"set-github-reporting",
+			"7",
+			"--target-owner",
+			"acme",
+			"--target-repo",
+			"tracker",
+			"--pat",
+			"ghp_replacement",
+		])
+		.unwrap();
+		let Cmd::Repo(RepoCmd::SetGithubReporting(args)) = cli.cmd else {
+			panic!("expected repo set-github-reporting command");
+		};
+		assert_eq!(args.id, 7);
+		assert_eq!(args.target_owner, "acme");
+		assert_eq!(args.target_repo, "tracker");
+		assert_eq!(args.pat, "ghp_replacement");
+	}
+
+	#[test]
+	fn finding_retry_report_parses() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"finding",
+			"retry-report",
+			"11",
+		])
+		.unwrap();
+		let Cmd::Finding(FindingCmd::RetryReport { id }) = cli.cmd else {
+			panic!("expected finding retry-report command");
+		};
+		assert_eq!(id, 11);
+	}
+
+	#[test]
+	fn cert_mint_server_parses_without_server_url() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"cert",
+			"mint-server",
+			"--hostname",
+			"loupe.example.com",
+			"--ca-cert-pem",
+			"ca-cert",
+			"--ca-key-pem",
+			"ca-key",
+		])
+		.unwrap();
+		let Cmd::Cert(CertCmd::MintServer(args)) = cli.cmd else {
+			panic!("expected cert mint-server command");
+		};
+		assert_eq!(args.hostnames, vec!["loupe.example.com"]);
+		assert!(cli.conn.server_url.is_none());
+	}
+
+	#[test]
+	fn cert_mint_server_uses_existing_ca() {
+		let ca = loupe_tls::Ca::new("loupe-test-ca").unwrap();
+		let args = CertMintServerArgs {
+			hostnames: vec!["loupe.example.com".into(), "loupe.internal".into()],
+			common_name: "loupe-server".into(),
+			emit_env: true,
+			ca_cert: None,
+			ca_cert_pem: Some(ca.cert_pem().to_owned()),
+			ca_cert_pem_b64: None,
+			ca_key: None,
+			ca_key_pem: Some(ca.key_pem().to_owned()),
+			ca_key_pem_b64: None,
+		};
+
+		let bundle = mint_server_cert(&args).unwrap();
+		assert!(bundle.cert_pem.contains("BEGIN CERTIFICATE"));
+		assert!(bundle.key_pem.contains("PRIVATE KEY"));
+	}
+
+	#[test]
+	fn server_cert_env_assignments_are_single_line_and_decode_to_bundle() {
+		let bundle = loupe_tls::CertBundle {
+			cert_pem: "server\ncert\n".into(),
+			key_pem: "server\nkey\n".into(),
+		};
+
+		let assignments = server_cert_env_assignments(&bundle);
+		let names: Vec<_> = assignments.iter().map(|(name, _)| *name).collect();
+		assert_eq!(names, vec!["LOUPE_SERVER_CERT_PEM_B64", "LOUPE_SERVER_KEY_PEM_B64"]);
+		for (name, value) in &assignments {
+			assert!(!value.is_empty(), "{name} value must be present");
+			assert!(!value.contains('\n'), "{name} value must fit dotenv/env-file syntax");
+		}
+
+		use base64::Engine as _;
+		let decoded_cert =
+			base64::engine::general_purpose::STANDARD.decode(&assignments[0].1).unwrap();
+		assert_eq!(String::from_utf8(decoded_cert).unwrap(), bundle.cert_pem);
+		let decoded_key =
+			base64::engine::general_purpose::STANDARD.decode(&assignments[1].1).unwrap();
+		assert_eq!(String::from_utf8(decoded_key).unwrap(), bundle.key_pem);
 	}
 
 	#[test]
