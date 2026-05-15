@@ -27,7 +27,7 @@ struct Cli {
 #[derive(Debug, Args)]
 struct ConnArgs {
 	#[arg(long, env = "LOUPE_SERVER_URL")]
-	server_url: reqwest::Url,
+	server_url: Option<reqwest::Url>,
 	#[arg(long, env = "LOUPE_CA_CERT")]
 	ca_cert: Option<PathBuf>,
 	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
@@ -58,6 +58,8 @@ enum Cmd {
 	Job(JobCmd),
 	#[command(subcommand)]
 	Finding(FindingCmd),
+	#[command(subcommand)]
+	Cert(CertCmd),
 }
 
 #[derive(Debug, Subcommand)]
@@ -236,43 +238,122 @@ enum FindingCmd {
 	Reject { id: i64 },
 }
 
+#[derive(Debug, Subcommand)]
+enum CertCmd {
+	/// Mint a replacement server certificate signed by the existing CA.
+	MintServer(CertMintServerArgs),
+}
+
+#[derive(Debug, Args)]
+struct CertMintServerArgs {
+	/// DNS name to include in the server certificate SAN. Repeat for
+	/// every hostname clients will use.
+	#[arg(long = "hostname", required = true)]
+	hostnames: Vec<String>,
+	#[arg(long, default_value = "loupe-server")]
+	common_name: String,
+	#[arg(long, default_value_t = false)]
+	emit_env: bool,
+	#[arg(long, env = "LOUPE_CA_CERT")]
+	ca_cert: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_CA_CERT_PEM", hide_env_values = true)]
+	ca_cert_pem: Option<String>,
+	#[arg(long, env = "LOUPE_CA_CERT_PEM_B64", hide_env_values = true)]
+	ca_cert_pem_b64: Option<String>,
+	#[arg(long, env = "LOUPE_CA_KEY")]
+	ca_key: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_CA_KEY_PEM", hide_env_values = true)]
+	ca_key_pem: Option<String>,
+	#[arg(long, env = "LOUPE_CA_KEY_PEM_B64", hide_env_values = true)]
+	ca_key_pem_b64: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-	let cli = Cli::parse();
-	let client = build_client(&cli.conn)?;
-	match cli.cmd {
+	let Cli { conn, cmd } = Cli::parse();
+	match cmd {
 		Cmd::Repo(c) => match c {
-			RepoCmd::Add(a) => repo_add(&client, &cli.conn.server_url, a).await,
-			RepoCmd::List => repo_list(&client, &cli.conn.server_url).await,
-			RepoCmd::Rm { id } => repo_rm(&client, &cli.conn.server_url, id).await,
-			RepoCmd::Update(a) => repo_update(&client, &cli.conn.server_url, a).await,
-			RepoCmd::RotatePat(a) => repo_rotate_pat(&client, &cli.conn.server_url, a).await,
+			RepoCmd::Add(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_add(&client, base, a).await
+			},
+			RepoCmd::List => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_list(&client, base).await
+			},
+			RepoCmd::Rm { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_rm(&client, base, id).await
+			},
+			RepoCmd::Update(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_update(&client, base, a).await
+			},
+			RepoCmd::RotatePat(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_rotate_pat(&client, base, a).await
+			},
 			RepoCmd::Scan { id, incremental } => {
-				repo_scan(&client, &cli.conn.server_url, id, incremental).await
+				let (client, base) = client_and_url(&conn)?;
+				repo_scan(&client, base, id, incremental).await
 			},
 		},
 		Cmd::Worker(c) => match c {
-			WorkerCmd::Register(a) => worker_register(&client, &cli.conn.server_url, a).await,
-			WorkerCmd::Rm { id } => worker_rm(&client, &cli.conn.server_url, id).await,
+			WorkerCmd::Register(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				worker_register(&client, base, a).await
+			},
+			WorkerCmd::Rm { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				worker_rm(&client, base, id).await
+			},
 		},
 		Cmd::Job(c) => match c {
-			JobCmd::List => job_list(&client, &cli.conn.server_url).await,
-			JobCmd::Get { id } => job_get(&client, &cli.conn.server_url, id).await,
+			JobCmd::List => {
+				let (client, base) = client_and_url(&conn)?;
+				job_list(&client, base).await
+			},
+			JobCmd::Get { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				job_get(&client, base, id).await
+			},
 		},
 		Cmd::Finding(c) => match c {
 			FindingCmd::List { repo_id } => {
-				finding_list(&client, &cli.conn.server_url, repo_id).await
+				let (client, base) = client_and_url(&conn)?;
+				finding_list(&client, base, repo_id).await
 			},
 			FindingCmd::Search { repo_id, query, limit } => {
-				finding_search(&client, &cli.conn.server_url, repo_id, &query, limit).await
+				let (client, base) = client_and_url(&conn)?;
+				finding_search(&client, base, repo_id, &query, limit).await
 			},
 			FindingCmd::Show { id, json } => {
-				finding_show(&client, &cli.conn.server_url, id, json).await
+				let (client, base) = client_and_url(&conn)?;
+				finding_show(&client, base, id, json).await
 			},
-			FindingCmd::Approve { id } => finding_approve(&client, &cli.conn.server_url, id).await,
-			FindingCmd::Reject { id } => finding_reject(&client, &cli.conn.server_url, id).await,
+			FindingCmd::Approve { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				finding_approve(&client, base, id).await
+			},
+			FindingCmd::Reject { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				finding_reject(&client, base, id).await
+			},
+		},
+		Cmd::Cert(c) => match c {
+			CertCmd::MintServer(a) => cert_mint_server(a),
 		},
 	}
+}
+
+fn client_and_url(c: &ConnArgs) -> Result<(reqwest::Client, &reqwest::Url)> {
+	let base = server_url(c)?;
+	let client = build_client(c)?;
+	Ok((client, base))
+}
+
+fn server_url(c: &ConnArgs) -> Result<&reqwest::Url> {
+	c.server_url.as_ref().context("server URL missing — set LOUPE_SERVER_URL or pass --server-url")
 }
 
 fn build_client(c: &ConnArgs) -> Result<reqwest::Client> {
@@ -521,6 +602,51 @@ fn b64(value: &str) -> String {
 	base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
 }
 
+fn cert_mint_server(a: CertMintServerArgs) -> Result<()> {
+	let bundle = mint_server_cert(&a)?;
+	if a.emit_env {
+		for (name, value) in server_cert_env_assignments(&bundle) {
+			println!("{name}={value}");
+		}
+		return Ok(());
+	}
+
+	println!(
+		"{}",
+		serde_json::to_string_pretty(&serde_json::json!({
+			"server_cert_pem": bundle.cert_pem,
+			"server_key_pem": bundle.key_pem,
+		}))?
+	);
+	Ok(())
+}
+
+fn mint_server_cert(a: &CertMintServerArgs) -> Result<loupe_tls::CertBundle> {
+	let ca_cert = pem_from_env_or_file(
+		"CA cert",
+		&a.ca_cert_pem,
+		&a.ca_cert_pem_b64,
+		a.ca_cert.as_ref(),
+		"CA cert missing — set LOUPE_CA_CERT_PEM, LOUPE_CA_CERT_PEM_B64, or LOUPE_CA_CERT",
+	)?;
+	let ca_key = pem_from_env_or_file(
+		"CA key",
+		&a.ca_key_pem,
+		&a.ca_key_pem_b64,
+		a.ca_key.as_ref(),
+		"CA key missing — set LOUPE_CA_KEY_PEM, LOUPE_CA_KEY_PEM_B64, or LOUPE_CA_KEY",
+	)?;
+	let ca = loupe_tls::Ca::from_pem(&ca_cert, &ca_key)?;
+	ca.mint_server(&a.common_name, &a.hostnames)
+}
+
+fn server_cert_env_assignments(bundle: &loupe_tls::CertBundle) -> Vec<(&'static str, String)> {
+	vec![
+		("LOUPE_SERVER_CERT_PEM_B64", b64(&bundle.cert_pem)),
+		("LOUPE_SERVER_KEY_PEM_B64", b64(&bundle.key_pem)),
+	]
+}
+
 async fn worker_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.delete(url(base, &format!("/v1/workers/{id}"))).send().await?;
 	resp.error_for_status()?;
@@ -676,6 +802,71 @@ mod tests {
 		};
 		assert_eq!(args.id, 7);
 		assert_eq!(args.pat, "ghp_replacement");
+	}
+
+	#[test]
+	fn cert_mint_server_parses_without_server_url() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"cert",
+			"mint-server",
+			"--hostname",
+			"loupe.example.com",
+			"--ca-cert-pem",
+			"ca-cert",
+			"--ca-key-pem",
+			"ca-key",
+		])
+		.unwrap();
+		let Cmd::Cert(CertCmd::MintServer(args)) = cli.cmd else {
+			panic!("expected cert mint-server command");
+		};
+		assert_eq!(args.hostnames, vec!["loupe.example.com"]);
+		assert!(cli.conn.server_url.is_none());
+	}
+
+	#[test]
+	fn cert_mint_server_uses_existing_ca() {
+		let ca = loupe_tls::Ca::new("loupe-test-ca").unwrap();
+		let args = CertMintServerArgs {
+			hostnames: vec!["loupe.example.com".into(), "loupe.internal".into()],
+			common_name: "loupe-server".into(),
+			emit_env: true,
+			ca_cert: None,
+			ca_cert_pem: Some(ca.cert_pem().to_owned()),
+			ca_cert_pem_b64: None,
+			ca_key: None,
+			ca_key_pem: Some(ca.key_pem().to_owned()),
+			ca_key_pem_b64: None,
+		};
+
+		let bundle = mint_server_cert(&args).unwrap();
+		assert!(bundle.cert_pem.contains("BEGIN CERTIFICATE"));
+		assert!(bundle.key_pem.contains("PRIVATE KEY"));
+	}
+
+	#[test]
+	fn server_cert_env_assignments_are_single_line_and_decode_to_bundle() {
+		let bundle = loupe_tls::CertBundle {
+			cert_pem: "server\ncert\n".into(),
+			key_pem: "server\nkey\n".into(),
+		};
+
+		let assignments = server_cert_env_assignments(&bundle);
+		let names: Vec<_> = assignments.iter().map(|(name, _)| *name).collect();
+		assert_eq!(names, vec!["LOUPE_SERVER_CERT_PEM_B64", "LOUPE_SERVER_KEY_PEM_B64"]);
+		for (name, value) in &assignments {
+			assert!(!value.is_empty(), "{name} value must be present");
+			assert!(!value.contains('\n'), "{name} value must fit dotenv/env-file syntax");
+		}
+
+		use base64::Engine as _;
+		let decoded_cert =
+			base64::engine::general_purpose::STANDARD.decode(&assignments[0].1).unwrap();
+		assert_eq!(String::from_utf8(decoded_cert).unwrap(), bundle.cert_pem);
+		let decoded_key =
+			base64::engine::general_purpose::STANDARD.decode(&assignments[1].1).unwrap();
+		assert_eq!(String::from_utf8(decoded_key).unwrap(), bundle.key_pem);
 	}
 
 	#[test]
