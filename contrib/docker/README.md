@@ -144,7 +144,23 @@ contrib/docker/deploy-worker.sh
 
 The worker deploy writes `/etc/loupe-container/worker.secrets.env` with mode
 `0600`, owned by the container UID `10002`. It contains the worker certificate
-bundle and whichever LLM API keys are set.
+bundle and whichever LLM API keys are set. It also writes
+`/etc/loupe-container/worker.config.toml` for non-secret worker settings
+(cache, logging, scanner defaults, BKB API URL, and Claude/Codex
+model/effort), mounts it read-only into the container, and sets
+`LOUPE_WORKER_CONFIG`.
+
+As a temporary alternative to `OPENAI_API_KEY`, a worker can use Codex login
+state from an explicit local `auth.json` path:
+
+```bash
+unset OPENAI_API_KEY
+export CODEX_AUTH_JSON_PATH="$HOME/.codex/auth.json"
+```
+
+The worker deploy copies that file to
+`/etc/loupe-container/codex/auth.json` on the worker host with mode `0600`
+and mounts it read-only at `/var/lib/loupe-worker/.codex/auth.json`.
 
 ## Secret Handling
 
