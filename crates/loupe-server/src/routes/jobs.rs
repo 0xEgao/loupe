@@ -257,7 +257,7 @@ const MAX_LEASE_WAIT_SECS: u32 = 60;
 /// not when a verifier leases them, so it must tolerate queue backlogs.
 /// Seven days keeps unverified findings from being silently dismissed
 /// during verifier outages while still bounding invisible stale state.
-const DEFAULT_VALIDATING_BUDGET_SECS: i64 = 7 * 24 * 60 * 60;
+pub(crate) const DEFAULT_VALIDATING_BUDGET_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// `POST /v1/jobs/lease` — worker pulls the next available job. Honours
 /// `wait_seconds` for server-side long-polling: when the queue is empty
