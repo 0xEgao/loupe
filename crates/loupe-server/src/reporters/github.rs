@@ -5,9 +5,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use loupe_core::{Finding, ReportingDestination};
+use loupe_core::{Finding, ReportingDestination, Severity};
 use loupe_storage::repos::RepoRow;
-use reqwest::Url;
+use reqwest::{StatusCode, Url};
 use serde::Serialize;
 
 use super::{DispatchReceipt, Reporter};
@@ -47,6 +47,20 @@ struct CreateIssueBody<'a> {
 	labels: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct CreateLabelBody<'a> {
+	name: &'a str,
+	color: &'a str,
+	description: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LabelSpec {
+	name: &'static str,
+	color: &'static str,
+	description: &'static str,
+}
+
 #[async_trait]
 impl Reporter for GithubReporter {
 	fn kind(&self) -> &'static str {
@@ -68,17 +82,19 @@ impl Reporter for GithubReporter {
 
 		let mut external_ids = Vec::new();
 		for finding in findings {
-			let url = self
-				.api_base
-				.join(&format!("/repos/{target_owner}/{target_repo}/issues"))
-				.map_err(|e| anyhow!("building issues URL: {e}"))?;
+			let severity = severity_label(finding.severity);
+			self.ensure_label(target_owner, target_repo, pat, severity).await?;
 			let title = render_title(finding);
 			let body = render_body(repo, finding);
-			let labels = vec!["loupe".to_owned(), finding.severity.as_str().to_owned()];
+			let labels = vec!["loupe".to_owned(), severity.name.to_owned()];
 
 			let resp = self
 				.http
-				.post(url)
+				.post(
+					self.api_base
+						.join(&format!("/repos/{target_owner}/{target_repo}/issues"))
+						.map_err(|e| anyhow!("building issues URL: {e}"))?,
+				)
 				.bearer_auth(pat)
 				.header("Accept", "application/vnd.github+json")
 				.header("X-GitHub-Api-Version", "2022-11-28")
@@ -100,6 +116,68 @@ impl Reporter for GithubReporter {
 		}
 		let external_id = (!external_ids.is_empty()).then(|| external_ids.as_slice().join(","));
 		Ok(DispatchReceipt { kind: self.kind(), external_id })
+	}
+}
+
+impl GithubReporter {
+	async fn ensure_label(
+		&self, target_owner: &str, target_repo: &str, pat: &str, label: LabelSpec,
+	) -> Result<()> {
+		let url = self
+			.api_base
+			.join(&format!("/repos/{target_owner}/{target_repo}/labels"))
+			.map_err(|e| anyhow!("building labels URL: {e}"))?;
+		let resp = self
+			.http
+			.post(url)
+			.bearer_auth(pat)
+			.header("Accept", "application/vnd.github+json")
+			.header("X-GitHub-Api-Version", "2022-11-28")
+			.json(&CreateLabelBody {
+				name: label.name,
+				color: label.color,
+				description: label.description,
+			})
+			.send()
+			.await
+			.with_context(|| format!("creating github label {}", label.name))?;
+		let status = resp.status();
+		if status.is_success() {
+			return Ok(());
+		}
+		let body = resp.text().await.unwrap_or_default();
+		if status == StatusCode::UNPROCESSABLE_ENTITY && body.contains("already_exists") {
+			return Ok(());
+		}
+		anyhow::bail!("github returned {} when creating label {}: {}", status, label.name, body);
+	}
+}
+
+fn severity_label(severity: Severity) -> LabelSpec {
+	match severity {
+		Severity::Info => LabelSpec {
+			name: "severity:info",
+			color: "cfd3d7",
+			description: "Loupe severity: info",
+		},
+		Severity::Low => {
+			LabelSpec { name: "severity:low", color: "fef2c0", description: "Loupe severity: low" }
+		},
+		Severity::Medium => LabelSpec {
+			name: "severity:medium",
+			color: "fbca04",
+			description: "Loupe severity: medium",
+		},
+		Severity::High => LabelSpec {
+			name: "severity:high",
+			color: "d93f0b",
+			description: "Loupe severity: high",
+		},
+		Severity::Critical => LabelSpec {
+			name: "severity:critical",
+			color: "b60205",
+			description: "Loupe severity: critical",
+		},
 	}
 }
 
@@ -227,6 +305,23 @@ mod tests {
 	#[test]
 	fn title_is_per_finding_without_loupe_or_severity_prefix() {
 		assert_eq!(render_title(&finding()), "Out-of-bounds index in idx");
+	}
+
+	#[test]
+	fn severity_labels_are_namespaced_and_colored_by_urgency() {
+		assert_eq!(
+			severity_label(Severity::Info),
+			LabelSpec {
+				name: "severity:info",
+				color: "cfd3d7",
+				description: "Loupe severity: info"
+			}
+		);
+		assert_eq!(severity_label(Severity::Low).name, "severity:low");
+		assert_eq!(severity_label(Severity::Low).color, "fef2c0");
+		assert_eq!(severity_label(Severity::Medium).color, "fbca04");
+		assert_eq!(severity_label(Severity::High).color, "d93f0b");
+		assert_eq!(severity_label(Severity::Critical).color, "b60205");
 	}
 
 	#[test]
