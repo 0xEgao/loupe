@@ -104,7 +104,7 @@ impl Reporter for GithubReporter {
 }
 
 fn render_title(finding: &Finding) -> String {
-	format!("{}: {}", finding.severity, compact_title(&finding.title))
+	compact_title(&finding.title)
 }
 
 fn compact_title(raw: &str) -> String {
@@ -225,8 +225,8 @@ mod tests {
 	}
 
 	#[test]
-	fn title_is_per_finding_without_loupe_prefix() {
-		assert_eq!(render_title(&finding()), "high: Out-of-bounds index in idx");
+	fn title_is_per_finding_without_loupe_or_severity_prefix() {
+		assert_eq!(render_title(&finding()), "Out-of-bounds index in idx");
 	}
 
 	#[test]

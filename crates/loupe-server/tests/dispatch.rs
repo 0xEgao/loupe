@@ -439,10 +439,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 	assert_eq!(captured.len(), 2);
 	let titles: Vec<_> =
 		captured.iter().map(|issue| issue.body["title"].as_str().unwrap_or("")).collect();
-	assert_eq!(
-		titles,
-		vec!["high: Confirmed finding", "critical: Second confirmed finding with a direct title"]
-	);
+	assert_eq!(titles, vec!["Confirmed finding", "Second confirmed finding with a direct title"]);
 	assert!(titles.iter().all(|title| !title.contains("[loupe]")), "titles: {titles:?}");
 
 	server.shutdown().await;
