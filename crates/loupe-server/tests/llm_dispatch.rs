@@ -272,7 +272,7 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 	assert_eq!(issue.repo, "tracker");
 	let issue_body = issue.body["body"].as_str().unwrap_or("");
 	let issue_title = issue.body["title"].as_str().unwrap_or("");
-	assert_eq!(issue_title, "high: Out-of-bounds index in idx");
+	assert_eq!(issue_title, "Out-of-bounds index in idx");
 	assert!(issue_body.contains("Out-of-bounds index"), "body: {issue_body}");
 	assert!(issue_body.contains("llm-code-review"), "body: {issue_body}");
 	assert!(issue_body.contains("#[test] fn oob_panic"), "body: {issue_body}");
