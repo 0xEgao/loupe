@@ -253,10 +253,11 @@ pub async fn retry(
 const MAX_LEASE_WAIT_SECS: u32 = 60;
 
 /// How long a finding can sit in `validating` before the deadline
-/// reaper steps in. 1 hour is a healthy budget for an LLM verifier;
-/// large enough to absorb queue backpressure, small enough that a
-/// stuck finding doesn't sit invisible for days.
-const DEFAULT_VALIDATING_BUDGET_SECS: i64 = 3_600;
+/// reaper steps in. This budget starts when verify jobs are enqueued,
+/// not when a verifier leases them, so it must tolerate queue backlogs.
+/// Seven days keeps unverified findings from being silently dismissed
+/// during verifier outages while still bounding invisible stale state.
+const DEFAULT_VALIDATING_BUDGET_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// `POST /v1/jobs/lease` — worker pulls the next available job. Honours
 /// `wait_seconds` for server-side long-polling: when the queue is empty
