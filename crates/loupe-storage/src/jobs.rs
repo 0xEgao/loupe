@@ -92,7 +92,9 @@ pub fn lease_next(
 		     SELECT id FROM jobs
 		     WHERE state = 'queued'
 		       AND (kind = 'scan' OR (kind = 'verify' AND ?4 = 1))
-		     ORDER BY enqueued_at ASC
+		     ORDER BY
+		       CASE WHEN kind = 'verify' AND ?4 = 1 THEN 0 ELSE 1 END,
+		       enqueued_at ASC
 		     LIMIT 1
 		 )
 		 RETURNING id, repo_id, kind, state, incremental, since_sha, head_sha,
@@ -407,6 +409,51 @@ mod tests {
 		// A verify-capable worker DOES pick it up.
 		let third = db.with_conn(|c| Ok(lease_next(c, worker_id, true, 202, 60)?)).unwrap();
 		assert!(matches!(third.as_ref().map(|r| r.kind), Some(JobKind::Verify)));
+	}
+
+	#[test]
+	fn verify_capable_workers_prioritize_verify_jobs() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		let scan_id = db
+			.with_conn(|c| {
+				Ok(enqueue(
+					c,
+					&NewJob {
+						repo_id,
+						kind: JobKind::Scan,
+						incremental: false,
+						since_sha: None,
+						parent_job_id: None,
+						target_finding_id: None,
+					},
+					100,
+				)?)
+			})
+			.unwrap();
+		let verify_id = db
+			.with_conn(|c| {
+				Ok(enqueue(
+					c,
+					&NewJob {
+						repo_id,
+						kind: JobKind::Verify,
+						incremental: false,
+						since_sha: None,
+						parent_job_id: Some(scan_id),
+						target_finding_id: Some(42),
+					},
+					200,
+				)?)
+			})
+			.unwrap();
+
+		let first = db.with_conn(|c| Ok(lease_next(c, worker_id, true, 300, 60)?)).unwrap();
+		assert_eq!(first.as_ref().map(|r| r.id), Some(verify_id));
+		assert!(matches!(first.as_ref().map(|r| r.kind), Some(JobKind::Verify)));
+
+		let second = db.with_conn(|c| Ok(lease_next(c, worker_id, true, 301, 60)?)).unwrap();
+		assert_eq!(second.as_ref().map(|r| r.id), Some(scan_id));
+		assert!(matches!(second.as_ref().map(|r| r.kind), Some(JobKind::Scan)));
 	}
 
 	#[test]

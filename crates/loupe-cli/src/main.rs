@@ -12,8 +12,8 @@ use clap::{Args, Parser, Subcommand};
 use loupe_proto::{
 	FindingDetail, JobInfo, ListFindingsResponse, ListReposResponse, RegisterRepoRequest,
 	RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	RotateRepoPatRequest, ScanRequest, ScanResponse, SetRepoGithubReportingRequest,
-	UpdateRepoRequest, PROTOCOL_VERSION,
+	RetryTimedOutVerificationsRequest, RetryTimedOutVerificationsResponse, RotateRepoPatRequest,
+	ScanRequest, ScanResponse, SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -261,10 +261,26 @@ enum FindingCmd {
 	Approve { id: i64 },
 	/// Retry external reporting for a confirmed finding.
 	RetryReport { id: i64 },
+	/// Recover findings dismissed by the validating-deadline reaper and
+	/// requeue or create their verify jobs.
+	RetryTimedOutVerifications(RetryTimedOutVerificationsArgs),
 	/// Reject a finding parked in `awaiting_approval`. Transitions
 	/// it to terminal `dismissed` with the rejection audit trail
 	/// stamped (distinct from a verifier-issued dismiss).
 	Reject { id: i64 },
+}
+
+#[derive(Debug, Args)]
+struct RetryTimedOutVerificationsArgs {
+	/// Return counts without changing findings or jobs.
+	#[arg(long, default_value_t = false)]
+	dry_run: bool,
+	/// Restrict recovery to one repo.
+	#[arg(long)]
+	repo_id: Option<i64>,
+	/// Optional cap on findings processed in one request.
+	#[arg(long)]
+	limit: Option<i64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -375,6 +391,10 @@ async fn main() -> Result<()> {
 			FindingCmd::RetryReport { id } => {
 				let (client, base) = client_and_url(&conn)?;
 				finding_retry_report(&client, base, id).await
+			},
+			FindingCmd::RetryTimedOutVerifications(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				finding_retry_timed_out_verifications(&client, base, a).await
 			},
 			FindingCmd::Reject { id } => {
 				let (client, base) = client_and_url(&conn)?;
@@ -856,6 +876,43 @@ async fn finding_retry_report(
 	Ok(())
 }
 
+async fn finding_retry_timed_out_verifications(
+	client: &reqwest::Client, base: &reqwest::Url, args: RetryTimedOutVerificationsArgs,
+) -> Result<()> {
+	let req = RetryTimedOutVerificationsRequest {
+		protocol_version: PROTOCOL_VERSION,
+		dry_run: args.dry_run,
+		repo_id: args.repo_id,
+		limit: args.limit,
+	};
+	let resp = client
+		.post(url(base, "/v1/findings/retry-timed-out-verifications"))
+		.json(&req)
+		.send()
+		.await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!(
+			"retry timed-out verifications: {} — {}",
+			status,
+			resp.text().await.unwrap_or_default()
+		);
+	}
+	let body: RetryTimedOutVerificationsResponse = resp.json().await?;
+	let label = if body.dry_run { "would_revive" } else { "revived" };
+	println!(
+		"dry_run={} matched={} {}={} requeued_jobs={} created_jobs={} left_queued_or_leased={}",
+		body.dry_run,
+		body.matched,
+		label,
+		body.revived,
+		body.requeued_jobs,
+		body.created_jobs,
+		body.left_queued_or_leased,
+	);
+	Ok(())
+}
+
 async fn finding_reject(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
 	let resp = client.post(url(base, &format!("/v1/findings/{id}/reject"))).send().await?;
 	let status = resp.status();
@@ -1044,6 +1101,29 @@ mod tests {
 			panic!("expected finding retry-report command");
 		};
 		assert_eq!(id, 11);
+	}
+
+	#[test]
+	fn finding_retry_timed_out_verifications_parses() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"finding",
+			"retry-timed-out-verifications",
+			"--dry-run",
+			"--repo-id",
+			"7",
+			"--limit",
+			"50",
+		])
+		.unwrap();
+		let Cmd::Finding(FindingCmd::RetryTimedOutVerifications(args)) = cli.cmd else {
+			panic!("expected finding retry-timed-out-verifications command");
+		};
+		assert!(args.dry_run);
+		assert_eq!(args.repo_id, Some(7));
+		assert_eq!(args.limit, Some(50));
 	}
 
 	#[test]

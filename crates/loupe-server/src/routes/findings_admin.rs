@@ -20,9 +20,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use loupe_core::{FindingState, ReportingDestination};
-use loupe_proto::{FindingDetail, FindingSummary, ListFindingsResponse, PROTOCOL_VERSION};
+use loupe_core::{FindingState, JobKind, ReportingDestination};
+use loupe_proto::{
+	FindingDetail, FindingSummary, ListFindingsResponse, RetryTimedOutVerificationsRequest,
+	RetryTimedOutVerificationsResponse, PROTOCOL_VERSION,
+};
 use loupe_storage::findings::{self, ApprovalOutcome, FindingRow};
+use loupe_storage::jobs::NewJob;
 use loupe_storage::{jobs, repos};
 use serde::Deserialize;
 
@@ -41,6 +45,13 @@ const SEARCH_DEFAULT_LIMIT: i64 = 20;
 /// Hard ceiling on `search` to keep a single tool call from
 /// downloading every finding on a repo.
 const SEARCH_MAX_LIMIT: i64 = 100;
+
+#[derive(Debug)]
+struct TimedOutVerificationCandidate {
+	finding_id: i64,
+	repo_id: i64,
+	parent_job_id: i64,
+}
 
 fn now_secs() -> i64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
@@ -131,6 +142,171 @@ pub async fn get(
 		.ok_or((StatusCode::NOT_FOUND, format!("no finding with id {id}")))?;
 	authorize_prior_finding_repo(&state, &authed, row.repo_id)?;
 	Ok(Json(row_to_detail(row)))
+}
+
+/// `POST /v1/findings/retry-timed-out-verifications` — admin-only
+/// recovery for findings dismissed by the validating-deadline reaper
+/// before any terminal verifier verdict arrived.
+pub async fn retry_timed_out_verifications(
+	State(state): State<AppState>, Json(req): Json<RetryTimedOutVerificationsRequest>,
+) -> Result<Json<RetryTimedOutVerificationsResponse>, (StatusCode, String)> {
+	if req.protocol_version != PROTOCOL_VERSION {
+		return Err((
+			StatusCode::BAD_REQUEST,
+			format!("unsupported protocol_version {}", req.protocol_version),
+		));
+	}
+	if let Some(limit) = req.limit {
+		if limit <= 0 {
+			return Err((StatusCode::BAD_REQUEST, "limit must be positive".into()));
+		}
+	}
+	let now = now_secs();
+	let mut response = state
+		.db
+		.with_conn(|c| {
+			let tx = c.transaction()?;
+			let limit = req.limit.unwrap_or(-1);
+			let candidates = {
+				let mut stmt = tx.prepare(
+					"SELECT f.id, f.repo_id, f.job_id
+					   FROM findings f
+					  WHERE f.state = 'dismissed'
+					    AND f.verification_required = 1
+					    AND (?1 IS NULL OR f.repo_id = ?1)
+					    AND EXISTS (
+					      SELECT 1 FROM finding_verifications v
+					       WHERE v.finding_id = f.id
+					         AND v.job_id IS NULL
+					         AND v.verdict = 'inconclusive'
+					         AND v.notes = 'validating_deadline expired'
+					    )
+					    AND NOT EXISTS (
+					      SELECT 1 FROM finding_verifications v
+					       WHERE v.finding_id = f.id
+					         AND v.verdict IN ('confirmed', 'dismissed')
+					    )
+					  ORDER BY COALESCE(f.dismissed_at, f.created_at), f.id
+					  LIMIT ?2",
+				)?;
+				let mut rows = stmt.query((req.repo_id, limit))?;
+				let mut out = Vec::new();
+				while let Some(r) = rows.next()? {
+					out.push(TimedOutVerificationCandidate {
+						finding_id: r.get(0)?,
+						repo_id: r.get(1)?,
+						parent_job_id: r.get(2)?,
+					});
+				}
+				out
+			};
+
+			let mut out = RetryTimedOutVerificationsResponse {
+				protocol_version: PROTOCOL_VERSION,
+				dry_run: req.dry_run,
+				matched: candidates.len() as u64,
+				revived: candidates.len() as u64,
+				requeued_jobs: 0,
+				created_jobs: 0,
+				left_queued_or_leased: 0,
+			};
+
+			for candidate in candidates {
+				let active_verify: bool = tx.query_row(
+					"SELECT EXISTS(
+					   SELECT 1 FROM jobs
+					    WHERE kind = 'verify'
+					      AND target_finding_id = ?1
+					      AND state IN ('queued','leased')
+					)",
+					[candidate.finding_id],
+					|r| r.get(0),
+				)?;
+
+				if active_verify {
+					out.left_queued_or_leased += 1;
+				} else {
+					let failed_job_id: Option<i64> = {
+						let mut stmt = tx.prepare(
+							"SELECT id FROM jobs
+							  WHERE kind = 'verify'
+							    AND target_finding_id = ?1
+							    AND state = 'failed'
+							  ORDER BY enqueued_at DESC, id DESC
+							  LIMIT 1",
+						)?;
+						let mut rows = stmt.query([candidate.finding_id])?;
+						match rows.next()? {
+							Some(r) => Some(r.get(0)?),
+							None => None,
+						}
+					};
+
+					if let Some(job_id) = failed_job_id {
+						out.requeued_jobs += 1;
+						if !req.dry_run {
+							tx.execute(
+								"UPDATE jobs
+								   SET state = 'queued',
+								       worker_id = NULL,
+								       lease_expires_at = NULL,
+								       attempts = 0,
+								       started_at = NULL,
+								       finished_at = NULL,
+								       error = NULL,
+								       head_sha = NULL,
+								       enqueued_at = ?2
+								 WHERE id = ?1 AND state = 'failed'",
+								(job_id, now),
+							)?;
+						}
+					} else {
+						out.created_jobs += 1;
+						if !req.dry_run {
+							jobs::enqueue(
+								&tx,
+								&NewJob {
+									repo_id: candidate.repo_id,
+									kind: JobKind::Verify,
+									incremental: false,
+									since_sha: None,
+									parent_job_id: Some(candidate.parent_job_id),
+									target_finding_id: Some(candidate.finding_id),
+								},
+								now,
+							)?;
+						}
+					}
+				}
+
+				if !req.dry_run {
+					tx.execute(
+						"UPDATE findings
+						   SET state = 'validating',
+						       dismissed_at = NULL,
+						       validating_deadline = ?1
+						 WHERE id = ?2 AND state = 'dismissed'",
+						(now + super::jobs::DEFAULT_VALIDATING_BUDGET_SECS, candidate.finding_id),
+					)?;
+				}
+			}
+
+			if req.dry_run {
+				tx.rollback()?;
+			} else {
+				tx.commit()?;
+			}
+			Ok(out)
+		})
+		.map_err(|e| {
+			(StatusCode::INTERNAL_SERVER_ERROR, format!("retry timed-out verifications: {e}"))
+		})?;
+
+	if !response.dry_run && response.matched > 0 {
+		state.job_arrived.notify_waiters();
+	}
+	response.protocol_version = PROTOCOL_VERSION;
+	Ok(Json(response))
 }
 
 /// `POST /v1/findings/:id/approve` — admin only. Transitions a
