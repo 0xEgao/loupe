@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Default)]
 struct GithubStubState {
 	captured: Arc<Mutex<Vec<CapturedIssue>>>,
+	labels: Arc<Mutex<Vec<CapturedLabel>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,22 @@ struct CapturedIssue {
 	repo: String,
 	auth: String,
 	body: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedLabel {
+	owner: String,
+	repo: String,
+	body: serde_json::Value,
+}
+
+async fn stub_create_label(
+	State(stub): State<GithubStubState>,
+	axum::extract::Path((owner, repo)): axum::extract::Path<(String, String)>,
+	Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+	stub.labels.lock().unwrap().push(CapturedLabel { owner, repo, body: body.clone() });
+	(StatusCode::CREATED, Json(body))
 }
 
 async fn stub_create_issue(
@@ -59,6 +76,7 @@ async fn stub_create_issue(
 async fn spawn_github_stub() -> (SocketAddr, GithubStubState, tokio::task::JoinHandle<()>) {
 	let stub = GithubStubState::default();
 	let app = Router::new()
+		.route("/repos/{owner}/{repo}/labels", post(stub_create_label))
 		.route("/repos/{owner}/{repo}/issues", post(stub_create_issue))
 		.with_state(stub.clone());
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -209,7 +227,19 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 	assert_eq!(issue.repo, "tracker");
 	assert_eq!(issue.auth, "Bearer ghp_test_pat_value");
 	let body_str = issue.body.to_string();
+	assert_eq!(
+		issue.body["labels"],
+		serde_json::json!(["loupe", "severity:high"]),
+		"issue body: {body_str}"
+	);
 	assert!(body_str.contains("AWS access key"), "issue body: {body_str}");
+
+	let labels = stub_state.labels.lock().unwrap().clone();
+	assert_eq!(labels.len(), 1);
+	assert_eq!(labels[0].owner, "acme");
+	assert_eq!(labels[0].repo, "tracker");
+	assert_eq!(labels[0].body["name"], "severity:high");
+	assert_eq!(labels[0].body["color"], "d93f0b");
 
 	// Findings table marked reported.
 	let reported_count: i64 = db
@@ -441,6 +471,24 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 		captured.iter().map(|issue| issue.body["title"].as_str().unwrap_or("")).collect();
 	assert_eq!(titles, vec!["Confirmed finding", "Second confirmed finding with a direct title"]);
 	assert!(titles.iter().all(|title| !title.contains("[loupe]")), "titles: {titles:?}");
+	let issue_labels: Vec<_> = captured.iter().map(|issue| issue.body["labels"].clone()).collect();
+	assert_eq!(
+		issue_labels,
+		vec![
+			serde_json::json!(["loupe", "severity:high"]),
+			serde_json::json!(["loupe", "severity:critical"])
+		]
+	);
+	let labels = stub_state.labels.lock().unwrap().clone();
+	let label_specs: Vec<_> =
+		labels.iter().map(|l| (l.body["name"].clone(), l.body["color"].clone())).collect();
+	assert_eq!(
+		label_specs,
+		vec![
+			("severity:high".into(), "d93f0b".into()),
+			("severity:critical".into(), "b60205".into())
+		]
+	);
 
 	server.shutdown().await;
 }

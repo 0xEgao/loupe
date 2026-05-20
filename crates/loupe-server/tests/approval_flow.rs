@@ -57,9 +57,16 @@ async fn stub_create_issue(
 	)
 }
 
+async fn stub_create_label(
+	Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+	(StatusCode::CREATED, Json(body))
+}
+
 async fn spawn_github_stub() -> (SocketAddr, GithubStubState) {
 	let stub = GithubStubState::default();
 	let app = Router::new()
+		.route("/repos/{owner}/{repo}/labels", post(stub_create_label))
 		.route("/repos/{owner}/{repo}/issues", post(stub_create_issue))
 		.with_state(stub.clone());
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
