@@ -16,27 +16,27 @@ pub struct ListFindingsResponse {
 	pub findings: Vec<FindingSummary>,
 }
 
-/// Body of `POST /v1/findings/retry-timed-out-verifications`.
+/// Body of `POST /v1/findings/retry-verify`.
 ///
-/// This is an operator recovery tool for findings dismissed by the
-/// validating-deadline reaper before a verifier produced a terminal
-/// verdict. `dry_run = true` returns the counts that would be applied
+/// This is an operator recovery tool for findings that still need
+/// verifier work but are no longer represented correctly in the
+/// queue. `dry_run = true` returns the counts that would be applied
 /// without mutating findings or jobs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetryTimedOutVerificationsRequest {
+pub struct RetryVerifyRequest {
 	pub protocol_version: u16,
 	#[serde(default)]
 	pub dry_run: bool,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub repo_id: Option<i64>,
 	/// Optional cap on findings processed in one call. Omit to process all
-	/// matching timeout-dismissed findings.
+	/// matching recoverable findings.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetryTimedOutVerificationsResponse {
+pub struct RetryVerifyResponse {
 	pub protocol_version: u16,
 	pub dry_run: bool,
 	pub matched: u64,

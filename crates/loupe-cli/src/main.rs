@@ -12,8 +12,8 @@ use clap::{Args, Parser, Subcommand};
 use loupe_proto::{
 	FindingDetail, JobInfo, ListFindingsResponse, ListReposResponse, RegisterRepoRequest,
 	RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	RetryTimedOutVerificationsRequest, RetryTimedOutVerificationsResponse, RotateRepoPatRequest,
-	ScanRequest, ScanResponse, SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
+	RetryVerifyRequest, RetryVerifyResponse, RotateRepoPatRequest, ScanRequest, ScanResponse,
+	SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -261,9 +261,9 @@ enum FindingCmd {
 	Approve { id: i64 },
 	/// Retry external reporting for a confirmed finding.
 	RetryReport { id: i64 },
-	/// Recover findings dismissed by the validating-deadline reaper and
-	/// requeue or create their verify jobs.
-	RetryTimedOutVerifications(RetryTimedOutVerificationsArgs),
+	/// Recover findings that still need verifier work and requeue or
+	/// create their verify jobs.
+	RetryVerify(RetryVerifyArgs),
 	/// Reject a finding parked in `awaiting_approval`. Transitions
 	/// it to terminal `dismissed` with the rejection audit trail
 	/// stamped (distinct from a verifier-issued dismiss).
@@ -271,7 +271,7 @@ enum FindingCmd {
 }
 
 #[derive(Debug, Args)]
-struct RetryTimedOutVerificationsArgs {
+struct RetryVerifyArgs {
 	/// Return counts without changing findings or jobs.
 	#[arg(long, default_value_t = false)]
 	dry_run: bool,
@@ -392,9 +392,9 @@ async fn main() -> Result<()> {
 				let (client, base) = client_and_url(&conn)?;
 				finding_retry_report(&client, base, id).await
 			},
-			FindingCmd::RetryTimedOutVerifications(a) => {
+			FindingCmd::RetryVerify(a) => {
 				let (client, base) = client_and_url(&conn)?;
-				finding_retry_timed_out_verifications(&client, base, a).await
+				finding_retry_verify(&client, base, a).await
 			},
 			FindingCmd::Reject { id } => {
 				let (client, base) = client_and_url(&conn)?;
@@ -876,29 +876,21 @@ async fn finding_retry_report(
 	Ok(())
 }
 
-async fn finding_retry_timed_out_verifications(
-	client: &reqwest::Client, base: &reqwest::Url, args: RetryTimedOutVerificationsArgs,
+async fn finding_retry_verify(
+	client: &reqwest::Client, base: &reqwest::Url, args: RetryVerifyArgs,
 ) -> Result<()> {
-	let req = RetryTimedOutVerificationsRequest {
+	let req = RetryVerifyRequest {
 		protocol_version: PROTOCOL_VERSION,
 		dry_run: args.dry_run,
 		repo_id: args.repo_id,
 		limit: args.limit,
 	};
-	let resp = client
-		.post(url(base, "/v1/findings/retry-timed-out-verifications"))
-		.json(&req)
-		.send()
-		.await?;
+	let resp = client.post(url(base, "/v1/findings/retry-verify")).json(&req).send().await?;
 	let status = resp.status();
 	if !status.is_success() {
-		anyhow::bail!(
-			"retry timed-out verifications: {} — {}",
-			status,
-			resp.text().await.unwrap_or_default()
-		);
+		anyhow::bail!("retry verify: {} — {}", status, resp.text().await.unwrap_or_default());
 	}
-	let body: RetryTimedOutVerificationsResponse = resp.json().await?;
+	let body: RetryVerifyResponse = resp.json().await?;
 	let label = if body.dry_run { "would_revive" } else { "revived" };
 	println!(
 		"dry_run={} matched={} {}={} requeued_jobs={} created_jobs={} left_queued_or_leased={}",
@@ -1104,13 +1096,13 @@ mod tests {
 	}
 
 	#[test]
-	fn finding_retry_timed_out_verifications_parses() {
+	fn finding_retry_verify_parses() {
 		let cli = Cli::try_parse_from([
 			"loupectl",
 			"--server-url",
 			"https://loupe.example:8443",
 			"finding",
-			"retry-timed-out-verifications",
+			"retry-verify",
 			"--dry-run",
 			"--repo-id",
 			"7",
@@ -1118,8 +1110,8 @@ mod tests {
 			"50",
 		])
 		.unwrap();
-		let Cmd::Finding(FindingCmd::RetryTimedOutVerifications(args)) = cli.cmd else {
-			panic!("expected finding retry-timed-out-verifications command");
+		let Cmd::Finding(FindingCmd::RetryVerify(args)) = cli.cmd else {
+			panic!("expected finding retry-verify command");
 		};
 		assert!(args.dry_run);
 		assert_eq!(args.repo_id, Some(7));

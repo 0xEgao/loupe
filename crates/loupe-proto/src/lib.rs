@@ -14,8 +14,7 @@ mod scan;
 mod version;
 
 pub use findings_admin::{
-	FindingDetail, FindingSummary, ListFindingsResponse, RetryTimedOutVerificationsRequest,
-	RetryTimedOutVerificationsResponse,
+	FindingDetail, FindingSummary, ListFindingsResponse, RetryVerifyRequest, RetryVerifyResponse,
 };
 pub use job_io::{
 	CompleteOutcome, CompleteRequest, FindingsBatch, HeartbeatRequest, HeartbeatResponse,
