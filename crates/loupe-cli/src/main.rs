@@ -275,6 +275,11 @@ struct RetryVerifyArgs {
 	/// Return counts without changing findings or jobs.
 	#[arg(long, default_value_t = false)]
 	dry_run: bool,
+	/// Also retry findings whose verifier-produced history contains an
+	/// inconclusive verdict. Deadline-reaper inconclusive rows remain
+	/// recoverable without this flag.
+	#[arg(long, default_value_t = false)]
+	include_inconclusive: bool,
 	/// Restrict recovery to one repo.
 	#[arg(long)]
 	repo_id: Option<i64>,
@@ -882,6 +887,7 @@ async fn finding_retry_verify(
 	let req = RetryVerifyRequest {
 		protocol_version: PROTOCOL_VERSION,
 		dry_run: args.dry_run,
+		include_inconclusive: args.include_inconclusive,
 		repo_id: args.repo_id,
 		limit: args.limit,
 	};
@@ -1104,6 +1110,7 @@ mod tests {
 			"finding",
 			"retry-verify",
 			"--dry-run",
+			"--include-inconclusive",
 			"--repo-id",
 			"7",
 			"--limit",
@@ -1114,6 +1121,7 @@ mod tests {
 			panic!("expected finding retry-verify command");
 		};
 		assert!(args.dry_run);
+		assert!(args.include_inconclusive);
 		assert_eq!(args.repo_id, Some(7));
 		assert_eq!(args.limit, Some(50));
 	}

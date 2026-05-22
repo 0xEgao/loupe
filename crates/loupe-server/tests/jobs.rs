@@ -606,7 +606,7 @@ async fn retry_revives_deadline_dismissed_verify_target() {
 }
 
 #[tokio::test]
-async fn retry_verify_revives_dismissed_findings() {
+async fn retry_verify_recovers_deadline_dismissed_but_not_verifier_dismissed_findings() {
 	let f = bring_up_with_repo_and_worker().await;
 	f.db.with_conn(|c| {
 		Ok(c.execute(
@@ -621,6 +621,12 @@ async fn retry_verify_revives_dismissed_findings() {
 	assert_eq!(scan_env.job_id, scan.job_id);
 	submit_finding(&f.worker, scan_env.job_id, finding("Failed verify", "fp-failed-verify")).await;
 	submit_finding(&f.worker, scan_env.job_id, finding("Queued verify", "fp-queued-verify")).await;
+	submit_finding(
+		&f.worker,
+		scan_env.job_id,
+		finding("Verifier dismissed", "fp-verifier-dismissed"),
+	)
+	.await;
 
 	let resp = f
 		.worker
@@ -668,8 +674,47 @@ async fn retry_verify_revives_dismissed_findings() {
 		})
 		.unwrap();
 
+	let (terminal_finding_id, terminal_verify_job_id): (i64, i64) =
+		f.db.with_conn(|c| {
+			Ok(c.query_row(
+				"SELECT f.id, j.id
+				   FROM findings f
+				   JOIN jobs j ON j.target_finding_id = f.id
+				  WHERE f.fingerprint = 'fp-verifier-dismissed'
+				    AND j.kind = 'verify'",
+				[],
+				|r| Ok((r.get(0)?, r.get(1)?)),
+			)?)
+		})
+		.unwrap();
+
 	f.db.with_conn(|c| {
-		c.execute("UPDATE findings SET validating_deadline = 100 WHERE repo_id = ?1", [f.repo_id])?;
+		c.execute(
+			"INSERT INTO finding_verifications
+			   (finding_id, job_id, verdict, notes, created_at)
+			 VALUES (?1, ?2, 'dismissed', 'verifier rejected it', 100)",
+			(terminal_finding_id, terminal_verify_job_id),
+		)?;
+		c.execute(
+			"UPDATE findings SET state = 'dismissed', dismissed_at = 100 WHERE id = ?1",
+			[terminal_finding_id],
+		)?;
+		c.execute(
+			"UPDATE jobs SET state = 'succeeded', finished_at = 100 WHERE id = ?1",
+			[terminal_verify_job_id],
+		)?;
+		Ok(())
+	})
+	.unwrap();
+
+	f.db.with_conn(|c| {
+		c.execute(
+			"UPDATE findings
+			    SET validating_deadline = 100
+			  WHERE repo_id = ?1
+			    AND state = 'validating'",
+			[f.repo_id],
+		)?;
 		Ok(loupe_storage::findings::reap_stale_validating(c, 200)?)
 	})
 	.unwrap();
@@ -680,6 +725,7 @@ async fn retry_verify_revives_dismissed_findings() {
 		.json(&RetryVerifyRequest {
 			protocol_version: PROTOCOL_VERSION,
 			dry_run: true,
+			include_inconclusive: false,
 			repo_id: Some(f.repo_id),
 			limit: None,
 		})
@@ -693,7 +739,7 @@ async fn retry_verify_revives_dismissed_findings() {
 		.unwrap();
 	assert!(dry_run.dry_run);
 	assert_eq!(dry_run.matched, 2);
-	assert_eq!(dry_run.revived, 2);
+	assert_eq!(dry_run.revived, 1);
 	assert_eq!(dry_run.requeued_jobs, 1);
 	assert_eq!(dry_run.created_jobs, 0);
 	assert_eq!(dry_run.left_queued_or_leased, 1);
@@ -707,7 +753,7 @@ async fn retry_verify_revives_dismissed_findings() {
 			)?)
 		})
 		.unwrap();
-	assert_eq!(dismissed_count, 2, "dry-run must not revive findings");
+	assert_eq!(dismissed_count, 3, "dry-run must not revive findings");
 
 	let applied: RetryVerifyResponse = f
 		.admin
@@ -715,6 +761,7 @@ async fn retry_verify_revives_dismissed_findings() {
 		.json(&RetryVerifyRequest {
 			protocol_version: PROTOCOL_VERSION,
 			dry_run: false,
+			include_inconclusive: false,
 			repo_id: Some(f.repo_id),
 			limit: None,
 		})
@@ -728,26 +775,39 @@ async fn retry_verify_revives_dismissed_findings() {
 		.unwrap();
 	assert!(!applied.dry_run);
 	assert_eq!(applied.matched, 2);
-	assert_eq!(applied.revived, 2);
+	assert_eq!(applied.revived, 1);
 	assert_eq!(applied.requeued_jobs, 1);
 	assert_eq!(applied.created_jobs, 0);
 	assert_eq!(applied.left_queued_or_leased, 1);
 
-	let validating_count: i64 =
+	let (failed_state, queued_state, terminal_state): (String, String, String) =
 		f.db.with_conn(|c| {
-			Ok(c.query_row(
-				"SELECT COUNT(*) FROM findings
-				  WHERE repo_id = ?1
-				    AND state = 'validating'
-				    AND dismissed_at IS NULL",
-				[f.repo_id],
+			let failed_state = c.query_row(
+				"SELECT state FROM findings WHERE id = ?1",
+				[failed_finding_id],
 				|r| r.get(0),
-			)?)
+			)?;
+			let queued_state = c.query_row(
+				"SELECT f.state
+				   FROM findings f
+				   JOIN jobs j ON j.target_finding_id = f.id
+				  WHERE j.id = ?1",
+				[queued_verify_job_id],
+				|r| r.get(0),
+			)?;
+			let terminal_state = c.query_row(
+				"SELECT state FROM findings WHERE id = ?1",
+				[terminal_finding_id],
+				|r| r.get(0),
+			)?;
+			Ok((failed_state, queued_state, terminal_state))
 		})
 		.unwrap();
-	assert_eq!(validating_count, 2);
+	assert_eq!(failed_state, "validating");
+	assert_eq!(queued_state, "dismissed", "active verify work must not be touched");
+	assert_eq!(terminal_state, "dismissed", "verifier-dismissed findings must stay terminal");
 
-	let (failed_job_state, queued_job_state): (String, String) =
+	let (failed_job_state, queued_job_state, terminal_job_state): (String, String, String) =
 		f.db.with_conn(|c| {
 			let failed_state =
 				c.query_row("SELECT state FROM jobs WHERE id = ?1", [failed_env.job_id], |r| {
@@ -757,11 +817,303 @@ async fn retry_verify_revives_dismissed_findings() {
 				c.query_row("SELECT state FROM jobs WHERE id = ?1", [queued_verify_job_id], |r| {
 					r.get(0)
 				})?;
-			Ok((failed_state, queued_state))
+			let terminal_state = c.query_row(
+				"SELECT state FROM jobs WHERE id = ?1",
+				[terminal_verify_job_id],
+				|r| r.get(0),
+			)?;
+			Ok((failed_state, queued_state, terminal_state))
 		})
 		.unwrap();
 	assert_eq!(failed_job_state, "queued");
 	assert_eq!(queued_job_state, "queued");
+	assert_eq!(terminal_job_state, "succeeded");
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_verify_refreshes_validating_findings_without_active_verify_jobs() {
+	let f = bring_up_with_repo_and_worker().await;
+	f.db.with_conn(|c| {
+		Ok(c.execute(
+			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
+			[f.repo_id],
+		)?)
+	})
+	.unwrap();
+
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let scan_env = lease_job(&f.worker).await;
+	assert_eq!(scan_env.job_id, scan.job_id);
+	for (title, fingerprint) in [
+		("Failed verify", "fp-refresh-failed"),
+		("Inconclusive verify", "fp-refresh-inconclusive"),
+		("Queued verify", "fp-refresh-queued"),
+		("Leased verify", "fp-refresh-leased"),
+		("Confirmed finding", "fp-refresh-confirmed"),
+		("Dismissed finding", "fp-refresh-dismissed"),
+		("Reported finding", "fp-refresh-reported"),
+	] {
+		submit_finding(&f.worker, scan_env.job_id, finding(title, fingerprint)).await;
+	}
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Succeeded,
+			head_sha: Some("abc123".into()),
+			error: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let rows: Vec<(String, i64, i64)> =
+		f.db.with_conn(|c| {
+			let mut stmt = c.prepare(
+				"SELECT f.fingerprint, f.id, j.id
+				   FROM findings f
+				   JOIN jobs j ON j.target_finding_id = f.id
+				  WHERE f.repo_id = ?1
+				    AND j.kind = 'verify'",
+			)?;
+			let rows = stmt.query_map([f.repo_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+			Ok(rows.collect::<Result<Vec<_>, _>>()?)
+		})
+		.unwrap();
+	let ids = |fingerprint: &str| -> (i64, i64) {
+		rows.iter()
+			.find(|(fp, _, _)| fp == fingerprint)
+			.map(|(_, finding_id, job_id)| (*finding_id, *job_id))
+			.unwrap_or_else(|| panic!("missing finding/job for {fingerprint}"))
+	};
+	let (failed_id, failed_job) = ids("fp-refresh-failed");
+	let (inconclusive_id, inconclusive_job) = ids("fp-refresh-inconclusive");
+	let (queued_id, queued_job) = ids("fp-refresh-queued");
+	let (leased_id, leased_job) = ids("fp-refresh-leased");
+	let (confirmed_id, confirmed_job) = ids("fp-refresh-confirmed");
+	let (dismissed_id, dismissed_job) = ids("fp-refresh-dismissed");
+	let (reported_id, reported_job) = ids("fp-refresh-reported");
+
+	f.db.with_conn(|c| {
+		for finding_id in [
+			failed_id,
+			inconclusive_id,
+			queued_id,
+			leased_id,
+			confirmed_id,
+			dismissed_id,
+			reported_id,
+		] {
+			c.execute(
+				"UPDATE findings SET validating_deadline = 1000 WHERE id = ?1",
+				[finding_id],
+			)?;
+		}
+		c.execute(
+			"UPDATE jobs
+			   SET state = 'failed', finished_at = 100, error = 'verifier failed'
+			 WHERE id = ?1",
+			[failed_job],
+		)?;
+		c.execute(
+			"UPDATE jobs
+			   SET state = 'succeeded', finished_at = 100
+			 WHERE id = ?1",
+			[inconclusive_job],
+		)?;
+		c.execute(
+			"INSERT INTO finding_verifications
+			   (finding_id, job_id, verdict, notes, created_at)
+			 VALUES (?1, ?2, 'inconclusive', ?3, ?4)",
+			(inconclusive_id, inconclusive_job, "verifier could not decide", 100_i64),
+		)?;
+		let worker_id: i64 =
+			c.query_row("SELECT id FROM workers WHERE name = 'w1'", [], |r| r.get(0))?;
+		c.execute(
+			"UPDATE jobs
+			   SET state = 'leased',
+			       worker_id = ?2,
+			       lease_expires_at = 9999999999,
+			       attempts = 1,
+			       started_at = 100
+			 WHERE id = ?1",
+			(leased_job, worker_id),
+		)?;
+		c.execute(
+			"UPDATE jobs
+			   SET state = 'failed', finished_at = 100, error = 'terminal finding'
+			 WHERE id IN (?1, ?2, ?3)",
+			(confirmed_job, dismissed_job, reported_job),
+		)?;
+		c.execute(
+			"UPDATE findings SET state = 'confirmed', confirmed_at = 100 WHERE id = ?1",
+			[confirmed_id],
+		)?;
+		c.execute(
+			"UPDATE findings SET state = 'dismissed', dismissed_at = 100 WHERE id = ?1",
+			[dismissed_id],
+		)?;
+		c.execute(
+			"INSERT INTO finding_verifications
+			   (finding_id, job_id, verdict, notes, created_at)
+			 VALUES (?1, ?2, 'dismissed', 'verifier rejected it', 100)",
+			(dismissed_id, dismissed_job),
+		)?;
+		c.execute(
+			"UPDATE findings SET state = 'reported', reported_at = 100 WHERE id = ?1",
+			[reported_id],
+		)?;
+		Ok(())
+	})
+	.unwrap();
+
+	let applied: RetryVerifyResponse = f
+		.admin
+		.post("https://loupe-server/v1/findings/retry-verify")
+		.json(&RetryVerifyRequest {
+			protocol_version: PROTOCOL_VERSION,
+			dry_run: false,
+			include_inconclusive: false,
+			repo_id: Some(f.repo_id),
+			limit: None,
+		})
+		.send()
+		.await
+		.unwrap()
+		.error_for_status()
+		.unwrap()
+		.json()
+		.await
+		.unwrap();
+	assert_eq!(applied.matched, 3);
+	assert_eq!(applied.revived, 1);
+	assert_eq!(applied.requeued_jobs, 1);
+	assert_eq!(applied.created_jobs, 0);
+	assert_eq!(applied.left_queued_or_leased, 2);
+
+	let (failed_job_state, inconclusive_queued, queued_job_state, queued_deadline, leased_deadline): (
+		String,
+		i64,
+		String,
+		i64,
+		i64,
+	) = f
+		.db
+		.with_conn(|c| {
+			let failed_job_state =
+				c.query_row("SELECT state FROM jobs WHERE id = ?1", [failed_job], |r| r.get(0))?;
+			let inconclusive_queued = c.query_row(
+				"SELECT COUNT(*) FROM jobs
+				  WHERE kind = 'verify'
+				    AND target_finding_id = ?1
+				    AND state = 'queued'",
+				[inconclusive_id],
+				|r| r.get(0),
+			)?;
+			let queued_job_state =
+				c.query_row("SELECT state FROM jobs WHERE id = ?1", [queued_job], |r| r.get(0))?;
+			let queued_deadline = c.query_row(
+				"SELECT validating_deadline FROM findings WHERE id = ?1",
+				[queued_id],
+				|r| r.get(0),
+			)?;
+			let leased_deadline = c.query_row(
+				"SELECT validating_deadline FROM findings WHERE id = ?1",
+				[leased_id],
+				|r| r.get(0),
+			)?;
+			Ok((
+				failed_job_state,
+				inconclusive_queued,
+				queued_job_state,
+				queued_deadline,
+				leased_deadline,
+			))
+		})
+		.unwrap();
+	assert_eq!(failed_job_state, "queued");
+	assert_eq!(inconclusive_queued, 0, "inconclusive findings require the explicit flag");
+	assert_eq!(queued_job_state, "queued");
+	assert_eq!(queued_deadline, 1000, "queued verify work must not be refreshed");
+	assert_eq!(leased_deadline, 1000, "leased verify work must not be refreshed");
+
+	let include: RetryVerifyResponse = f
+		.admin
+		.post("https://loupe-server/v1/findings/retry-verify")
+		.json(&RetryVerifyRequest {
+			protocol_version: PROTOCOL_VERSION,
+			dry_run: false,
+			include_inconclusive: true,
+			repo_id: Some(f.repo_id),
+			limit: None,
+		})
+		.send()
+		.await
+		.unwrap()
+		.error_for_status()
+		.unwrap()
+		.json()
+		.await
+		.unwrap();
+	assert_eq!(include.matched, 4);
+	assert_eq!(include.revived, 1);
+	assert_eq!(include.requeued_jobs, 0);
+	assert_eq!(include.created_jobs, 1);
+	assert_eq!(include.left_queued_or_leased, 3);
+
+	let (inconclusive_queued, confirmed_state, dismissed_state, reported_state, terminal_jobs): (
+		i64,
+		String,
+		String,
+		String,
+		i64,
+	) = f.db
+		.with_conn(|c| {
+			let inconclusive_queued = c.query_row(
+				"SELECT COUNT(*) FROM jobs
+				  WHERE kind = 'verify'
+				    AND target_finding_id = ?1
+				    AND state = 'queued'",
+				[inconclusive_id],
+				|r| r.get(0),
+			)?;
+			let confirmed_state =
+				c.query_row("SELECT state FROM findings WHERE id = ?1", [confirmed_id], |r| {
+					r.get(0)
+				})?;
+			let dismissed_state =
+				c.query_row("SELECT state FROM findings WHERE id = ?1", [dismissed_id], |r| {
+					r.get(0)
+				})?;
+			let reported_state =
+				c.query_row("SELECT state FROM findings WHERE id = ?1", [reported_id], |r| {
+					r.get(0)
+				})?;
+			let terminal_jobs = c.query_row(
+				"SELECT COUNT(*) FROM jobs
+				  WHERE id IN (?1, ?2, ?3)
+				    AND state = 'failed'",
+				(confirmed_job, dismissed_job, reported_job),
+				|r| r.get(0),
+			)?;
+			Ok((
+				inconclusive_queued,
+				confirmed_state,
+				dismissed_state,
+				reported_state,
+				terminal_jobs,
+			))
+		})
+		.unwrap();
+	assert_eq!(inconclusive_queued, 1);
+	assert_eq!(confirmed_state, "confirmed");
+	assert_eq!(dismissed_state, "dismissed");
+	assert_eq!(reported_state, "reported");
+	assert_eq!(terminal_jobs, 3, "terminal findings' verify jobs must not be retried");
 
 	f.handle.shutdown().await;
 }
@@ -836,6 +1188,7 @@ async fn retry_verify_recovers_legacy_stranded_pending_findings() {
 		.json(&RetryVerifyRequest {
 			protocol_version: PROTOCOL_VERSION,
 			dry_run: true,
+			include_inconclusive: false,
 			repo_id: Some(f.repo_id),
 			limit: None,
 		})
@@ -882,6 +1235,7 @@ async fn retry_verify_recovers_legacy_stranded_pending_findings() {
 		.json(&RetryVerifyRequest {
 			protocol_version: PROTOCOL_VERSION,
 			dry_run: false,
+			include_inconclusive: false,
 			repo_id: Some(f.repo_id),
 			limit: None,
 		})

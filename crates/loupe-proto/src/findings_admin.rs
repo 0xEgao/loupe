@@ -27,6 +27,11 @@ pub struct RetryVerifyRequest {
 	pub protocol_version: u16,
 	#[serde(default)]
 	pub dry_run: bool,
+	/// Include findings whose verifier-produced history contains
+	/// inconclusive verdicts. Deadline-reaper inconclusive rows use
+	/// `job_id = NULL` and remain recoverable without this flag.
+	#[serde(default)]
+	pub include_inconclusive: bool,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub repo_id: Option<i64>,
 	/// Optional cap on findings processed in one call. Omit to process all
