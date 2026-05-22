@@ -146,10 +146,22 @@ pub async fn get(
 
 /// `POST /v1/findings/retry-verify` — admin-only
 /// recovery for findings that still need verifier work but are no
-/// longer represented correctly in the queue. This covers findings
-/// dismissed by the validating-deadline reaper before any terminal
-/// verifier verdict arrived, and findings stranded in `pending` after
-/// a failed scan inserted them before a later duplicate scan succeeded.
+/// longer represented correctly in the queue.
+///
+/// Recovery has three explicit arms:
+///
+/// 1. deadline-dismissed findings: `dismissed` only because the
+///    validating-deadline reaper inserted its system inconclusive row;
+/// 2. legacy stranded pending findings: `pending` rows whose scan job
+///    is already terminal;
+/// 3. stranded validating findings: `validating` rows with no active
+///    verify job.
+///
+/// All arms exclude terminal verifier verdicts, so findings actively
+/// dismissed by a verifier are not revived. Verifier-produced
+/// inconclusive rows are excluded unless `include_inconclusive` is set;
+/// the reaper's system inconclusive marker (`job_id = NULL`) remains
+/// recoverable without that flag.
 pub async fn retry_verify(
 	State(state): State<AppState>, Json(req): Json<RetryVerifyRequest>,
 ) -> Result<Json<RetryVerifyResponse>, (StatusCode, String)> {
@@ -171,42 +183,56 @@ pub async fn retry_verify(
 			let tx = c.transaction()?;
 			let limit = req.limit.unwrap_or(-1);
 			let candidates = {
+				// Keep the three recovery modes in one query so the
+				// repo/limit ordering is global rather than per-arm.
+				// Active queued/leased verify jobs are counted later and
+				// not mutated, which prevents duplicate verifier work.
 				let mut stmt = tx.prepare(
 					"SELECT f.id, f.repo_id, f.job_id
-					   FROM findings f
-					  WHERE f.verification_required = 1
-					    AND (?1 IS NULL OR f.repo_id = ?1)
-					    AND (
-					      (
-					        f.state = 'dismissed'
-					        AND EXISTS (
-					          SELECT 1 FROM finding_verifications v
-					           WHERE v.finding_id = f.id
-					             AND v.job_id IS NULL
-					             AND v.verdict = 'inconclusive'
-					             AND v.notes = 'validating_deadline expired'
-					        )
-					      )
-					      OR (
-					        f.state = 'pending'
-					        AND EXISTS (
-					          SELECT 1 FROM jobs j
-					           WHERE j.id = f.job_id
-					             AND j.kind = 'scan'
-					             AND j.state IN ('succeeded', 'failed', 'cancelled')
-					             AND j.finished_at IS NOT NULL
-					        )
-					      )
-					    )
-					    AND NOT EXISTS (
-					      SELECT 1 FROM finding_verifications v
-					       WHERE v.finding_id = f.id
-					         AND v.verdict IN ('confirmed', 'dismissed')
-					    )
-					  ORDER BY COALESCE(f.dismissed_at, f.created_at), f.id
-					  LIMIT ?2",
+						   FROM findings f
+						  WHERE f.verification_required = 1
+						    AND (?1 IS NULL OR f.repo_id = ?1)
+						    AND (
+						      (
+						        f.state = 'dismissed'
+						        AND EXISTS (
+						          SELECT 1 FROM finding_verifications v
+						           WHERE v.finding_id = f.id
+						             AND v.job_id IS NULL
+						             AND v.verdict = 'inconclusive'
+						             AND v.notes = 'validating_deadline expired'
+						        )
+						      )
+						      OR (
+						        f.state = 'pending'
+						        AND EXISTS (
+						          SELECT 1 FROM jobs j
+						           WHERE j.id = f.job_id
+						             AND j.kind = 'scan'
+						             AND j.state IN ('succeeded', 'failed', 'cancelled')
+						             AND j.finished_at IS NOT NULL
+						        )
+						      )
+						      OR f.state = 'validating'
+						    )
+						    AND NOT EXISTS (
+						      SELECT 1 FROM finding_verifications v
+						       WHERE v.finding_id = f.id
+						         AND v.verdict IN ('confirmed', 'dismissed')
+						    )
+						    AND (
+						      ?3 = 1
+						      OR NOT EXISTS (
+						        SELECT 1 FROM finding_verifications v
+						         WHERE v.finding_id = f.id
+						           AND v.job_id IS NOT NULL
+						           AND v.verdict = 'inconclusive'
+						      )
+						    )
+						  ORDER BY COALESCE(f.validating_deadline, f.created_at), f.id
+						  LIMIT ?2",
 				)?;
-				let mut rows = stmt.query((req.repo_id, limit))?;
+				let mut rows = stmt.query((req.repo_id, limit, req.include_inconclusive as i64))?;
 				let mut out = Vec::new();
 				while let Some(r) = rows.next()? {
 					out.push(VerifyRetryCandidate {
@@ -222,7 +248,7 @@ pub async fn retry_verify(
 				protocol_version: PROTOCOL_VERSION,
 				dry_run: req.dry_run,
 				matched: candidates.len() as u64,
-				revived: candidates.len() as u64,
+				revived: 0,
 				requeued_jobs: 0,
 				created_jobs: 0,
 				left_queued_or_leased: 0,
@@ -242,7 +268,9 @@ pub async fn retry_verify(
 
 				if active_verify {
 					out.left_queued_or_leased += 1;
+					continue;
 				} else {
+					out.revived += 1;
 					let failed_job_id: Option<i64> = {
 						let mut stmt = tx.prepare(
 							"SELECT id FROM jobs
@@ -299,10 +327,10 @@ pub async fn retry_verify(
 				if !req.dry_run {
 					tx.execute(
 						"UPDATE findings
-						   SET state = 'validating',
-						       dismissed_at = NULL,
-						       validating_deadline = ?1
-						 WHERE id = ?2 AND state IN ('dismissed', 'pending')",
+							   SET state = 'validating',
+							       dismissed_at = NULL,
+							       validating_deadline = ?1
+							 WHERE id = ?2 AND state IN ('dismissed', 'pending', 'validating')",
 						(now + super::jobs::DEFAULT_VALIDATING_BUDGET_SECS, candidate.finding_id),
 					)?;
 				}
@@ -317,7 +345,7 @@ pub async fn retry_verify(
 		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("retry verify: {e}")))?;
 
-	if !response.dry_run && response.matched > 0 {
+	if !response.dry_run && response.requeued_jobs + response.created_jobs > 0 {
 		state.job_arrived.notify_waiters();
 	}
 	response.protocol_version = PROTOCOL_VERSION;
