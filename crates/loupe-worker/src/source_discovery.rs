@@ -117,6 +117,7 @@ fn default_excludes() -> Vec<String> {
 		"file:*_tests.*",
 		"file:*.test.*",
 		"file:*.spec.*",
+		"dir:fuzz",
 		// Build artefacts across ecosystems.
 		"dir:target",
 		"dir:build",
@@ -145,8 +146,9 @@ fn default_excludes() -> Vec<String> {
 
 /// Walk the worktree for production source files. Strategy:
 ///
-/// - Rust Cargo package roots from the root package/workspace, including
-///   `workspace.members` globs and `workspace.exclude`.
+/// - Rust Cargo package roots from non-excluded `Cargo.toml` manifests
+///   with a `[package]` table. This intentionally includes in-repo
+///   packages that are path dependencies but not workspace members.
 /// - JS/TS roots under directories containing `package.json`.
 /// - C/C++ roots under directories containing common build-system markers.
 /// - Fallback to the whole worktree if no project roots are discovered.
@@ -182,7 +184,7 @@ struct DiscoveryRoots {
 
 fn discover_roots(workdir: &Path, cfg: &ScannerConfig) -> DiscoveryRoots {
 	let mut roots = DiscoveryRoots::default();
-	add_cargo_roots(workdir, &mut roots);
+	add_cargo_roots(workdir, cfg, &mut roots);
 	add_marker_roots(workdir, cfg, &mut roots);
 	roots.roots.sort();
 	roots.roots.dedup();
@@ -191,20 +193,15 @@ fn discover_roots(workdir: &Path, cfg: &ScannerConfig) -> DiscoveryRoots {
 	roots
 }
 
-fn add_cargo_roots(workdir: &Path, roots: &mut DiscoveryRoots) {
-	let cargo_toml = workdir.join("Cargo.toml");
-	if !cargo_toml.exists() {
-		return;
-	}
+fn add_cargo_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots) {
+	let workspace_exclude = parse_workspace(&workdir.join("Cargo.toml"))
+		.map(|workspace| workspace.exclude)
+		.unwrap_or_default();
 
-	match parse_workspace(&cargo_toml) {
-		Some(workspace) => {
-			for member in expand_workspace_members(workdir, &workspace.members, &workspace.exclude)
-			{
-				add_rust_package_roots(&member, roots);
-			}
-		},
-		None => add_rust_package_roots(workdir, roots),
+	for manifest in cargo_package_manifests(workdir, cfg, &workspace_exclude) {
+		if let Some(package_dir) = manifest.parent() {
+			add_rust_package_roots(package_dir, roots);
+		}
 	}
 }
 
@@ -221,17 +218,45 @@ fn add_rust_package_roots(package: &Path, roots: &mut DiscoveryRoots) {
 
 #[derive(Debug, Default)]
 struct WorkspaceManifest {
-	members: Vec<String>,
 	exclude: Vec<String>,
 }
 
 fn parse_workspace(cargo_toml: &Path) -> Option<WorkspaceManifest> {
-	let text = std::fs::read_to_string(cargo_toml).ok()?;
-	let manifest: toml::Value = toml::from_str(&text).ok()?;
+	let manifest = parse_manifest(cargo_toml)?;
 	let workspace = manifest.get("workspace")?;
-	let members = read_string_array(workspace, "members");
 	let exclude = read_string_array(workspace, "exclude");
-	Some(WorkspaceManifest { members, exclude })
+	Some(WorkspaceManifest { exclude })
+}
+
+fn cargo_package_manifests(
+	workdir: &Path, cfg: &ScannerConfig, workspace_exclude: &[String],
+) -> Vec<PathBuf> {
+	let mut out: Vec<PathBuf> = walkdir::WalkDir::new(workdir)
+		.into_iter()
+		.filter_entry(|entry| {
+			!is_excluded_dir(entry.path(), cfg)
+				&& !is_workspace_excluded_descendant(workdir, entry.path(), workspace_exclude)
+		})
+		.filter_map(Result::ok)
+		.filter(|entry| entry.file_type().is_file() && entry.file_name() == "Cargo.toml")
+		.map(|entry| entry.into_path())
+		.filter(|manifest| manifest_has_package(manifest))
+		.collect();
+	out.sort();
+	out.dedup();
+	out
+}
+
+fn manifest_has_package(cargo_toml: &Path) -> bool {
+	let Some(manifest) = parse_manifest(cargo_toml) else {
+		return false;
+	};
+	manifest.get("package").is_some()
+}
+
+fn parse_manifest(cargo_toml: &Path) -> Option<toml::Value> {
+	let text = std::fs::read_to_string(cargo_toml).ok()?;
+	toml::from_str(&text).ok()
 }
 
 fn read_string_array(table: &toml::Value, key: &str) -> Vec<String> {
@@ -245,42 +270,6 @@ fn read_string_array(table: &toml::Value, key: &str) -> Vec<String> {
 		.collect()
 }
 
-fn expand_workspace_members(
-	workdir: &Path, members: &[String], excludes: &[String],
-) -> Vec<PathBuf> {
-	let mut out = Vec::new();
-	for member in members {
-		for path in expand_relative_pattern(workdir, member) {
-			if !path.is_dir() {
-				continue;
-			}
-			let rel = path.strip_prefix(workdir).unwrap_or(&path);
-			if matches_workspace_exclude(rel, excludes) {
-				continue;
-			}
-			if path.join("Cargo.toml").is_file() {
-				out.push(path);
-			}
-		}
-	}
-	out.sort();
-	out.dedup();
-	out
-}
-
-fn expand_relative_pattern(base: &Path, pattern: &str) -> Vec<PathBuf> {
-	if !has_glob_meta(pattern) {
-		return vec![base.join(pattern)];
-	}
-	let Some(abs_pattern) = base.join(pattern).to_str().map(str::to_owned) else {
-		return Vec::new();
-	};
-	let mut out: Vec<PathBuf> =
-		glob::glob(&abs_pattern).into_iter().flatten().filter_map(Result::ok).collect();
-	out.sort();
-	out
-}
-
 fn matches_workspace_exclude(rel: &Path, excludes: &[String]) -> bool {
 	excludes.iter().any(|exclude| {
 		if exclude == rel.to_string_lossy().as_ref() {
@@ -290,8 +279,14 @@ fn matches_workspace_exclude(rel: &Path, excludes: &[String]) -> bool {
 	})
 }
 
-fn has_glob_meta(pattern: &str) -> bool {
-	pattern.as_bytes().iter().any(|b| matches!(b, b'*' | b'?' | b'['))
+fn is_workspace_excluded_descendant(workdir: &Path, path: &Path, excludes: &[String]) -> bool {
+	if excludes.is_empty() {
+		return false;
+	}
+	let rel = path.strip_prefix(workdir).unwrap_or(path);
+	rel.ancestors()
+		.take_while(|candidate| !candidate.as_os_str().is_empty())
+		.any(|candidate| matches_workspace_exclude(candidate, excludes))
 }
 
 fn add_marker_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots) {
@@ -442,6 +437,7 @@ mod tests {
 		}
 		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:node_modules"));
 		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:target"));
+		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:fuzz"));
 	}
 
 	#[test]
@@ -497,6 +493,35 @@ mod tests {
 		let names = rel_names(tmp.path(), walk_source_files(tmp.path(), &ScannerConfig::default()));
 		assert!(names.iter().any(|n| n == "crates/public/src/lib.rs"), "names: {names:?}");
 		assert!(names.iter().all(|n| !n.contains("private-api")), "names: {names:?}");
+	}
+
+	#[test]
+	fn cargo_workspace_discovers_non_member_package_manifests() {
+		let tmp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			tmp.path().join("Cargo.toml"),
+			"[workspace]\nmembers = [\"stratum-core\"]\nexclude = [\"fuzz\"]\n",
+		)
+		.unwrap();
+		write_crate(tmp.path().join("stratum-core").as_path(), &[("src/lib.rs", "// facade\n")]);
+		write_crate(
+			tmp.path().join("stratum-core/stratum-translation").as_path(),
+			&[("src/lib.rs", "// translation\n")],
+		);
+		write_crate(tmp.path().join("sv1").as_path(), &[("src/lib.rs", "// sv1\n")]);
+		write_crate(tmp.path().join("sv2/binary-sv2").as_path(), &[("src/lib.rs", "// binary\n")]);
+		write_crate(tmp.path().join("fuzz").as_path(), &[("src/lib.rs", "// fuzz\n")]);
+
+		let names = rel_names(tmp.path(), walk_source_files(tmp.path(), &ScannerConfig::default()));
+		for expected in [
+			"stratum-core/src/lib.rs",
+			"stratum-core/stratum-translation/src/lib.rs",
+			"sv1/src/lib.rs",
+			"sv2/binary-sv2/src/lib.rs",
+		] {
+			assert!(names.iter().any(|n| n == expected), "missing {expected} in {names:?}");
+		}
+		assert!(names.iter().all(|n| !n.starts_with("fuzz/")), "names: {names:?}");
 	}
 
 	#[test]
