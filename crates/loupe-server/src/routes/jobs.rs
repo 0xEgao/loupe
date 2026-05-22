@@ -735,6 +735,12 @@ pub async fn complete(
 					 WHERE job_id = ?2 AND state = 'validating'",
 					(job.repo_id, job_id, now),
 				)?;
+			} else if matches!(new_state, JobState::Failed) && job.kind == JobKind::Scan {
+				tx.execute(
+					"DELETE FROM findings
+					 WHERE job_id = ?1 AND state = 'pending'",
+					[job_id],
+				)?;
 			}
 			tx.commit()?;
 			Ok(true)

@@ -206,6 +206,17 @@ pub fn worker_has_active_lease_for_repo(
 /// `queued` if `attempts < MAX_ATTEMPTS`, else `failed` with an error
 /// message. Returns the number of rows affected.
 pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+	let failing_scan_jobs = {
+		let mut stmt = conn.prepare(
+			"SELECT id FROM jobs
+			 WHERE kind = 'scan'
+			   AND state = 'leased'
+			   AND lease_expires_at < ?1
+			   AND attempts >= ?2",
+		)?;
+		let rows = stmt.query_map(params![now, MAX_ATTEMPTS], |r| r.get::<_, i64>(0))?;
+		rows.collect::<rusqlite::Result<Vec<_>>>()?
+	};
 	let requeued = conn.execute(
 		"UPDATE jobs
 		   SET state = 'queued',
@@ -228,6 +239,9 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		   AND attempts >= ?2",
 		params![now, MAX_ATTEMPTS],
 	)?;
+	for job_id in failing_scan_jobs {
+		conn.execute("DELETE FROM findings WHERE job_id = ?1 AND state = 'pending'", [job_id])?;
+	}
 	Ok(requeued + failed)
 }
 
@@ -262,7 +276,7 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 
 #[cfg(test)]
 mod tests {
-	use loupe_core::ReportingDestination;
+	use loupe_core::{Finding, ReportingDestination, Severity};
 
 	use super::*;
 	use crate::repos::{self, NewRepo};
@@ -645,5 +659,74 @@ mod tests {
 		db.with_conn(|c| Ok(reap_stale_leases(c, 9_999)?)).unwrap();
 		let row = db.with_conn(|c| Ok(list(c)?)).unwrap().pop().unwrap();
 		assert_eq!(row.state, JobState::Failed);
+	}
+
+	#[test]
+	fn reap_failed_scan_discards_pending_findings() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		db.with_conn(|c| {
+			Ok(enqueue(
+				c,
+				&NewJob {
+					repo_id,
+					kind: JobKind::Scan,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				},
+				0,
+			)?)
+		})
+		.unwrap();
+		let leased =
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 999, 10)?)).unwrap().unwrap();
+		db.with_conn(|c| {
+			Ok(crate::findings::insert_or_ignore(
+				c,
+				repo_id,
+				leased.id,
+				&Finding {
+					scanner_id: "regex".into(),
+					severity: Severity::High,
+					title: "Partial scan finding".into(),
+					description: "submitted before lease expiry".into(),
+					file_path: Some("src/x.rs".into()),
+					line_start: Some(1),
+					line_end: Some(1),
+					cwe: None,
+					patch_unified: None,
+					poc_unified: None,
+					fingerprint: "fp-reaped".into(),
+				},
+				true,
+				1_000,
+			)?)
+		})
+		.unwrap();
+		db.with_conn(|c| {
+			Ok(c.execute(
+				"UPDATE jobs
+				    SET attempts = ?1,
+				        lease_expires_at = 1000
+				  WHERE id = ?2",
+				(MAX_ATTEMPTS as i64, leased.id),
+			)?)
+		})
+		.unwrap();
+
+		db.with_conn(|c| Ok(reap_stale_leases(c, 9_999)?)).unwrap();
+		let row = db.with_conn(|c| Ok(list(c)?)).unwrap().pop().unwrap();
+		assert_eq!(row.state, JobState::Failed);
+		let pending_findings: i64 = db
+			.with_conn(|c| {
+				Ok(c.query_row(
+					"SELECT COUNT(*) FROM findings WHERE job_id = ?1",
+					[leased.id],
+					|r| r.get(0),
+				)?)
+			})
+			.unwrap();
+		assert_eq!(pending_findings, 0);
 	}
 }

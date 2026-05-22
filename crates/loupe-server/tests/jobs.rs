@@ -332,6 +332,91 @@ async fn end_to_end_scan_lifecycle() {
 }
 
 #[tokio::test]
+async fn failed_scan_discards_pending_findings_so_retry_can_insert_them() {
+	let f = bring_up_with_repo_and_worker().await;
+	f.db.with_conn(|c| {
+		Ok(c.execute(
+			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
+			[f.repo_id],
+		)?)
+	})
+	.unwrap();
+
+	let failed_scan = enqueue_scan(&f, f.repo_id).await;
+	let failed_env = lease_job(&f.worker).await;
+	assert_eq!(failed_env.job_id, failed_scan.job_id);
+	submit_finding(&f.worker, failed_env.job_id, finding("Partial scan finding", "fp-retryable"))
+		.await;
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", failed_env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Failed,
+			head_sha: None,
+			error: Some("scanner failed after submitting findings".into()),
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let failed_job_findings: i64 =
+		f.db.with_conn(|c| {
+			Ok(c.query_row(
+				"SELECT COUNT(*) FROM findings WHERE job_id = ?1",
+				[failed_env.job_id],
+				|r| r.get(0),
+			)?)
+		})
+		.unwrap();
+	assert_eq!(failed_job_findings, 0, "failed scans must not leave dedup-blocking findings");
+
+	let retried_scan = enqueue_scan(&f, f.repo_id).await;
+	let retried_env = lease_job(&f.worker).await;
+	assert_eq!(retried_env.job_id, retried_scan.job_id);
+	submit_finding(&f.worker, retried_env.job_id, finding("Partial scan finding", "fp-retryable"))
+		.await;
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", retried_env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Succeeded,
+			head_sha: Some("abc123".into()),
+			error: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let (finding_job_id, finding_state, verify_jobs): (i64, String, i64) =
+		f.db.with_conn(|c| {
+			let (finding_id, finding_job_id, finding_state): (i64, i64, String) = c.query_row(
+				"SELECT id, job_id, state FROM findings WHERE fingerprint = 'fp-retryable'",
+				[],
+				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+			)?;
+			let verify_jobs = c.query_row(
+				"SELECT COUNT(*) FROM jobs
+				  WHERE kind = 'verify'
+				    AND parent_job_id = ?1
+				    AND target_finding_id = ?2",
+				(retried_env.job_id, finding_id),
+				|r| r.get(0),
+			)?;
+			Ok((finding_job_id, finding_state, verify_jobs))
+		})
+		.unwrap();
+	assert_eq!(finding_job_id, retried_env.job_id);
+	assert_eq!(finding_state, "validating");
+	assert_eq!(verify_jobs, 1);
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn admin_can_retry_failed_verify_job() {
 	let f = bring_up_with_repo_and_worker().await;
 	f.db.with_conn(|c| {
@@ -682,7 +767,7 @@ async fn retry_verify_revives_dismissed_findings() {
 }
 
 #[tokio::test]
-async fn retry_verify_recovers_stranded_pending_findings() {
+async fn retry_verify_recovers_legacy_stranded_pending_findings() {
 	let f = bring_up_with_repo_and_worker().await;
 	f.db.with_conn(|c| {
 		Ok(c.execute(
@@ -692,32 +777,13 @@ async fn retry_verify_recovers_stranded_pending_findings() {
 	})
 	.unwrap();
 
-	let failed_scan = enqueue_scan(&f, f.repo_id).await;
-	let failed_env = lease_job(&f.worker).await;
-	assert_eq!(failed_env.job_id, failed_scan.job_id);
-	submit_finding(&f.worker, failed_env.job_id, finding("Stranded pending", "fp-stranded")).await;
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let env = lease_job(&f.worker).await;
+	assert_eq!(env.job_id, scan.job_id);
+	submit_finding(&f.worker, env.job_id, finding("Stranded pending", "fp-stranded")).await;
 	let resp = f
 		.worker
-		.post(format!("https://loupe-server/v1/jobs/{}/complete", failed_env.job_id))
-		.json(&CompleteRequest {
-			protocol_version: PROTOCOL_VERSION,
-			outcome: CompleteOutcome::Failed,
-			head_sha: None,
-			error: Some("scanner failed after submitting findings".into()),
-		})
-		.send()
-		.await
-		.unwrap();
-	assert_eq!(resp.status(), 204);
-
-	let duplicate_scan = enqueue_scan(&f, f.repo_id).await;
-	let duplicate_env = lease_job(&f.worker).await;
-	assert_eq!(duplicate_env.job_id, duplicate_scan.job_id);
-	submit_finding(&f.worker, duplicate_env.job_id, finding("Stranded pending", "fp-stranded"))
-		.await;
-	let resp = f
-		.worker
-		.post(format!("https://loupe-server/v1/jobs/{}/complete", duplicate_env.job_id))
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", env.job_id))
 		.json(&CompleteRequest {
 			protocol_version: PROTOCOL_VERSION,
 			outcome: CompleteOutcome::Succeeded,
@@ -729,23 +795,38 @@ async fn retry_verify_recovers_stranded_pending_findings() {
 		.unwrap();
 	assert_eq!(resp.status(), 204);
 
+	let stranded_id: i64 =
+		f.db.with_conn(|c| {
+			let finding_id = c.query_row(
+				"SELECT id FROM findings WHERE fingerprint = 'fp-stranded'",
+				[],
+				|r| r.get(0),
+			)?;
+			c.execute(
+				"UPDATE findings
+				    SET state = 'pending',
+				        validating_deadline = NULL
+				  WHERE id = ?1",
+				[finding_id],
+			)?;
+			c.execute(
+				"DELETE FROM jobs WHERE kind = 'verify' AND target_finding_id = ?1",
+				[finding_id],
+			)?;
+			Ok(finding_id)
+		})
+		.unwrap();
+
 	let active_scan = enqueue_scan(&f, f.repo_id).await;
 	let active_env = lease_job(&f.worker).await;
 	assert_eq!(active_env.job_id, active_scan.job_id);
 	submit_finding(&f.worker, active_env.job_id, finding("Still scanning", "fp-active")).await;
 
-	let (stranded_id, active_id): (i64, i64) =
+	let active_id: i64 =
 		f.db.with_conn(|c| {
-			let stranded_id = c.query_row(
-				"SELECT id FROM findings WHERE fingerprint = 'fp-stranded'",
-				[],
-				|r| r.get(0),
-			)?;
-			let active_id =
-				c.query_row("SELECT id FROM findings WHERE fingerprint = 'fp-active'", [], |r| {
-					r.get(0)
-				})?;
-			Ok((stranded_id, active_id))
+			Ok(c.query_row("SELECT id FROM findings WHERE fingerprint = 'fp-active'", [], |r| {
+				r.get(0)
+			})?)
 		})
 		.unwrap();
 
@@ -843,7 +924,7 @@ async fn retry_verify_recovers_stranded_pending_findings() {
 				    AND state = 'queued'
 				    AND parent_job_id = ?1
 				    AND target_finding_id = ?2",
-				(failed_env.job_id, stranded_id),
+				(env.job_id, stranded_id),
 				|r| r.get(0),
 			)?;
 			Ok((stranded_state, stranded_deadline, active_state, active_deadline, verify_job_id))
