@@ -22,8 +22,8 @@ use axum::http::StatusCode;
 use axum::Json;
 use loupe_core::{FindingState, JobKind, ReportingDestination};
 use loupe_proto::{
-	FindingDetail, FindingSummary, ListFindingsResponse, RetryTimedOutVerificationsRequest,
-	RetryTimedOutVerificationsResponse, PROTOCOL_VERSION,
+	FindingDetail, FindingSummary, ListFindingsResponse, RetryVerifyRequest, RetryVerifyResponse,
+	PROTOCOL_VERSION,
 };
 use loupe_storage::findings::{self, ApprovalOutcome, FindingRow};
 use loupe_storage::jobs::NewJob;
@@ -47,7 +47,7 @@ const SEARCH_DEFAULT_LIMIT: i64 = 20;
 const SEARCH_MAX_LIMIT: i64 = 100;
 
 #[derive(Debug)]
-struct TimedOutVerificationCandidate {
+struct VerifyRetryCandidate {
 	finding_id: i64,
 	repo_id: i64,
 	parent_job_id: i64,
@@ -144,12 +144,15 @@ pub async fn get(
 	Ok(Json(row_to_detail(row)))
 }
 
-/// `POST /v1/findings/retry-timed-out-verifications` — admin-only
-/// recovery for findings dismissed by the validating-deadline reaper
-/// before any terminal verifier verdict arrived.
-pub async fn retry_timed_out_verifications(
-	State(state): State<AppState>, Json(req): Json<RetryTimedOutVerificationsRequest>,
-) -> Result<Json<RetryTimedOutVerificationsResponse>, (StatusCode, String)> {
+/// `POST /v1/findings/retry-verify` — admin-only
+/// recovery for findings that still need verifier work but are no
+/// longer represented correctly in the queue. This covers findings
+/// dismissed by the validating-deadline reaper before any terminal
+/// verifier verdict arrived, and findings stranded in `pending` after
+/// a failed scan inserted them before a later duplicate scan succeeded.
+pub async fn retry_verify(
+	State(state): State<AppState>, Json(req): Json<RetryVerifyRequest>,
+) -> Result<Json<RetryVerifyResponse>, (StatusCode, String)> {
 	if req.protocol_version != PROTOCOL_VERSION {
 		return Err((
 			StatusCode::BAD_REQUEST,
@@ -171,15 +174,29 @@ pub async fn retry_timed_out_verifications(
 				let mut stmt = tx.prepare(
 					"SELECT f.id, f.repo_id, f.job_id
 					   FROM findings f
-					  WHERE f.state = 'dismissed'
-					    AND f.verification_required = 1
+					  WHERE f.verification_required = 1
 					    AND (?1 IS NULL OR f.repo_id = ?1)
-					    AND EXISTS (
-					      SELECT 1 FROM finding_verifications v
-					       WHERE v.finding_id = f.id
-					         AND v.job_id IS NULL
-					         AND v.verdict = 'inconclusive'
-					         AND v.notes = 'validating_deadline expired'
+					    AND (
+					      (
+					        f.state = 'dismissed'
+					        AND EXISTS (
+					          SELECT 1 FROM finding_verifications v
+					           WHERE v.finding_id = f.id
+					             AND v.job_id IS NULL
+					             AND v.verdict = 'inconclusive'
+					             AND v.notes = 'validating_deadline expired'
+					        )
+					      )
+					      OR (
+					        f.state = 'pending'
+					        AND EXISTS (
+					          SELECT 1 FROM jobs j
+					           WHERE j.id = f.job_id
+					             AND j.kind = 'scan'
+					             AND j.state IN ('succeeded', 'failed', 'cancelled')
+					             AND j.finished_at IS NOT NULL
+					        )
+					      )
 					    )
 					    AND NOT EXISTS (
 					      SELECT 1 FROM finding_verifications v
@@ -192,7 +209,7 @@ pub async fn retry_timed_out_verifications(
 				let mut rows = stmt.query((req.repo_id, limit))?;
 				let mut out = Vec::new();
 				while let Some(r) = rows.next()? {
-					out.push(TimedOutVerificationCandidate {
+					out.push(VerifyRetryCandidate {
 						finding_id: r.get(0)?,
 						repo_id: r.get(1)?,
 						parent_job_id: r.get(2)?,
@@ -201,7 +218,7 @@ pub async fn retry_timed_out_verifications(
 				out
 			};
 
-			let mut out = RetryTimedOutVerificationsResponse {
+			let mut out = RetryVerifyResponse {
 				protocol_version: PROTOCOL_VERSION,
 				dry_run: req.dry_run,
 				matched: candidates.len() as u64,
@@ -285,7 +302,7 @@ pub async fn retry_timed_out_verifications(
 						   SET state = 'validating',
 						       dismissed_at = NULL,
 						       validating_deadline = ?1
-						 WHERE id = ?2 AND state = 'dismissed'",
+						 WHERE id = ?2 AND state IN ('dismissed', 'pending')",
 						(now + super::jobs::DEFAULT_VALIDATING_BUDGET_SECS, candidate.finding_id),
 					)?;
 				}
@@ -298,9 +315,7 @@ pub async fn retry_timed_out_verifications(
 			}
 			Ok(out)
 		})
-		.map_err(|e| {
-			(StatusCode::INTERNAL_SERVER_ERROR, format!("retry timed-out verifications: {e}"))
-		})?;
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("retry verify: {e}")))?;
 
 	if !response.dry_run && response.matched > 0 {
 		state.job_arrived.notify_waiters();
