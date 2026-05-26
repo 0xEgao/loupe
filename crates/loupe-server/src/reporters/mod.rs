@@ -24,11 +24,17 @@ pub struct DispatchReceipt {
 	pub external_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportFinding {
+	pub finding: Finding,
+	pub reviewed_revision: Option<String>,
+}
+
 #[async_trait::async_trait]
 pub trait Reporter: Send + Sync {
 	fn kind(&self) -> &'static str;
 	async fn dispatch(
-		&self, repo: &RepoRow, findings: &[Finding], pat: &str,
+		&self, repo: &RepoRow, findings: &[ReportFinding], pat: &str,
 	) -> Result<DispatchReceipt>;
 }
 

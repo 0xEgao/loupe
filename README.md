@@ -28,6 +28,8 @@ mTLS:
 For the architecture in one page (component diagram, data lifecycle,
 mTLS topology), see `ARCH.md`.
 
+Join the Project Loupe Discord: https://discord.gg/d4Z58kTZF4
+
 ## Prerequisites
 
 Before installing, the host needs:

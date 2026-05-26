@@ -860,8 +860,8 @@ async fn dispatch_confirmed_rows(
 	if matches!(repo.reporting, ReportingDestination::GithubIssue { .. }) {
 		for row in confirmed_rows {
 			let finding_id = row.id;
-			let finding = finding_from_row(row);
-			let findings_for_report = [finding];
+			let report_finding = report_finding_from_row(state, row)?;
+			let findings_for_report = [report_finding];
 			let receipt = reporter.dispatch(repo, &findings_for_report, &pat).await?;
 			match scope {
 				DispatchScope::Finding(_) => tracing::info!(
@@ -881,7 +881,10 @@ async fn dispatch_confirmed_rows(
 		return Ok(());
 	}
 
-	let findings_for_report: Vec<_> = confirmed_rows.into_iter().map(finding_from_row).collect();
+	let findings_for_report: Vec<_> = confirmed_rows
+		.into_iter()
+		.map(|row| report_finding_from_row(state, row))
+		.collect::<anyhow::Result<_>>()?;
 	let receipt = reporter.dispatch(repo, &findings_for_report, &pat).await?;
 	match scope {
 		DispatchScope::Finding(finding_id) => tracing::info!(
@@ -931,6 +934,16 @@ fn finding_from_row(row: findings::FindingRow) -> loupe_core::Finding {
 		poc_unified: row.poc_unified,
 		fingerprint: row.fingerprint,
 	}
+}
+
+fn report_finding_from_row(
+	state: &AppState, row: findings::FindingRow,
+) -> anyhow::Result<reporters::ReportFinding> {
+	let job_id = row.job_id;
+	let finding = finding_from_row(row);
+	let reviewed_revision =
+		state.db.with_conn(|c| Ok(jobs::get(c, job_id)?))?.and_then(|j| j.head_sha);
+	Ok(reporters::ReportFinding { finding, reviewed_revision })
 }
 
 fn mark_reported(state: &AppState, ids: &[i64], now: i64) -> anyhow::Result<usize> {

@@ -168,6 +168,17 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 	assert!(captured.contains("To: security@example.com"));
 	assert!(captured.contains("Subject: [scan]"));
 	assert!(captured.contains("AWS access key"), "captured: {captured}");
+	let reviewed_sha: String = db
+		.with_conn(|c| {
+			Ok(c.query_row("SELECT head_sha FROM jobs WHERE repo_id = ?1", [repo_id], |r| {
+				r.get(0)
+			})?)
+		})
+		.unwrap();
+	assert!(
+		captured.contains(&format!("reviewed revision: {reviewed_sha}")),
+		"captured: {captured}"
+	);
 
 	server.shutdown().await;
 }
