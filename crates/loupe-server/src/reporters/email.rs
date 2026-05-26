@@ -9,12 +9,12 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
-use loupe_core::{Finding, ReportingDestination, Severity};
+use loupe_core::{ReportingDestination, Severity};
 use loupe_storage::repos::RepoRow;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use super::{DispatchReceipt, Reporter};
+use super::{DispatchReceipt, ReportFinding, Reporter};
 
 const DEFAULT_SENDMAIL_BIN: &str = "/usr/sbin/sendmail";
 const DEFAULT_FROM: &str = "loupe-noreply@localhost";
@@ -47,7 +47,7 @@ impl Reporter for EmailReporter {
 	}
 
 	async fn dispatch(
-		&self, repo: &RepoRow, findings: &[Finding], _pat: &str,
+		&self, repo: &RepoRow, findings: &[ReportFinding], _pat: &str,
 	) -> Result<DispatchReceipt> {
 		let (to, from, subject_prefix) = match &repo.reporting {
 			ReportingDestination::Email { to, from, subject_prefix } => {
@@ -108,7 +108,7 @@ fn validate_header_value(name: &str, value: &str) -> Result<()> {
 }
 
 fn render_message(
-	from: &str, to: &[String], subject: &str, repo: &RepoRow, findings: &[Finding],
+	from: &str, to: &[String], subject: &str, repo: &RepoRow, findings: &[ReportFinding],
 ) -> String {
 	let mut out = String::new();
 	out.push_str(&format!("From: {from}\r\n"));
@@ -123,8 +123,13 @@ fn render_message(
 		repo.owner, repo.repo, repo.clone_url
 	));
 	out.push_str(&format!("Findings: {}\n\n", findings.len()));
-	for (i, f) in findings.iter().enumerate() {
+	for (i, report_finding) in findings.iter().enumerate() {
+		let f = &report_finding.finding;
 		out.push_str(&format!("{}. [{}] {}\n", i + 1, f.severity, f.title));
+		match &report_finding.reviewed_revision {
+			Some(revision) => out.push_str(&format!("   reviewed revision: {revision}\n")),
+			None => out.push_str("   reviewed revision: not recorded\n"),
+		}
 		if let Some(path) = &f.file_path {
 			out.push_str(&format!("   file: {path}"));
 			if let Some(line) = f.line_start {
@@ -141,12 +146,14 @@ fn render_message(
 	out
 }
 
-fn max_severity(findings: &[Finding]) -> Severity {
-	findings.iter().map(|f| f.severity).max().unwrap_or(Severity::Info)
+fn max_severity(findings: &[ReportFinding]) -> Severity {
+	findings.iter().map(|f| f.finding.severity).max().unwrap_or(Severity::Info)
 }
 
 #[cfg(test)]
 mod tests {
+	use loupe_core::Finding;
+
 	use super::*;
 
 	fn repo_with_email(
@@ -187,6 +194,10 @@ mod tests {
 		}
 	}
 
+	fn report_finding() -> ReportFinding {
+		ReportFinding { finding: finding(), reviewed_revision: Some("abc123".into()) }
+	}
+
 	#[tokio::test]
 	async fn dispatch_rejects_header_injection_values() {
 		let reporter = EmailReporter::with_bin("/definitely/missing/sendmail");
@@ -209,7 +220,8 @@ mod tests {
 		];
 
 		for repo in cases {
-			let err = reporter.dispatch(&repo, &[finding()], "").await.expect_err("must reject");
+			let err =
+				reporter.dispatch(&repo, &[report_finding()], "").await.expect_err("must reject");
 			let msg = err.to_string();
 			assert!(msg.contains("header contains a newline"), "got: {msg}");
 		}

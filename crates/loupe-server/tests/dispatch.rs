@@ -227,12 +227,24 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 	assert_eq!(issue.repo, "tracker");
 	assert_eq!(issue.auth, "Bearer ghp_test_pat_value");
 	let body_str = issue.body.to_string();
+	let issue_body = issue.body["body"].as_str().expect("issue body string");
 	assert_eq!(
 		issue.body["labels"],
 		serde_json::json!(["loupe", "severity:high"]),
 		"issue body: {body_str}"
 	);
 	assert!(body_str.contains("AWS access key"), "issue body: {body_str}");
+	let reviewed_sha: String = db
+		.with_conn(|c| {
+			Ok(c.query_row("SELECT head_sha FROM jobs WHERE repo_id = ?1", [repo_id], |r| {
+				r.get(0)
+			})?)
+		})
+		.unwrap();
+	assert!(
+		issue_body.contains(&format!("- reviewed revision: `{reviewed_sha}`")),
+		"issue body: {issue_body}"
+	);
 
 	let labels = stub_state.labels.lock().unwrap().clone();
 	assert_eq!(labels.len(), 1);

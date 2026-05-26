@@ -10,7 +10,7 @@ use loupe_storage::repos::RepoRow;
 use reqwest::{StatusCode, Url};
 use serde::Serialize;
 
-use super::{DispatchReceipt, Reporter};
+use super::{DispatchReceipt, ReportFinding, Reporter};
 
 const DEFAULT_API_BASE: &str = "https://api.github.com";
 const MAX_TITLE_CHARS: usize = 100;
@@ -68,7 +68,7 @@ impl Reporter for GithubReporter {
 	}
 
 	async fn dispatch(
-		&self, repo: &RepoRow, findings: &[Finding], pat: &str,
+		&self, repo: &RepoRow, findings: &[ReportFinding], pat: &str,
 	) -> Result<DispatchReceipt> {
 		let (target_owner, target_repo) = match &repo.reporting {
 			ReportingDestination::GithubIssue { target_owner, target_repo, .. } => {
@@ -81,11 +81,12 @@ impl Reporter for GithubReporter {
 		}
 
 		let mut external_ids = Vec::new();
-		for finding in findings {
+		for report_finding in findings {
+			let finding = &report_finding.finding;
 			let severity = severity_label(finding.severity);
 			self.ensure_label(target_owner, target_repo, pat, severity).await?;
 			let title = render_title(finding);
-			let body = render_body(repo, finding);
+			let body = render_body(repo, report_finding);
 			let labels = vec!["loupe".to_owned(), severity.name.to_owned()];
 
 			let resp = self
@@ -208,10 +209,15 @@ fn compact_title(raw: &str) -> String {
 	truncated
 }
 
-fn render_body(repo: &RepoRow, finding: &Finding) -> String {
+fn render_body(repo: &RepoRow, report_finding: &ReportFinding) -> String {
+	let finding = &report_finding.finding;
 	let mut out = String::new();
 	out.push_str("## Finding\n\n");
 	out.push_str(&format!("- repo: `{}/{}` (`{}`)\n", repo.owner, repo.repo, repo.clone_url));
+	match &report_finding.reviewed_revision {
+		Some(revision) => out.push_str(&format!("- reviewed revision: `{revision}`\n")),
+		None => out.push_str("- reviewed revision: _not recorded_\n"),
+	}
 	out.push_str(&format!("- title: {}\n", finding.title));
 	out.push_str(&format!("- severity: `{}`\n", finding.severity));
 	if let Some(location) = render_location(finding) {
@@ -326,9 +332,13 @@ mod tests {
 
 	#[test]
 	fn body_describes_one_finding_not_a_scan_batch() {
-		let body = render_body(&repo(), &finding());
+		let body = render_body(
+			&repo(),
+			&ReportFinding { finding: finding(), reviewed_revision: Some("abc123".into()) },
+		);
 		assert!(body.starts_with("## Finding\n\n"));
 		assert!(body.contains("- repo: `acme/widget` (`https://github.com/acme/widget.git`)"));
+		assert!(body.contains("- reviewed revision: `abc123`"));
 		assert!(body.contains("- title: Out-of-bounds index in idx"));
 		assert!(body.contains("- severity: `high`"));
 		assert!(body.contains("- location: `src/lib.rs:4-6`"));
