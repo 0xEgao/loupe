@@ -93,6 +93,51 @@ pub fn list_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<Vec<Find
 	rows.collect()
 }
 
+pub fn transition_scan_findings_after_success(
+	conn: &Connection, job_id: i64, require_approval: bool, validating_deadline: i64, now: i64,
+) -> rusqlite::Result<usize> {
+	let source_state = FindingState::Pending;
+	let auto_transition = if require_approval {
+		FindingTransition::ScanAwaitApproval
+	} else {
+		FindingTransition::ScanAutoConfirm
+	};
+	let auto_target = source_state.apply(auto_transition).map_err(sql_state_transition_error)?;
+	let verify_target = source_state
+		.apply(FindingTransition::ScanRequireVerification)
+		.map_err(sql_state_transition_error)?;
+
+	let auto_count = if require_approval {
+		conn.execute(
+			"UPDATE findings
+			   SET state = ?1
+			 WHERE job_id = ?2 AND verification_required = 0 AND state = ?3",
+			(auto_target.as_str(), job_id, source_state.as_str()),
+		)?
+	} else {
+		conn.execute(
+			"UPDATE findings
+			   SET state = ?1, confirmed_at = ?2
+			 WHERE job_id = ?3 AND verification_required = 0 AND state = ?4",
+			(auto_target.as_str(), now, job_id, source_state.as_str()),
+		)?
+	};
+	let verify_count = conn.execute(
+		"UPDATE findings
+		   SET state = ?1, validating_deadline = ?2
+		 WHERE job_id = ?3 AND verification_required = 1 AND state = ?4",
+		(verify_target.as_str(), validating_deadline, job_id, source_state.as_str()),
+	)?;
+	Ok(auto_count + verify_count)
+}
+
+pub fn delete_pending_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<usize> {
+	conn.execute(
+		"DELETE FROM findings WHERE job_id = ?1 AND state = ?2",
+		(job_id, FindingState::Pending.as_str()),
+	)
+}
+
 /// Reap findings whose `validating_deadline` has elapsed without
 /// enough verdicts to flip state. Each reaped finding gets a
 /// system-issued `inconclusive` verdict in `finding_verifications`

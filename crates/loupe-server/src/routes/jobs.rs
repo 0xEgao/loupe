@@ -712,55 +712,16 @@ pub async fn complete(
 					),
 				)?;
 
-				// Transition each finding produced by this scan. The
-				// auto-pass branch (verification_required = 0) lands on
-				// either `confirmed` (dispatcher picks up later) or
-				// `awaiting_approval` (parked until a human runs
-				// `loupectl finding approve`), driven by the repo's
-				// effective `require_approval`. `confirmed_at` is only
-				// stamped on the `confirmed` path — `awaiting_approval`
-				// stamps `approved_at` later when (and if) approved.
-				if require_approval {
-					tx.execute(
-						"UPDATE findings
-						   SET state = 'awaiting_approval'
-						 WHERE job_id = ?1 AND verification_required = 0 AND state = 'pending'",
-						[job_id],
-					)?;
-				} else {
-					tx.execute(
-						"UPDATE findings
-						   SET state = 'confirmed', confirmed_at = ?1
-						 WHERE job_id = ?2 AND verification_required = 0 AND state = 'pending'",
-						(now, job_id),
-					)?;
-				}
-				tx.execute(
-					"UPDATE findings
-					   SET state = 'validating', validating_deadline = ?1
-					 WHERE job_id = ?2 AND verification_required = 1 AND state = 'pending'",
-					(now + DEFAULT_VALIDATING_BUDGET_SECS, job_id),
+				findings::transition_scan_findings_after_success(
+					&tx,
+					job_id,
+					require_approval,
+					now + DEFAULT_VALIDATING_BUDGET_SECS,
+					now,
 				)?;
-
-				// Enqueue one verify job per finding now in 'validating'
-				// for this scan. We use a stand-alone INSERT…SELECT so
-				// the verify-job rows go in inside the same transaction
-				// as the state flips.
-				tx.execute(
-					"INSERT INTO jobs
-					   (repo_id, kind, state, incremental, parent_job_id,
-					    target_finding_id, enqueued_at)
-					 SELECT ?1, 'verify', 'queued', 0, ?2, id, ?3
-					 FROM findings
-					 WHERE job_id = ?2 AND state = 'validating'",
-					(job.repo_id, job_id, now),
-				)?;
+				jobs::enqueue_verify_jobs_for_scan(&tx, job.repo_id, job_id, now)?;
 			} else if matches!(new_state, JobState::Failed) && job.kind == JobKind::Scan {
-				tx.execute(
-					"DELETE FROM findings
-					 WHERE job_id = ?1 AND state = 'pending'",
-					[job_id],
-				)?;
+				findings::delete_pending_for_job(&tx, job_id)?;
 			}
 			tx.commit()?;
 			Ok(true)
@@ -967,18 +928,6 @@ fn report_finding_from_row(
 }
 
 fn mark_reported(state: &AppState, ids: &[i64], now: i64) -> anyhow::Result<usize> {
-	let n = state.db.with_conn(|c| {
-		let tx = c.transaction()?;
-		let mut n = 0usize;
-		for id in ids {
-			n += tx.execute(
-				"UPDATE findings SET reported_at = ?1, state = 'reported'
-				 WHERE id = ?2 AND state = 'confirmed'",
-				(now, id),
-			)?;
-		}
-		tx.commit()?;
-		Ok(n)
-	})?;
+	let n = state.db.with_conn(|c| Ok(findings::mark_reported(c, ids, now)?))?;
 	Ok(n)
 }

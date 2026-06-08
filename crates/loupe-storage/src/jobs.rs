@@ -5,7 +5,9 @@
 //! `JobKind::as_str` exactly so callers can shuttle them through SQL
 //! without having to define their own constants.
 
-use loupe_core::{initial_job_state, JobKind, JobState, JobTransition, StateTransitionError};
+use loupe_core::{
+	initial_job_state, FindingState, JobKind, JobState, JobTransition, StateTransitionError,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// Lease lifetime in seconds. Worker must heartbeat or complete before
@@ -205,11 +207,34 @@ pub fn cancel(conn: &mut Connection, job_id: i64, now: i64) -> rusqlite::Result<
 		return Ok(CancelOutcome::NotCancellable(state));
 	}
 	if row.kind == JobKind::Scan {
-		tx.execute("DELETE FROM findings WHERE job_id = ?1 AND state = 'pending'", [job_id])?;
+		crate::findings::delete_pending_for_job(&tx, job_id)?;
 	}
 	let row = get(&tx, job_id)?.expect("cancelled job row still exists");
 	tx.commit()?;
 	Ok(CancelOutcome::Cancelled(row))
+}
+
+pub fn enqueue_verify_jobs_for_scan(
+	conn: &Connection, repo_id: i64, scan_job_id: i64, now: i64,
+) -> rusqlite::Result<usize> {
+	let initial_state =
+		initial_job_state(JobTransition::Enqueue).map_err(sql_state_transition_error)?;
+	conn.execute(
+		"INSERT INTO jobs
+		   (repo_id, kind, state, incremental, parent_job_id,
+		    target_finding_id, enqueued_at)
+		 SELECT ?1, ?2, ?3, 0, ?4, id, ?5
+		 FROM findings
+		 WHERE job_id = ?4 AND state = ?6",
+		params![
+			repo_id,
+			JobKind::Verify.as_str(),
+			initial_state.as_str(),
+			scan_job_id,
+			now,
+			FindingState::Validating.as_str(),
+		],
+	)
 }
 
 pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
@@ -312,7 +337,7 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		params![now, MAX_ATTEMPTS, failed_state.as_str()],
 	)?;
 	for job_id in failing_scan_jobs {
-		conn.execute("DELETE FROM findings WHERE job_id = ?1 AND state = 'pending'", [job_id])?;
+		crate::findings::delete_pending_for_job(conn, job_id)?;
 	}
 	Ok(requeued + failed)
 }
