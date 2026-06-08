@@ -227,6 +227,44 @@ impl RepoCache {
 		Ok(EnsuredRepo { path, _pin: pin })
 	}
 
+	/// Delete and freshly clone `key`, returning a pinned clone. Used
+	/// when a checkout discovers the cache lacks a required commit
+	/// even after the normal refresh path completed.
+	pub async fn reclone_repo(
+		self: &Arc<Self>, key: &RepoKey, clone_url: &str, token: Option<&str>,
+	) -> Result<EnsuredRepo> {
+		let path = self.repo_path(key);
+		let lock = self.repo_lock(key);
+		let _guard = lock.lock().await;
+
+		if let Err(e) = std::fs::remove_dir_all(&path) {
+			if path.exists() {
+				return Err(e)
+					.with_context(|| format!("failed to remove cached repo {}", path.display()));
+			}
+		}
+		self.evict_if_needed()?;
+		if let Some(parent) = path.parent() {
+			std::fs::create_dir_all(parent).with_context(|| {
+				format!("failed to create cache parent dir: {}", parent.display())
+			})?;
+		}
+		info!(host = %key.host, owner = %key.owner, repo = %key.repo, "re-cloning bare repo");
+		let started = std::time::Instant::now();
+		self.do_clone(&path, clone_url, token).await?;
+		info!(
+			host = %key.host, owner = %key.owner, repo = %key.repo,
+			elapsed_ms = started.elapsed().as_millis() as u64,
+			"re-cloned bare repo",
+		);
+
+		if let Ok(mut log) = self.access_log.lock() {
+			log.insert(key.clone(), SystemTime::now());
+		}
+		let pin = self.pin(key);
+		Ok(EnsuredRepo { path, _pin: pin })
+	}
+
 	async fn do_clone(&self, path: &Path, clone_url: &str, token: Option<&str>) -> Result<()> {
 		let path = path.to_owned();
 		let clone_url = clone_url.to_owned();
@@ -312,7 +350,16 @@ impl RepoCache {
 				cmd.args(["-c", &format!("remote.origin.url={}", with_token.as_str())]);
 			}
 		}
-		cmd.args(["fetch", "--quiet", "--prune", "--tags", "origin"]);
+		cmd.args([
+			"fetch",
+			"--quiet",
+			"--prune",
+			"--tags",
+			"origin",
+			"+refs/heads/*:refs/heads/*",
+			"+refs/heads/*:refs/remotes/origin/*",
+			"+HEAD:refs/remotes/origin/HEAD",
+		]);
 		let output = cmd.output().context("spawning git fetch")?;
 		if !output.status.success() {
 			let stderr = String::from_utf8_lossy(&output.stderr);
@@ -466,7 +513,45 @@ pub fn dir_size(path: &Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
+	use std::process::Command;
+	use std::sync::Arc;
+
 	use super::*;
+
+	fn git(dir: &Path, args: &[&str]) -> String {
+		let output = Command::new("git").current_dir(dir).args(args).output().unwrap();
+		assert!(
+			output.status.success(),
+			"git {:?} in {} failed: {}",
+			args,
+			dir.display(),
+			String::from_utf8_lossy(&output.stderr)
+		);
+		String::from_utf8_lossy(&output.stdout).trim().to_owned()
+	}
+
+	fn init_git_repo(path: &Path) {
+		std::fs::create_dir_all(path).unwrap();
+		let output = Command::new("git")
+			.current_dir(path)
+			.args(["init", "-q", "-b", "main"])
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"git init failed: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		git(path, &["config", "user.email", "loupe-test@example.com"]);
+		git(path, &["config", "user.name", "loupe-test"]);
+	}
+
+	fn commit_file(repo: &Path, contents: &str, message: &str) -> String {
+		std::fs::write(repo.join("file.txt"), contents).unwrap();
+		git(repo, &["add", "file.txt"]);
+		git(repo, &["commit", "-q", "-m", message]);
+		git(repo, &["rev-parse", "HEAD"])
+	}
 
 	#[test]
 	fn inject_token_rewrites_https_only() {
@@ -496,6 +581,66 @@ mod tests {
 		let cache = RepoCache::new(tmp.path().to_path_buf(), u64::MAX).unwrap();
 		let path = cache.repo_path(&RepoKey::new("github.com", "acme", "widget"));
 		assert_eq!(path, tmp.path().join("github.com").join("acme").join("widget.git"));
+	}
+
+	#[test]
+	fn fetch_bare_advances_branch_and_remote_head_refs() {
+		let remote_tmp = tempfile::tempdir().unwrap();
+		init_git_repo(remote_tmp.path());
+		commit_file(remote_tmp.path(), "one\n", "one");
+
+		let cache_tmp = tempfile::tempdir().unwrap();
+		let bare = cache_tmp.path().join("cache.git");
+		let url = format!("file://{}", remote_tmp.path().display());
+		RepoCache::clone_bare(&bare, &url, None).unwrap();
+
+		let second = commit_file(remote_tmp.path(), "two\n", "two");
+		RepoCache::fetch_bare(&bare, None).unwrap();
+
+		assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), second);
+		assert_eq!(git(&bare, &["rev-parse", "refs/remotes/origin/main"]), second);
+		assert_eq!(git(&bare, &["rev-parse", "refs/remotes/origin/HEAD"]), second);
+	}
+
+	#[tokio::test]
+	async fn ensure_repo_reclones_when_cache_dir_was_evicted() {
+		let remote_tmp = tempfile::tempdir().unwrap();
+		init_git_repo(remote_tmp.path());
+		let head = commit_file(remote_tmp.path(), "one\n", "one");
+
+		let cache_tmp = tempfile::tempdir().unwrap();
+		let cache = Arc::new(RepoCache::new(cache_tmp.path().to_path_buf(), u64::MAX).unwrap());
+		let key = RepoKey::new("local", "local", "repo");
+		let url = format!("file://{}", remote_tmp.path().display());
+
+		let first = cache.ensure_repo(&key, &url, None).await.unwrap();
+		let bare = first.path.clone();
+		drop(first);
+		std::fs::remove_dir_all(&bare).unwrap();
+
+		let second = cache.ensure_repo(&key, &url, None).await.unwrap();
+		assert!(second.path.exists());
+		assert_eq!(git(&second.path, &["rev-parse", "HEAD"]), head);
+	}
+
+	#[tokio::test]
+	async fn reclone_repo_replaces_stale_cache_with_fresh_clone() {
+		let remote_tmp = tempfile::tempdir().unwrap();
+		init_git_repo(remote_tmp.path());
+		commit_file(remote_tmp.path(), "one\n", "one");
+
+		let cache_tmp = tempfile::tempdir().unwrap();
+		let cache = Arc::new(RepoCache::new(cache_tmp.path().to_path_buf(), u64::MAX).unwrap());
+		let key = RepoKey::new("local", "local", "repo");
+		let url = format!("file://{}", remote_tmp.path().display());
+
+		let first = cache.ensure_repo(&key, &url, None).await.unwrap();
+		assert!(first.path.exists());
+		drop(first);
+
+		let second_head = commit_file(remote_tmp.path(), "two\n", "two");
+		let fresh = cache.reclone_repo(&key, &url, None).await.unwrap();
+		assert_eq!(git(&fresh.path, &["rev-parse", "HEAD"]), second_head);
 	}
 
 	#[test]
