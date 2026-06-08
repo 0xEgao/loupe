@@ -55,6 +55,13 @@ pub enum CancelOutcome {
 	NotCancellable(JobState),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryOutcome {
+	Retried(JobRow),
+	NotFound,
+	Conflict(String),
+}
+
 /// Insert a `queued` job, returning the new id.
 pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> rusqlite::Result<i64> {
 	let initial_state =
@@ -235,6 +242,81 @@ pub fn enqueue_verify_jobs_for_scan(
 			FindingState::Validating.as_str(),
 		],
 	)
+}
+
+pub fn retry_failed(
+	conn: &mut Connection, job_id: i64, now: i64, validating_deadline: i64,
+) -> rusqlite::Result<RetryOutcome> {
+	let tx = conn.transaction()?;
+	let Some(row) = get(&tx, job_id)? else { return Ok(RetryOutcome::NotFound) };
+	if row.state != JobState::Failed {
+		return Ok(RetryOutcome::Conflict(format!("job {job_id} is {:?}, not failed", row.state)));
+	}
+	if row.kind == JobKind::Verify {
+		let Some(finding_id) = row.target_finding_id else {
+			return Ok(RetryOutcome::Conflict(format!(
+				"verify job {job_id} has no target finding"
+			)));
+		};
+		let Some(finding) = crate::findings::get(&tx, finding_id)? else {
+			return Ok(RetryOutcome::Conflict(format!(
+				"verify job {job_id} target finding {finding_id} no longer exists"
+			)));
+		};
+		match finding.state {
+			FindingState::Validating => {},
+			FindingState::Dismissed => {
+				if !crate::findings::is_deadline_dismissed_without_terminal_verdict(
+					&tx, finding_id,
+				)? {
+					return Ok(RetryOutcome::Conflict(format!(
+						"verify job {job_id} target finding {finding_id} is dismissed by a terminal verdict"
+					)));
+				}
+			},
+			other => {
+				return Ok(RetryOutcome::Conflict(format!(
+					"verify job {job_id} target finding {finding_id} is {other}, not validating"
+				)));
+			},
+		}
+		if !crate::findings::retry_verification(&tx, finding_id, validating_deadline)? {
+			return Ok(RetryOutcome::Conflict(format!(
+				"verify job {job_id} target finding {finding_id} changed before retry"
+			)));
+		}
+	}
+
+	let Some(row) = requeue_failed(&tx, job_id, now)? else {
+		return Ok(RetryOutcome::Conflict(format!("job {job_id} changed before retry")));
+	};
+	tx.commit()?;
+	Ok(RetryOutcome::Retried(row))
+}
+
+pub fn requeue_failed(
+	conn: &Connection, job_id: i64, now: i64,
+) -> rusqlite::Result<Option<JobRow>> {
+	let target_state =
+		JobState::Failed.apply(JobTransition::Retry).map_err(sql_state_transition_error)?;
+	let updated = conn.execute(
+		"UPDATE jobs
+		   SET state = ?1,
+		       worker_id = NULL,
+		       lease_expires_at = NULL,
+		       attempts = 0,
+		       started_at = NULL,
+		       finished_at = NULL,
+		       error = NULL,
+		       head_sha = NULL,
+		       enqueued_at = ?2
+		 WHERE id = ?3 AND state = ?4",
+		(target_state.as_str(), now, job_id, JobState::Failed.as_str()),
+	)?;
+	if updated == 0 {
+		return Ok(None);
+	}
+	get(conn, job_id)
 }
 
 pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {

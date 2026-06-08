@@ -62,12 +62,6 @@ fn job_to_info(row: &JobRow) -> JobInfo {
 	}
 }
 
-enum RetryJobResult {
-	Retried(JobRow),
-	NotFound,
-	Conflict(String),
-}
-
 /// `POST /v1/repos/:id/scan` — admin enqueues a scan job for `id`.
 pub async fn enqueue_scan(
 	State(state): State<AppState>, Path(repo_id): Path<i64>, Json(req): Json<ScanRequest>,
@@ -142,107 +136,18 @@ pub async fn retry(
 	let now = now_secs();
 	let result = state
 		.db
-		.with_conn(|c| {
-			let tx = c.transaction()?;
-			let Some(row) = jobs::get(&tx, id)? else {
-				return Ok(RetryJobResult::NotFound);
-			};
-			if row.state != JobState::Failed {
-				return Ok(RetryJobResult::Conflict(format!(
-					"job {id} is {:?}, not failed",
-					row.state
-				)));
-			}
-			if row.kind == JobKind::Verify {
-				let Some(finding_id) = row.target_finding_id else {
-					return Ok(RetryJobResult::Conflict(format!(
-						"verify job {id} has no target finding"
-					)));
-				};
-				let Some(finding) = findings::get(&tx, finding_id)? else {
-					return Ok(RetryJobResult::Conflict(format!(
-						"verify job {id} target finding {finding_id} no longer exists"
-					)));
-				};
-				let deadline = now + DEFAULT_VALIDATING_BUDGET_SECS;
-				match finding.state {
-					FindingState::Validating => {},
-					FindingState::Dismissed => {
-						let deadline_dismissed_without_terminal_verdict: bool = tx.query_row(
-							"SELECT
-							    EXISTS(
-							      SELECT 1 FROM finding_verifications
-							       WHERE finding_id = ?1
-							         AND job_id IS NULL
-							         AND verdict = 'inconclusive'
-							         AND notes = 'validating_deadline expired'
-							    )
-							    AND NOT EXISTS(
-							      SELECT 1 FROM finding_verifications
-							       WHERE finding_id = ?1
-							         AND verdict IN ('confirmed', 'dismissed')
-							    )",
-							[finding_id],
-							|r| r.get(0),
-						)?;
-						if !deadline_dismissed_without_terminal_verdict {
-							return Ok(RetryJobResult::Conflict(format!(
-								"verify job {id} target finding {finding_id} is dismissed by a terminal verdict"
-							)));
-						}
-						tx.execute(
-							"UPDATE findings
-							   SET state = 'validating',
-							       dismissed_at = NULL,
-							       validating_deadline = ?1
-							 WHERE id = ?2 AND state = 'dismissed'",
-							(deadline, finding_id),
-						)?;
-					},
-					other => {
-						return Ok(RetryJobResult::Conflict(format!(
-							"verify job {id} target finding {finding_id} is {other}, not validating"
-						)));
-					},
-				}
-				tx.execute(
-					"UPDATE findings
-					   SET validating_deadline = ?1
-					 WHERE id = ?2 AND state = 'validating'",
-					(deadline, finding_id),
-				)?;
-			}
-
-			let updated = tx.execute(
-				"UPDATE jobs
-				   SET state = 'queued',
-				       worker_id = NULL,
-				       lease_expires_at = NULL,
-				       attempts = 0,
-				       started_at = NULL,
-				       finished_at = NULL,
-				       error = NULL,
-				       head_sha = NULL,
-				       enqueued_at = ?2
-				 WHERE id = ?1 AND state = 'failed'",
-				(id, now),
-			)?;
-			if updated == 0 {
-				return Ok(RetryJobResult::Conflict(format!("job {id} changed before retry")));
-			}
-			let row = jobs::get(&tx, id)?.expect("updated job row still exists");
-			tx.commit()?;
-			Ok(RetryJobResult::Retried(row))
-		})
+		.with_conn(|c| Ok(jobs::retry_failed(c, id, now, now + DEFAULT_VALIDATING_BUDGET_SECS)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("retry job: {e}")))?;
 
 	match result {
-		RetryJobResult::Retried(row) => {
+		jobs::RetryOutcome::Retried(row) => {
 			state.job_arrived.notify_waiters();
 			Ok(Json(job_to_info(&row)))
 		},
-		RetryJobResult::NotFound => Err((StatusCode::NOT_FOUND, format!("no job with id {id}"))),
-		RetryJobResult::Conflict(msg) => Err((StatusCode::CONFLICT, msg)),
+		jobs::RetryOutcome::NotFound => {
+			Err((StatusCode::NOT_FOUND, format!("no job with id {id}")))
+		},
+		jobs::RetryOutcome::Conflict(msg) => Err((StatusCode::CONFLICT, msg)),
 	}
 }
 

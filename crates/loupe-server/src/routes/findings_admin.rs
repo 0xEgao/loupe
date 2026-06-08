@@ -200,7 +200,7 @@ pub async fn retry_verify(
 						           WHERE v.finding_id = f.id
 						             AND v.job_id IS NULL
 						             AND v.verdict = 'inconclusive'
-						             AND v.notes = 'validating_deadline expired'
+						             AND v.notes = ?4
 						        )
 						      )
 						      OR (
@@ -232,7 +232,12 @@ pub async fn retry_verify(
 						  ORDER BY COALESCE(f.validating_deadline, f.created_at), f.id
 						  LIMIT ?2",
 				)?;
-				let mut rows = stmt.query((req.repo_id, limit, req.include_inconclusive as i64))?;
+				let mut rows = stmt.query((
+					req.repo_id,
+					limit,
+					req.include_inconclusive as i64,
+					findings::VALIDATING_DEADLINE_EXPIRED_NOTE,
+				))?;
 				let mut out = Vec::new();
 				while let Some(r) = rows.next()? {
 					out.push(VerifyRetryCandidate {
@@ -290,20 +295,7 @@ pub async fn retry_verify(
 					if let Some(job_id) = failed_job_id {
 						out.requeued_jobs += 1;
 						if !req.dry_run {
-							tx.execute(
-								"UPDATE jobs
-								   SET state = 'queued',
-								       worker_id = NULL,
-								       lease_expires_at = NULL,
-								       attempts = 0,
-								       started_at = NULL,
-								       finished_at = NULL,
-								       error = NULL,
-								       head_sha = NULL,
-								       enqueued_at = ?2
-								 WHERE id = ?1 AND state = 'failed'",
-								(job_id, now),
-							)?;
+							jobs::requeue_failed(&tx, job_id, now)?;
 						}
 					} else {
 						out.created_jobs += 1;
@@ -325,13 +317,10 @@ pub async fn retry_verify(
 				}
 
 				if !req.dry_run {
-					tx.execute(
-						"UPDATE findings
-							   SET state = 'validating',
-							       dismissed_at = NULL,
-							       validating_deadline = ?1
-							 WHERE id = ?2 AND state IN ('dismissed', 'pending', 'validating')",
-						(now + super::jobs::DEFAULT_VALIDATING_BUDGET_SECS, candidate.finding_id),
+					findings::retry_verification(
+						&tx,
+						candidate.finding_id,
+						now + super::jobs::DEFAULT_VALIDATING_BUDGET_SECS,
 					)?;
 				}
 			}

@@ -6,6 +6,8 @@ use loupe_core::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
+pub const VALIDATING_DEADLINE_EXPIRED_NOTE: &str = "validating_deadline expired";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindingRow {
 	pub id: i64,
@@ -163,8 +165,8 @@ pub fn reap_stale_validating(conn: &mut Connection, now: i64) -> rusqlite::Resul
 		tx.execute(
 			"INSERT INTO finding_verifications
 			   (finding_id, job_id, verdict, notes, created_at)
-			 VALUES (?1, NULL, 'inconclusive', 'validating_deadline expired', ?2)",
-			(fid, now),
+			 VALUES (?1, NULL, 'inconclusive', ?2, ?3)",
+			(fid, VALIDATING_DEADLINE_EXPIRED_NOTE, now),
 		)?;
 		tx.execute(
 			"UPDATE findings SET state = ?1, dismissed_at = ?2
@@ -209,6 +211,47 @@ pub fn roll_up_verdicts_for_finding(
 		(next_state.as_str(), now, finding_id),
 	)?;
 	Ok(Some(next_state))
+}
+
+pub fn is_deadline_dismissed_without_terminal_verdict(
+	conn: &Connection, finding_id: i64,
+) -> rusqlite::Result<bool> {
+	conn.query_row(
+		"SELECT
+		    EXISTS(
+		      SELECT 1 FROM finding_verifications
+		       WHERE finding_id = ?1
+		         AND job_id IS NULL
+		         AND verdict = 'inconclusive'
+		         AND notes = ?2
+		    )
+		    AND NOT EXISTS(
+		      SELECT 1 FROM finding_verifications
+		       WHERE finding_id = ?1
+		         AND verdict IN ('confirmed', 'dismissed')
+		    )",
+		(finding_id, VALIDATING_DEADLINE_EXPIRED_NOTE),
+		|r| r.get(0),
+	)
+}
+
+pub fn retry_verification(
+	conn: &Connection, finding_id: i64, validating_deadline: i64,
+) -> rusqlite::Result<bool> {
+	let Some(row) = get(conn, finding_id)? else { return Ok(false) };
+	let target_state = row
+		.state
+		.apply(FindingTransition::RetryVerification)
+		.map_err(sql_state_transition_error)?;
+	let updated = conn.execute(
+		"UPDATE findings
+		   SET state = ?1,
+		       dismissed_at = NULL,
+		       validating_deadline = ?2
+		 WHERE id = ?3 AND state = ?4",
+		(target_state.as_str(), validating_deadline, finding_id, row.state.as_str()),
+	)?;
+	Ok(updated > 0)
 }
 
 /// List findings for one repo, most recent first. `limit` caps the
