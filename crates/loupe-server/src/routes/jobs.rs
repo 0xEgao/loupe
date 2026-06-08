@@ -651,6 +651,40 @@ pub async fn complete(
 	if job.state != JobState::Leased || job.worker_id != Some(worker.id()) {
 		return Err((StatusCode::FORBIDDEN, "no leased job for this worker".into()));
 	}
+	if matches!(new_state, JobState::Succeeded) {
+		match job.kind {
+			JobKind::Scan => {
+				if req.head_sha.as_deref().map(str::trim).filter(|sha| !sha.is_empty()).is_none() {
+					return Err((
+						StatusCode::BAD_REQUEST,
+						"successful scan completion requires non-empty head_sha".into(),
+					));
+				}
+			},
+			JobKind::Verify => {
+				let has_verdict = state
+					.db
+					.with_conn(|c| {
+						Ok(c.query_row(
+							"SELECT EXISTS(
+							   SELECT 1 FROM finding_verifications WHERE job_id = ?1
+							 )",
+							[job_id],
+							|r| r.get::<_, bool>(0),
+						)?)
+					})
+					.map_err(|e| {
+						(StatusCode::INTERNAL_SERVER_ERROR, format!("check verdict: {e}"))
+					})?;
+				if !has_verdict {
+					return Err((
+						StatusCode::CONFLICT,
+						"successful verify completion requires a submitted verdict".into(),
+					));
+				}
+			},
+		}
+	}
 
 	// Resolve effective approval mode once, outside the tx, so the
 	// state-transition SQL can branch on it. `dispatch_for_job` later

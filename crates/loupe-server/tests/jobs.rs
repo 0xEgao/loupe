@@ -417,6 +417,214 @@ async fn failed_scan_discards_pending_findings_so_retry_can_insert_them() {
 }
 
 #[tokio::test]
+async fn scan_success_without_head_sha_is_rejected_without_mutating_job() {
+	let f = bring_up_with_repo_and_worker().await;
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let env = lease_job(&f.worker).await;
+	assert_eq!(env.job_id, scan.job_id);
+
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Succeeded,
+			head_sha: None,
+			error: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	let status = resp.status();
+	let body = resp.text().await.unwrap_or_default();
+	assert_eq!(status, 400, "{body}");
+	assert!(body.contains("head_sha"), "response should explain missing head_sha: {body}");
+
+	let (state, finished_at, lease_expires_at, history_count): (
+		String,
+		Option<i64>,
+		Option<i64>,
+		i64,
+	) = f.db
+		.with_conn(|c| {
+			let (state, finished_at, lease_expires_at) = c.query_row(
+				"SELECT state, finished_at, lease_expires_at FROM jobs WHERE id = ?1",
+				[env.job_id],
+				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+			)?;
+			let history_count = c.query_row(
+				"SELECT COUNT(*) FROM scan_history WHERE job_id = ?1",
+				[env.job_id],
+				|r| r.get(0),
+			)?;
+			Ok((state, finished_at, lease_expires_at, history_count))
+		})
+		.unwrap();
+	assert_eq!(state, "leased");
+	assert!(finished_at.is_none());
+	assert!(lease_expires_at.is_some());
+	assert_eq!(history_count, 0);
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn verify_success_without_verdict_is_rejected_without_mutating_job() {
+	let f = bring_up_with_repo_and_worker().await;
+	f.db.with_conn(|c| {
+		Ok(c.execute(
+			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
+			[f.repo_id],
+		)?)
+	})
+	.unwrap();
+
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let scan_env = lease_job(&f.worker).await;
+	assert_eq!(scan_env.job_id, scan.job_id);
+	submit_finding(&f.worker, scan_env.job_id, finding("Needs verdict", "fp-needs-verdict")).await;
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Succeeded,
+			head_sha: Some("abc123".into()),
+			error: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let verify_env = lease_verify_job(&f.worker).await;
+	let finding_id = match &verify_env.payload {
+		LeasePayload::Verify { finding_id, .. } => *finding_id,
+		other => panic!("expected verify payload, got {other:?}"),
+	};
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", verify_env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Succeeded,
+			head_sha: Some("abc123".into()),
+			error: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	let status = resp.status();
+	let body = resp.text().await.unwrap_or_default();
+	assert_eq!(status, 409, "{body}");
+	assert!(body.contains("verdict"), "response should explain missing verdict: {body}");
+
+	let (job_state, finding_state, verdict_count): (String, String, i64) =
+		f.db.with_conn(|c| {
+			let job_state =
+				c.query_row("SELECT state FROM jobs WHERE id = ?1", [verify_env.job_id], |r| {
+					r.get(0)
+				})?;
+			let finding_state =
+				c.query_row("SELECT state FROM findings WHERE id = ?1", [finding_id], |r| {
+					r.get(0)
+				})?;
+			let verdict_count = c.query_row(
+				"SELECT COUNT(*) FROM finding_verifications WHERE job_id = ?1",
+				[verify_env.job_id],
+				|r| r.get(0),
+			)?;
+			Ok((job_state, finding_state, verdict_count))
+		})
+		.unwrap();
+	assert_eq!(job_state, "leased");
+	assert_eq!(finding_state, "validating");
+	assert_eq!(verdict_count, 0);
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn verify_success_after_verdict_is_still_accepted() {
+	let f = bring_up_with_repo_and_worker().await;
+	f.db.with_conn(|c| {
+		Ok(c.execute(
+			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
+			[f.repo_id],
+		)?)
+	})
+	.unwrap();
+
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let scan_env = lease_job(&f.worker).await;
+	assert_eq!(scan_env.job_id, scan.job_id);
+	submit_finding(&f.worker, scan_env.job_id, finding("Dismissed verdict", "fp-dismissed-ok"))
+		.await;
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Succeeded,
+			head_sha: Some("abc123".into()),
+			error: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let verify_env = lease_verify_job(&f.worker).await;
+	let finding_id = match &verify_env.payload {
+		LeasePayload::Verify { finding_id, .. } => *finding_id,
+		other => panic!("expected verify payload, got {other:?}"),
+	};
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/verdict", verify_env.job_id))
+		.json(&VerdictSubmission {
+			protocol_version: PROTOCOL_VERSION,
+			verdict: Verdict::Dismissed { notes: Some("false positive".into()) },
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", verify_env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Succeeded,
+			head_sha: Some("abc123".into()),
+			error: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let (job_state, finding_state): (String, String) =
+		f.db.with_conn(|c| {
+			let job_state =
+				c.query_row("SELECT state FROM jobs WHERE id = ?1", [verify_env.job_id], |r| {
+					r.get(0)
+				})?;
+			let finding_state =
+				c.query_row("SELECT state FROM findings WHERE id = ?1", [finding_id], |r| {
+					r.get(0)
+				})?;
+			Ok((job_state, finding_state))
+		})
+		.unwrap();
+	assert_eq!(job_state, "succeeded");
+	assert_eq!(finding_state, "dismissed");
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn admin_can_retry_failed_verify_job() {
 	let f = bring_up_with_repo_and_worker().await;
 	f.db.with_conn(|c| {
