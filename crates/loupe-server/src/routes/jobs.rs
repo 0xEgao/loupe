@@ -246,6 +246,26 @@ pub async fn retry(
 	}
 }
 
+/// `POST /v1/jobs/:id/cancel` — admin cancels queued or leased work.
+pub async fn cancel(
+	State(state): State<AppState>, Path(id): Path<i64>,
+) -> Result<Json<JobInfo>, (StatusCode, String)> {
+	let now = now_secs();
+	let outcome = state
+		.db
+		.with_conn(|c| Ok(jobs::cancel(c, id, now)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel job: {e}")))?;
+	match outcome {
+		jobs::CancelOutcome::Cancelled(row) => Ok(Json(job_to_info(&row))),
+		jobs::CancelOutcome::NotFound => {
+			Err((StatusCode::NOT_FOUND, format!("no job with id {id}")))
+		},
+		jobs::CancelOutcome::NotCancellable(state) => {
+			Err((StatusCode::CONFLICT, format!("job {id} is {state:?}, not queued or leased")))
+		},
+	}
+}
+
 /// Maximum wait the server will honour on a single long-poll, even if
 /// the client asked for longer. Picked under the typical proxy idle
 /// timeout so we never hold a connection long enough for an
