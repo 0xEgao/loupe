@@ -544,7 +544,7 @@ pub async fn submit_verdict(
 	// transaction so a concurrent verdict from a second verifier
 	// can't catch us mid-state-flip and observe "confirmed AND
 	// dismissed" simultaneously.
-	let new_state: Option<&str> = state
+	let new_state: Option<FindingState> = state
 		.db
 		.with_conn(|c| {
 			let tx = c.transaction()?;
@@ -571,65 +571,13 @@ pub async fn submit_verdict(
 					now,
 				)?;
 			}
-			// Bail out early if the finding was already terminal — a
-			// concurrent reaper or earlier verdict beat us here.
-			let current: String = tx.query_row(
-				"SELECT state FROM findings WHERE id = ?1",
-				[target_finding_id],
-				|r| r.get(0),
+			let next_state = loupe_storage::findings::roll_up_verdicts_for_finding(
+				&tx,
+				target_finding_id,
+				terminal_inconclusive,
+				require_approval,
+				now,
 			)?;
-			if current != "validating" {
-				tx.commit()?;
-				return Ok(None);
-			}
-			// Default rollup policy:
-			//   terminal inconclusive ⇒ dismissed
-			//   else any 'dismissed'  ⇒ dismissed
-			//   else any 'confirmed' ⇒ confirmed
-			//   else stay 'validating' (waiting for more verdicts or
-			//        the deadline reaper).
-			let next_state: Option<&'static str> = if terminal_inconclusive {
-				Some("dismissed")
-			} else {
-				let any_dismissed: bool = tx.query_row(
-					"SELECT EXISTS(SELECT 1 FROM finding_verifications
-					                 WHERE finding_id = ?1 AND verdict = 'dismissed')",
-					[target_finding_id],
-					|r| r.get(0),
-				)?;
-				if any_dismissed {
-					Some("dismissed")
-				} else {
-					let any_confirmed: bool = tx.query_row(
-						"SELECT EXISTS(SELECT 1 FROM finding_verifications
-						                 WHERE finding_id = ?1 AND verdict = 'confirmed')",
-						[target_finding_id],
-						|r| r.get(0),
-					)?;
-					if any_confirmed {
-						if require_approval {
-							Some("awaiting_approval")
-						} else {
-							Some("confirmed")
-						}
-					} else {
-						None
-					}
-				}
-			};
-			if let Some(s) = next_state {
-				// `awaiting_approval` doesn't stamp anything yet —
-				// `approved_at` lands later when the operator approves.
-				let stamp_clause = match s {
-					"confirmed" => ", confirmed_at = ?2",
-					"dismissed" => ", dismissed_at = ?2",
-					_ => "",
-				};
-				tx.execute(
-					&format!("UPDATE findings SET state = ?1{stamp_clause} WHERE id = ?3"),
-					(s, now, target_finding_id),
-				)?;
-			}
 			tx.commit()?;
 			Ok(next_state)
 		})
@@ -637,7 +585,7 @@ pub async fn submit_verdict(
 			(StatusCode::INTERNAL_SERVER_ERROR, format!("submit verdict: {e}"))
 		})?;
 
-	if matches!(new_state, Some("confirmed")) {
+	if matches!(new_state, Some(FindingState::Confirmed)) {
 		if let Err(e) = dispatch_finding(&state, target_finding_id, now).await {
 			tracing::warn!(
 				finding_id = target_finding_id,
