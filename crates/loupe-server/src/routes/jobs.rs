@@ -284,19 +284,7 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 				.db
 				.with_conn(|c| Ok(jobs::get(c, reviewed_job_id)?))?
 				.and_then(|j| if j.kind == JobKind::Scan { j.head_sha } else { None });
-			let finding = loupe_core::Finding {
-				scanner_id: finding_row.scanner_id,
-				severity: finding_row.severity,
-				title: finding_row.title,
-				description: finding_row.description,
-				file_path: finding_row.file_path,
-				line_start: finding_row.line_start,
-				line_end: finding_row.line_end,
-				cwe: finding_row.cwe,
-				patch_unified: finding_row.patch_unified,
-				poc_unified: finding_row.poc_unified,
-				fingerprint: finding_row.fingerprint,
-			};
+			let finding = finding_row.into_finding();
 			LeasePayload::Verify { finding_id: target_id, finding: Box::new(finding), reviewed_sha }
 		},
 	};
@@ -806,27 +794,11 @@ fn reporter_secret(state: &AppState, repo: &repos::RepoRow) -> anyhow::Result<St
 	}
 }
 
-fn finding_from_row(row: findings::FindingRow) -> loupe_core::Finding {
-	loupe_core::Finding {
-		scanner_id: row.scanner_id,
-		severity: row.severity,
-		title: row.title,
-		description: row.description,
-		file_path: row.file_path,
-		line_start: row.line_start,
-		line_end: row.line_end,
-		cwe: row.cwe,
-		patch_unified: row.patch_unified,
-		poc_unified: row.poc_unified,
-		fingerprint: row.fingerprint,
-	}
-}
-
 fn report_finding_from_row(
 	state: &AppState, row: findings::FindingRow,
 ) -> anyhow::Result<reporters::ReportFinding> {
 	let job_id = row.job_id;
-	let finding = finding_from_row(row);
+	let finding = row.into_finding();
 	let reviewed_revision =
 		state.db.with_conn(|c| Ok(jobs::get(c, job_id)?))?.and_then(|j| j.head_sha);
 	Ok(reporters::ReportFinding { finding, reviewed_revision })

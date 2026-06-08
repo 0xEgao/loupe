@@ -36,6 +36,24 @@ pub struct FindingRow {
 	pub patch_notes: Option<String>,
 }
 
+impl FindingRow {
+	pub fn into_finding(self) -> Finding {
+		Finding {
+			scanner_id: self.scanner_id,
+			severity: self.severity,
+			title: self.title,
+			description: self.description,
+			file_path: self.file_path,
+			line_start: self.line_start,
+			line_end: self.line_end,
+			cwe: self.cwe,
+			patch_unified: self.patch_unified,
+			poc_unified: self.poc_unified,
+			fingerprint: self.fingerprint,
+		}
+	}
+}
+
 /// Insert a finding produced by a scan job. Idempotent on
 /// `UNIQUE(repo_id, fingerprint)`: a duplicate insert returns `None`
 /// rather than erroring, so the worker can retry safely.
@@ -400,18 +418,6 @@ pub enum ApprovalOutcome {
 	NotPending,
 	/// No finding with that id.
 	NotFound,
-}
-
-/// Park a freshly-`confirmed` finding in `awaiting_approval` because
-/// the repo (or server default) requires human sign-off before
-/// dispatch. No-op if the finding isn't in `confirmed`.
-pub fn transition_to_awaiting_approval(conn: &Connection, finding_id: i64) -> rusqlite::Result<()> {
-	conn.execute(
-		"UPDATE findings SET state = 'awaiting_approval'
-		 WHERE id = ?1 AND state = 'confirmed'",
-		[finding_id],
-	)?;
-	Ok(())
 }
 
 /// Approve a finding. Stamps `approved_at`/`approved_by_cn` and

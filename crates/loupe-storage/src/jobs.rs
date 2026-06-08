@@ -18,6 +18,13 @@ pub const DEFAULT_LEASE_SECONDS: i64 = 600;
 /// is moved to `failed` rather than back to `queued`.
 pub const MAX_ATTEMPTS: u32 = 3;
 
+pub const JOB_CANCELLED_BY_ADMIN_ERROR: &str = "cancelled by admin";
+pub const LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR: &str = "lease expired after max attempts";
+
+const JOB_COLUMNS: &str = "id, repo_id, kind, state, incremental, since_sha, head_sha,
+        parent_job_id, target_finding_id, worker_id, lease_expires_at,
+        attempts, enqueued_at, started_at, finished_at, error";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRow {
 	pub id: i64,
@@ -102,7 +109,7 @@ pub fn lease_next(
 	let lease_until = now + lease_seconds;
 	let target_state =
 		JobState::Queued.apply(JobTransition::Lease).map_err(sql_state_transition_error)?;
-	let mut stmt = conn.prepare(
+	let mut stmt = conn.prepare(&format!(
 		"UPDATE jobs
 		   SET state = ?1,
 		       worker_id = ?2,
@@ -118,10 +125,8 @@ pub fn lease_next(
 		       enqueued_at ASC
 		     LIMIT 1
 		 )
-		 RETURNING id, repo_id, kind, state, incremental, since_sha, head_sha,
-		           parent_job_id, target_finding_id, worker_id, lease_expires_at,
-		           attempts, enqueued_at, started_at, finished_at, error",
-	)?;
+		 RETURNING {JOB_COLUMNS}",
+	))?;
 	let mut iter = stmt.query_map(
 		params![target_state.as_str(), worker_id, lease_until, now, accepts_verify as i64],
 		row_to_job,
@@ -205,9 +210,9 @@ pub fn cancel(conn: &mut Connection, job_id: i64, now: i64) -> rusqlite::Result<
 		       worker_id = NULL,
 		       lease_expires_at = NULL,
 		       finished_at = ?3,
-		       error = 'cancelled by admin'
+		       error = ?4
 		 WHERE id = ?1 AND state IN ('queued','leased')",
-		(job_id, target_state.as_str(), now),
+		(job_id, target_state.as_str(), now, JOB_CANCELLED_BY_ADMIN_ERROR),
 	)?;
 	if updated == 0 {
 		let state = get(&tx, job_id)?.map(|row| row.state).unwrap_or(JobState::Cancelled);
@@ -321,10 +326,7 @@ pub fn requeue_failed(
 
 pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
 	conn.query_row(
-		"SELECT id, repo_id, kind, state, incremental, since_sha, head_sha,
-		        parent_job_id, target_finding_id, worker_id, lease_expires_at,
-		        attempts, enqueued_at, started_at, finished_at, error
-		 FROM jobs WHERE id = ?1",
+		&format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"),
 		params![id],
 		row_to_job,
 	)
@@ -332,13 +334,11 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
 }
 
 pub fn list(conn: &Connection) -> rusqlite::Result<Vec<JobRow>> {
-	let mut stmt = conn.prepare(
-		"SELECT id, repo_id, kind, state, incremental, since_sha, head_sha,
-		        parent_job_id, target_finding_id, worker_id, lease_expires_at,
-		        attempts, enqueued_at, started_at, finished_at, error
+	let mut stmt = conn.prepare(&format!(
+		"SELECT {JOB_COLUMNS}
 		 FROM jobs
 		 ORDER BY enqueued_at DESC, id DESC",
-	)?;
+	))?;
 	let rows = stmt.query_map([], row_to_job)?.collect::<rusqlite::Result<Vec<_>>>()?;
 	Ok(rows)
 }
@@ -412,11 +412,11 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		       worker_id = NULL,
 		       lease_expires_at = NULL,
 		       finished_at = ?1,
-		       error = COALESCE(error, 'lease expired after max attempts')
+		       error = COALESCE(error, ?4)
 		 WHERE state = 'leased'
 		   AND lease_expires_at < ?1
 		   AND attempts >= ?2",
-		params![now, MAX_ATTEMPTS, failed_state.as_str()],
+		params![now, MAX_ATTEMPTS, failed_state.as_str(), LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR],
 	)?;
 	for job_id in failing_scan_jobs {
 		crate::findings::delete_pending_for_job(conn, job_id)?;
@@ -808,7 +808,7 @@ mod tests {
 		let CancelOutcome::Cancelled(row) = outcome else { panic!("expected cancelled outcome") };
 		assert_eq!(row.state, JobState::Cancelled);
 		assert_eq!(row.finished_at, Some(200));
-		assert_eq!(row.error.as_deref(), Some("cancelled by admin"));
+		assert_eq!(row.error.as_deref(), Some(JOB_CANCELLED_BY_ADMIN_ERROR));
 		assert!(row.worker_id.is_none());
 		assert!(row.lease_expires_at.is_none());
 
