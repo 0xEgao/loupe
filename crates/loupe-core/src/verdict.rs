@@ -42,6 +42,8 @@ pub enum Verdict {
 	},
 	Inconclusive {
 		reason: String,
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		terminal: bool,
 	},
 }
 
@@ -61,7 +63,7 @@ mod tests {
 				}),
 			},
 			Verdict::Dismissed { notes: None },
-			Verdict::Inconclusive { reason: "scanner does not verify".into() },
+			Verdict::Inconclusive { reason: "scanner does not verify".into(), terminal: false },
 		];
 		for v in cases {
 			let s = serde_json::to_string(&v).unwrap();
@@ -88,5 +90,24 @@ mod tests {
 		let v = Verdict::Confirmed { notes: Some("real bug".into()), patch: None };
 		let s = serde_json::to_string(&v).unwrap();
 		assert!(!s.contains("patch"), "got: {s}");
+	}
+
+	#[test]
+	fn inconclusive_omits_nonterminal_flag() {
+		let v = Verdict::Inconclusive { reason: "not enough context".into(), terminal: false };
+		let s = serde_json::to_string(&v).unwrap();
+		assert!(!s.contains("terminal"), "got: {s}");
+		let back: Verdict = serde_json::from_str(&s).unwrap();
+		assert_eq!(back, v);
+	}
+
+	#[test]
+	fn inconclusive_defaults_terminal_false() {
+		let raw = r#"{"outcome":"inconclusive","reason":"not enough context"}"#;
+		let back: Verdict = serde_json::from_str(raw).unwrap();
+		assert_eq!(
+			back,
+			Verdict::Inconclusive { reason: "not enough context".into(), terminal: false }
+		);
 	}
 }

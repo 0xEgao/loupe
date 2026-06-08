@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use loupe_core::Verdict;
 use loupe_proto::{
 	CompleteOutcome, CompleteRequest, FindingsBatch, LeaseEnvelope, LeasePayload, LeaseResponse,
 	VerdictSubmission, PROTOCOL_VERSION,
@@ -107,7 +108,7 @@ impl Runner {
 				let req = CompleteRequest {
 					protocol_version: PROTOCOL_VERSION,
 					outcome: CompleteOutcome::Succeeded,
-					head_sha: Some(head_sha),
+					head_sha,
 					error: None,
 				};
 				self.client.complete(job_id, &req).await?;
@@ -132,18 +133,59 @@ impl Runner {
 	/// Returns (head_sha, findings_count).
 	async fn execute(
 		&self, env: LeaseEnvelope, cancel: CancellationToken,
-	) -> Result<(String, usize)> {
+	) -> Result<(Option<String>, usize)> {
 		let key = RepoKey::new(&env.repo.host, &env.repo.owner, &env.repo.repo);
-		let ensured =
+		let clone_url = env.repo.clone_url.clone();
+		let github_pat = env.github_pat.clone();
+		let mut ensured =
 			self.cache.ensure_repo(&key, &env.repo.clone_url, env.github_pat.as_deref()).await?;
-		let bare = ensured.path.clone();
 		// `ensured` (and its pin) lives until the end of this fn; the
 		// repo cache won't evict the bare clone while the worktree
 		// alternate is still in use.
 
 		match env.payload {
-			LeasePayload::Verify { finding_id, finding } => {
-				let (workdir, head_sha) = checkout(&bare, env.head_branch.as_deref()).await?;
+			LeasePayload::Verify { finding_id, finding, reviewed_sha } => {
+				let Some(reviewed_sha) = reviewed_sha.filter(|sha| !sha.trim().is_empty()) else {
+					self.submit_revision_unavailable_verdict(
+						env.job_id,
+						finding_id,
+						None,
+						"verify lease did not carry the original reviewed revision",
+					)
+					.await?;
+					return Ok((None, 0));
+				};
+				let (workdir, head_sha) =
+					match checkout_revision(&ensured.path, &reviewed_sha).await {
+						Ok(ok) => ok,
+						Err(first_error) => {
+							tracing::warn!(
+								job_id = env.job_id,
+								finding_id,
+								reviewed_sha = %reviewed_sha,
+								error = %first_error,
+								"verify revision missing from refreshed cache; re-cloning",
+							);
+							drop(ensured);
+							ensured = self
+								.cache
+								.reclone_repo(&key, &clone_url, github_pat.as_deref())
+								.await?;
+							match checkout_revision(&ensured.path, &reviewed_sha).await {
+								Ok(ok) => ok,
+								Err(second_error) => {
+									self.submit_revision_unavailable_verdict(
+										env.job_id,
+										finding_id,
+										Some(&reviewed_sha),
+										&second_error.to_string(),
+									)
+									.await?;
+									return Ok((Some(reviewed_sha), 0));
+								},
+							}
+						},
+					};
 				let workdir_size = crate::repo_cache::dir_size(workdir.path());
 				if workdir_size > self.max_workdir_bytes {
 					anyhow::bail!(
@@ -157,7 +199,7 @@ impl Runner {
 					repo_id: env.repo_id,
 					job_id: env.job_id,
 					finding_id,
-					finding,
+					finding: *finding,
 					config: env.scanner_config,
 					cancel: cancel.clone(),
 				};
@@ -203,11 +245,27 @@ impl Runner {
 						);
 					},
 				}
-				Ok((head_sha, 0))
+				Ok((Some(head_sha), 0))
 			},
 			LeasePayload::Scan { since_sha } => {
 				tracing::info!(job_id = env.job_id, "checking out worktree");
-				let (workdir, head_sha) = checkout(&bare, env.head_branch.as_deref()).await?;
+				let (workdir, head_sha) =
+					match checkout_latest(&ensured.path, env.head_branch.as_deref()).await {
+						Ok(ok) => ok,
+						Err(first_error) => {
+							tracing::warn!(
+								job_id = env.job_id,
+								error = %first_error,
+								"scan checkout failed from refreshed cache; re-cloning",
+							);
+							drop(ensured);
+							ensured = self
+								.cache
+								.reclone_repo(&key, &clone_url, github_pat.as_deref())
+								.await?;
+							checkout_latest(&ensured.path, env.head_branch.as_deref()).await?
+						},
+					};
 				let workdir_size = crate::repo_cache::dir_size(workdir.path());
 				tracing::info!(
 					job_id = env.job_id,
@@ -263,9 +321,35 @@ impl Runner {
 						FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: all.clone() };
 					self.client.submit_findings(env.job_id, &batch).await?;
 				}
-				Ok((head_sha, all.len()))
+				Ok((Some(head_sha), all.len()))
 			},
 		}
+	}
+
+	async fn submit_revision_unavailable_verdict(
+		&self, job_id: i64, finding_id: i64, reviewed_sha: Option<&str>, detail: &str,
+	) -> Result<()> {
+		let reason = match reviewed_sha {
+			Some(sha) => format!(
+				"original reviewed revision {sha} is unavailable after refreshing and re-cloning the repository: {detail}"
+			),
+			None => format!("original reviewed revision is unavailable: {detail}"),
+		};
+		tracing::warn!(
+			job_id,
+			finding_id,
+			reviewed_sha = reviewed_sha.unwrap_or(""),
+			"submitting terminal inconclusive verdict for unavailable verify revision",
+		);
+		self.client
+			.submit_verdict(
+				job_id,
+				&VerdictSubmission {
+					protocol_version: PROTOCOL_VERSION,
+					verdict: Verdict::Inconclusive { reason, terminal: true },
+				},
+			)
+			.await
 	}
 
 	fn spawn_heartbeat(
@@ -288,27 +372,55 @@ impl Runner {
 }
 
 /// Produce a fresh worktree from the bare clone at `bare` checked out
-/// to `branch` (or the default branch if `None`). Returns the worktree
-/// dir (a `TempDir` for cleanup) plus the resolved commit SHA.
-pub async fn checkout(bare: &Path, branch: Option<&str>) -> Result<(tempfile::TempDir, String)> {
+/// to `branch` (or the remote/default HEAD if `None`). Returns the
+/// worktree dir (a `TempDir` for cleanup) plus the resolved commit SHA.
+pub async fn checkout_latest(
+	bare: &Path, branch: Option<&str>,
+) -> Result<(tempfile::TempDir, String)> {
+	checkout(bare, CheckoutTarget::Latest { branch: branch.map(str::to_owned) }).await
+}
+
+/// Produce a fresh worktree from the bare clone at `bare` checked out
+/// to one exact commit SHA.
+pub async fn checkout_revision(bare: &Path, sha: &str) -> Result<(tempfile::TempDir, String)> {
+	checkout(bare, CheckoutTarget::Revision(sha.to_owned())).await
+}
+
+enum CheckoutTarget {
+	Latest { branch: Option<String> },
+	Revision(String),
+}
+
+async fn checkout(bare: &Path, target: CheckoutTarget) -> Result<(tempfile::TempDir, String)> {
 	let bare = bare.to_path_buf();
-	let branch = branch.map(|s| s.to_owned());
 	let tmp = tempfile::tempdir().context("creating temp worktree dir")?;
 	let workdir = tmp.path().to_path_buf();
 	let head_sha = tokio::task::spawn_blocking(move || -> Result<String> {
 		let repo = git2::Repository::open_bare(&bare)
 			.with_context(|| format!("opening bare repo at {}", bare.display()))?;
-		let target_ref = match branch.as_deref() {
-			Some(b) => repo
-				.find_reference(&format!("refs/heads/{b}"))
-				.or_else(|_| repo.find_reference(&format!("refs/remotes/origin/{b}")))
-				.with_context(|| format!("locating ref for branch {b}"))?,
-			None => repo
-				.find_reference("HEAD")
-				.or_else(|_| repo.find_reference("refs/remotes/origin/HEAD"))
-				.context("locating HEAD reference")?,
+		let commit = match target {
+			CheckoutTarget::Latest { branch } => {
+				let target_ref = match branch.as_deref() {
+					Some(b) => repo
+						.find_reference(&format!("refs/remotes/origin/{b}"))
+						.or_else(|_| repo.find_reference(&format!("refs/heads/{b}")))
+						.with_context(|| format!("locating ref for branch {b}"))?,
+					None => repo
+						.find_reference("refs/remotes/origin/HEAD")
+						.or_else(|_| repo.find_reference("HEAD"))
+						.context("locating HEAD reference")?,
+				};
+				target_ref.peel_to_commit().context("resolving ref to commit")?
+			},
+			CheckoutTarget::Revision(sha) => {
+				let oid = git2::Oid::from_str(&sha)
+					.with_context(|| format!("parsing reviewed revision {sha}"))?;
+				let object = repo
+					.find_object(oid, None)
+					.with_context(|| format!("locating reviewed revision {sha}"))?;
+				object.peel_to_commit().context("resolving reviewed revision to commit")?
+			},
 		};
-		let commit = target_ref.peel_to_commit().context("resolving ref to commit")?;
 		let tree = commit.tree().context("resolving commit tree")?;
 		let mut opts = git2::build::CheckoutBuilder::new();
 		opts.target_dir(&workdir).recreate_missing(true).force();
@@ -323,6 +435,8 @@ pub async fn checkout(bare: &Path, branch: Option<&str>) -> Result<(tempfile::Te
 
 #[cfg(test)]
 mod tests {
+	use std::process::Command;
+
 	use super::*;
 
 	struct StubScanner {
@@ -354,5 +468,79 @@ mod tests {
 			.flat_map(|s| s.capabilities().iter().map(|c| (*c).to_owned()))
 			.collect();
 		assert_eq!(caps, vec!["scan:a", "scan:b", "verify:b"]);
+	}
+
+	fn git(dir: &Path, args: &[&str]) -> String {
+		let output = Command::new("git").current_dir(dir).args(args).output().unwrap();
+		assert!(
+			output.status.success(),
+			"git {:?} in {} failed: {}",
+			args,
+			dir.display(),
+			String::from_utf8_lossy(&output.stderr)
+		);
+		String::from_utf8_lossy(&output.stdout).trim().to_owned()
+	}
+
+	fn init_git_repo(path: &Path) {
+		std::fs::create_dir_all(path).unwrap();
+		let output = Command::new("git")
+			.current_dir(path)
+			.args(["init", "-q", "-b", "main"])
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"git init failed: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		git(path, &["config", "user.email", "loupe-test@example.com"]);
+		git(path, &["config", "user.name", "loupe-test"]);
+	}
+
+	fn commit_file(repo: &Path, contents: &str, message: &str) -> String {
+		std::fs::write(repo.join("file.txt"), contents).unwrap();
+		git(repo, &["add", "file.txt"]);
+		git(repo, &["commit", "-q", "-m", message]);
+		git(repo, &["rev-parse", "HEAD"])
+	}
+
+	#[tokio::test]
+	async fn checkout_revision_uses_original_sha_not_latest_branch_tip() {
+		let remote_tmp = tempfile::tempdir().unwrap();
+		init_git_repo(remote_tmp.path());
+		let first = commit_file(remote_tmp.path(), "one\n", "one");
+		let second = commit_file(remote_tmp.path(), "two\n", "two");
+
+		let bare_tmp = tempfile::tempdir().unwrap();
+		let bare = bare_tmp.path().join("cache.git");
+		let url = format!("file://{}", remote_tmp.path().display());
+		let output = Command::new("git")
+			.arg("clone")
+			.arg("--bare")
+			.arg("--quiet")
+			.arg(&url)
+			.arg(&bare)
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"git clone failed: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+
+		let (latest_workdir, latest_sha) = checkout_latest(&bare, Some("main")).await.unwrap();
+		assert_eq!(latest_sha, second);
+		assert_eq!(
+			std::fs::read_to_string(latest_workdir.path().join("file.txt")).unwrap(),
+			"two\n"
+		);
+
+		let (review_workdir, reviewed_sha) = checkout_revision(&bare, &first).await.unwrap();
+		assert_eq!(reviewed_sha, first);
+		assert_eq!(
+			std::fs::read_to_string(review_workdir.path().join("file.txt")).unwrap(),
+			"one\n"
+		);
 	}
 }

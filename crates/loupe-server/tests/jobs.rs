@@ -6,12 +6,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use loupe_core::{Finding, Severity};
+use loupe_core::{Finding, Severity, Verdict};
 use loupe_proto::{
 	CompleteOutcome, CompleteRequest, FindingDetail, FindingsBatch, LeaseEnvelope, LeasePayload,
 	LeaseRequest, LeaseResponse, ListFindingsResponse, RegisterRepoRequest, RegisterWorkerRequest,
 	RegisterWorkerResponse, ReportingSetup, RetryVerifyRequest, RetryVerifyResponse, ScanRequest,
-	ScanResponse, PROTOCOL_VERSION,
+	ScanResponse, VerdictSubmission, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
 use loupe_server::{serve, AppState, Config};
@@ -448,7 +448,10 @@ async fn admin_can_retry_failed_verify_job() {
 
 	let verify_env = lease_verify_job(&f.worker).await;
 	let finding_id = match &verify_env.payload {
-		LeasePayload::Verify { finding_id, .. } => *finding_id,
+		LeasePayload::Verify { finding_id, reviewed_sha, .. } => {
+			assert_eq!(reviewed_sha.as_deref(), Some("abc123"));
+			*finding_id
+		},
 		other => panic!("expected verify payload, got {other:?}"),
 	};
 
@@ -510,6 +513,79 @@ async fn admin_can_retry_failed_verify_job() {
 
 	let retried_env = lease_verify_job(&f.worker).await;
 	assert_eq!(retried_env.job_id, verify_env.job_id);
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn terminal_inconclusive_verdict_dismisses_finding_immediately() {
+	let f = bring_up_with_repo_and_worker().await;
+	f.db.with_conn(|c| {
+		Ok(c.execute(
+			"UPDATE registered_repos SET verification_enabled = 1 WHERE id = ?1",
+			[f.repo_id],
+		)?)
+	})
+	.unwrap();
+
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let scan_env = lease_job(&f.worker).await;
+	assert_eq!(scan_env.job_id, scan.job_id);
+	submit_finding(&f.worker, scan_env.job_id, finding("Missing revision", "fp-missing-rev")).await;
+
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", scan_env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Succeeded,
+			head_sha: Some("abc123".into()),
+			error: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let verify_env = lease_verify_job(&f.worker).await;
+	let finding_id = match &verify_env.payload {
+		LeasePayload::Verify { finding_id, reviewed_sha, .. } => {
+			assert_eq!(reviewed_sha.as_deref(), Some("abc123"));
+			*finding_id
+		},
+		other => panic!("expected verify payload, got {other:?}"),
+	};
+
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/verdict", verify_env.job_id))
+		.json(&VerdictSubmission {
+			protocol_version: PROTOCOL_VERSION,
+			verdict: Verdict::Inconclusive {
+				reason: "original revision unavailable".into(),
+				terminal: true,
+			},
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let (state, dismissed_at, verdict): (String, Option<i64>, String) =
+		f.db.with_conn(|c| {
+			Ok(c.query_row(
+				"SELECT f.state, f.dismissed_at, v.verdict
+				   FROM findings f
+				   JOIN finding_verifications v ON v.finding_id = f.id
+				  WHERE f.id = ?1",
+				[finding_id],
+				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+			)?)
+		})
+		.unwrap();
+	assert_eq!(state, "dismissed");
+	assert!(dismissed_at.is_some());
+	assert_eq!(verdict, "inconclusive");
 
 	f.handle.shutdown().await;
 }

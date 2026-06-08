@@ -63,7 +63,9 @@ pub enum LeasePayload {
 	},
 	Verify {
 		finding_id: i64,
-		finding: Finding,
+		finding: Box<Finding>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		reviewed_sha: Option<String>,
 	},
 }
 
@@ -137,17 +139,57 @@ mod tests {
 			lease_expires_at: 1_700_000_800,
 			scanner_config: serde_json::Value::Null,
 			github_pat: None,
-			payload: LeasePayload::Verify { finding_id: 42, finding: finding.clone() },
+			payload: LeasePayload::Verify {
+				finding_id: 42,
+				finding: Box::new(finding.clone()),
+				reviewed_sha: Some("abc123".into()),
+			},
 		};
 		let s = serde_json::to_string(&env).unwrap();
 		let back: LeaseEnvelope = serde_json::from_str(&s).unwrap();
 		assert_eq!(env, back);
 		// Sanity-check the discriminator is the verify kind.
 		match back.payload {
-			LeasePayload::Verify { finding_id, finding: f } => {
+			LeasePayload::Verify { finding_id, finding: f, reviewed_sha } => {
 				assert_eq!(finding_id, 42);
-				assert_eq!(f, finding);
+				assert_eq!(*f, finding);
+				assert_eq!(reviewed_sha.as_deref(), Some("abc123"));
 			},
+			LeasePayload::Scan { .. } => panic!("expected Verify payload"),
+		}
+	}
+
+	#[test]
+	fn verify_lease_defaults_reviewed_sha_for_old_servers() {
+		let raw = r#"{
+			"protocol_version":1,
+			"job_id":7,
+			"repo_id":11,
+			"repo":{
+				"host":"github.com",
+				"owner":"acme",
+				"repo":"widget",
+				"clone_url":"https://github.com/acme/widget.git",
+				"branch":"main"
+			},
+			"head_branch":null,
+			"lease_expires_at":1700000800,
+			"scanner_config":null,
+			"payload":{
+				"kind":"verify",
+				"finding_id":42,
+				"finding":{
+					"scanner_id":"regex-secrets",
+					"severity":"high",
+					"title":"AWS access key",
+					"description":"Found AKIA-prefixed token",
+					"fingerprint":"fp1"
+				}
+			}
+		}"#;
+		let env: LeaseEnvelope = serde_json::from_str(raw).unwrap();
+		match env.payload {
+			LeasePayload::Verify { reviewed_sha, .. } => assert!(reviewed_sha.is_none()),
 			LeasePayload::Scan { .. } => panic!("expected Verify payload"),
 		}
 	}

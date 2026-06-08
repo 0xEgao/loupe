@@ -37,6 +37,7 @@ pub trait Scanner: Send + Sync {
 	async fn verify(&self, _ctx: &VerifyContext) -> anyhow::Result<VerifyOutcome> {
 		Ok(VerifyOutcome::Verdict(Verdict::Inconclusive {
 			reason: "scanner does not verify".into(),
+			terminal: false,
 		}))
 	}
 }
