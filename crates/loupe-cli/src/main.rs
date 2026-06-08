@@ -229,6 +229,10 @@ enum JobCmd {
 	Retry {
 		id: i64,
 	},
+	/// Cancel queued or leased work.
+	Cancel {
+		id: i64,
+	},
 }
 
 #[derive(Debug, Subcommand)]
@@ -374,6 +378,10 @@ async fn main() -> Result<()> {
 			JobCmd::Retry { id } => {
 				let (client, base) = client_and_url(&conn)?;
 				job_retry(&client, base, id).await
+			},
+			JobCmd::Cancel { id } => {
+				let (client, base) = client_and_url(&conn)?;
+				job_cancel(&client, base, id).await
 			},
 		},
 		Cmd::Finding(c) => match c {
@@ -800,6 +808,17 @@ async fn job_retry(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Re
 	Ok(())
 }
 
+async fn job_cancel(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
+	let resp = client.post(url(base, &format!("/v1/jobs/{id}/cancel"))).send().await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!("cancel job: {} — {}", status, resp.text().await.unwrap_or_default());
+	}
+	let job: JobInfo = resp.json().await?;
+	println!("job_id={} state={:?} attempts={}", job.job_id, job.state, job.attempts);
+	Ok(())
+}
+
 async fn finding_list(client: &reqwest::Client, base: &reqwest::Url, repo_id: i64) -> Result<()> {
 	let resp = client.get(url(base, &format!("/v1/repos/{repo_id}/findings"))).send().await?;
 	let body: ListFindingsResponse = resp.error_for_status()?.json().await?;
@@ -1141,6 +1160,23 @@ mod tests {
 			panic!("expected job retry command");
 		};
 		assert_eq!(id, 33);
+	}
+
+	#[test]
+	fn job_cancel_parses() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"job",
+			"cancel",
+			"34",
+		])
+		.unwrap();
+		let Cmd::Job(JobCmd::Cancel { id }) = cli.cmd else {
+			panic!("expected job cancel command");
+		};
+		assert_eq!(id, 34);
 	}
 
 	#[test]

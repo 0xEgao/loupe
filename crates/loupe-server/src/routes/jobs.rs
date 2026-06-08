@@ -246,6 +246,26 @@ pub async fn retry(
 	}
 }
 
+/// `POST /v1/jobs/:id/cancel` — admin cancels queued or leased work.
+pub async fn cancel(
+	State(state): State<AppState>, Path(id): Path<i64>,
+) -> Result<Json<JobInfo>, (StatusCode, String)> {
+	let now = now_secs();
+	let outcome = state
+		.db
+		.with_conn(|c| Ok(jobs::cancel(c, id, now)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel job: {e}")))?;
+	match outcome {
+		jobs::CancelOutcome::Cancelled(row) => Ok(Json(job_to_info(&row))),
+		jobs::CancelOutcome::NotFound => {
+			Err((StatusCode::NOT_FOUND, format!("no job with id {id}")))
+		},
+		jobs::CancelOutcome::NotCancellable(state) => {
+			Err((StatusCode::CONFLICT, format!("job {id} is {state:?}, not queued or leased")))
+		},
+	}
+}
+
 /// Maximum wait the server will honour on a single long-poll, even if
 /// the client asked for longer. Picked under the typical proxy idle
 /// timeout so we never hold a connection long enough for an
@@ -344,10 +364,21 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 				.ok_or_else(|| anyhow::anyhow!("verify job missing target_finding_id"))?;
 			let finding_row = state
 				.db
-				.with_conn(|c| Ok(findings::list_for_job(c, row.parent_job_id.unwrap_or(0))?))?
-				.into_iter()
-				.find(|f| f.id == target_id)
+				.with_conn(|c| Ok(findings::get(c, target_id)?))?
 				.ok_or_else(|| anyhow::anyhow!("verify target finding not found"))?;
+			if finding_row.repo_id != row.repo_id {
+				anyhow::bail!(
+					"verify target finding {} belongs to repo {}, not job repo {}",
+					target_id,
+					finding_row.repo_id,
+					row.repo_id
+				);
+			}
+			let reviewed_job_id = row.parent_job_id.unwrap_or(finding_row.job_id);
+			let reviewed_sha = state
+				.db
+				.with_conn(|c| Ok(jobs::get(c, reviewed_job_id)?))?
+				.and_then(|j| if j.kind == JobKind::Scan { j.head_sha } else { None });
 			let finding = loupe_core::Finding {
 				scanner_id: finding_row.scanner_id,
 				severity: finding_row.severity,
@@ -361,7 +392,7 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 				poc_unified: finding_row.poc_unified,
 				fingerprint: finding_row.fingerprint,
 			};
-			LeasePayload::Verify { finding_id: target_id, finding }
+			LeasePayload::Verify { finding_id: target_id, finding: Box::new(finding), reviewed_sha }
 		},
 	};
 
@@ -481,10 +512,12 @@ pub async fn submit_verdict(
 		.target_finding_id
 		.ok_or((StatusCode::BAD_REQUEST, "verify job missing target finding".into()))?;
 
-	let (verdict_str, notes) = match &submission.verdict {
-		loupe_core::Verdict::Confirmed { notes, .. } => ("confirmed", notes.clone()),
-		loupe_core::Verdict::Dismissed { notes } => ("dismissed", notes.clone()),
-		loupe_core::Verdict::Inconclusive { reason } => ("inconclusive", Some(reason.clone())),
+	let (verdict_str, notes, terminal_inconclusive) = match &submission.verdict {
+		loupe_core::Verdict::Confirmed { notes, .. } => ("confirmed", notes.clone(), false),
+		loupe_core::Verdict::Dismissed { notes } => ("dismissed", notes.clone(), false),
+		loupe_core::Verdict::Inconclusive { reason, terminal } => {
+			("inconclusive", Some(reason.clone()), *terminal)
+		},
 	};
 	// Patches only ride on Confirmed verdicts (pinned by the
 	// `Verdict` type itself); pull the diff out here so the closure
@@ -550,33 +583,38 @@ pub async fn submit_verdict(
 				return Ok(None);
 			}
 			// Default rollup policy:
-			//   any 'dismissed'  ⇒ dismissed
+			//   terminal inconclusive ⇒ dismissed
+			//   else any 'dismissed'  ⇒ dismissed
 			//   else any 'confirmed' ⇒ confirmed
 			//   else stay 'validating' (waiting for more verdicts or
 			//        the deadline reaper).
-			let any_dismissed: bool = tx.query_row(
-				"SELECT EXISTS(SELECT 1 FROM finding_verifications
-				                 WHERE finding_id = ?1 AND verdict = 'dismissed')",
-				[target_finding_id],
-				|r| r.get(0),
-			)?;
-			let next_state: Option<&'static str> = if any_dismissed {
+			let next_state: Option<&'static str> = if terminal_inconclusive {
 				Some("dismissed")
 			} else {
-				let any_confirmed: bool = tx.query_row(
+				let any_dismissed: bool = tx.query_row(
 					"SELECT EXISTS(SELECT 1 FROM finding_verifications
-					                 WHERE finding_id = ?1 AND verdict = 'confirmed')",
+					                 WHERE finding_id = ?1 AND verdict = 'dismissed')",
 					[target_finding_id],
 					|r| r.get(0),
 				)?;
-				if any_confirmed {
-					if require_approval {
-						Some("awaiting_approval")
-					} else {
-						Some("confirmed")
-					}
+				if any_dismissed {
+					Some("dismissed")
 				} else {
-					None
+					let any_confirmed: bool = tx.query_row(
+						"SELECT EXISTS(SELECT 1 FROM finding_verifications
+						                 WHERE finding_id = ?1 AND verdict = 'confirmed')",
+						[target_finding_id],
+						|r| r.get(0),
+					)?;
+					if any_confirmed {
+						if require_approval {
+							Some("awaiting_approval")
+						} else {
+							Some("confirmed")
+						}
+					} else {
+						None
+					}
 				}
 			};
 			if let Some(s) = next_state {
@@ -632,6 +670,40 @@ pub async fn complete(
 		.ok_or((StatusCode::FORBIDDEN, "no leased job for this worker".into()))?;
 	if job.state != JobState::Leased || job.worker_id != Some(worker.id()) {
 		return Err((StatusCode::FORBIDDEN, "no leased job for this worker".into()));
+	}
+	if matches!(new_state, JobState::Succeeded) {
+		match job.kind {
+			JobKind::Scan => {
+				if req.head_sha.as_deref().map(str::trim).filter(|sha| !sha.is_empty()).is_none() {
+					return Err((
+						StatusCode::BAD_REQUEST,
+						"successful scan completion requires non-empty head_sha".into(),
+					));
+				}
+			},
+			JobKind::Verify => {
+				let has_verdict = state
+					.db
+					.with_conn(|c| {
+						Ok(c.query_row(
+							"SELECT EXISTS(
+							   SELECT 1 FROM finding_verifications WHERE job_id = ?1
+							 )",
+							[job_id],
+							|r| r.get::<_, bool>(0),
+						)?)
+					})
+					.map_err(|e| {
+						(StatusCode::INTERNAL_SERVER_ERROR, format!("check verdict: {e}"))
+					})?;
+				if !has_verdict {
+					return Err((
+						StatusCode::CONFLICT,
+						"successful verify completion requires a submitted verdict".into(),
+					));
+				}
+			},
+		}
 	}
 
 	// Resolve effective approval mode once, outside the tx, so the

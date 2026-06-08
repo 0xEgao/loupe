@@ -54,7 +54,7 @@ impl VerifyStubInput {
 					.map(|p| VerdictPatch { patch_unified: p.patch_unified, notes: p.notes }),
 			},
 			"dismissed" => Verdict::Dismissed { notes: Some(self.notes) },
-			"inconclusive" => Verdict::Inconclusive { reason: self.notes },
+			"inconclusive" => Verdict::Inconclusive { reason: self.notes, terminal: false },
 			other => panic!("unknown verdict in test input: {other}"),
 		}
 	}

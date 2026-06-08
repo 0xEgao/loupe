@@ -46,6 +46,13 @@ pub struct NewJob {
 	pub target_finding_id: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelOutcome {
+	Cancelled(JobRow),
+	NotFound,
+	NotCancellable(JobState),
+}
+
 /// Insert a `queued` job, returning the new id.
 pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> rusqlite::Result<i64> {
 	conn.execute(
@@ -142,6 +149,38 @@ pub fn complete(
 		params![new_state.as_str(), head_sha, error, now, job_id, worker_id],
 	)?;
 	Ok(n > 0)
+}
+
+/// Cancel queued or leased work. Scan jobs may have inserted pending
+/// findings while leased; remove those so a later scan retry is not
+/// blocked by fingerprint deduplication.
+pub fn cancel(conn: &mut Connection, job_id: i64, now: i64) -> rusqlite::Result<CancelOutcome> {
+	let tx = conn.transaction()?;
+	let Some(row) = get(&tx, job_id)? else { return Ok(CancelOutcome::NotFound) };
+	if !matches!(row.state, JobState::Queued | JobState::Leased) {
+		return Ok(CancelOutcome::NotCancellable(row.state));
+	}
+
+	let updated = tx.execute(
+		"UPDATE jobs
+		   SET state = 'cancelled',
+		       worker_id = NULL,
+		       lease_expires_at = NULL,
+		       finished_at = ?2,
+		       error = 'cancelled by admin'
+		 WHERE id = ?1 AND state IN ('queued','leased')",
+		(job_id, now),
+	)?;
+	if updated == 0 {
+		let state = get(&tx, job_id)?.map(|row| row.state).unwrap_or(JobState::Cancelled);
+		return Ok(CancelOutcome::NotCancellable(state));
+	}
+	if row.kind == JobKind::Scan {
+		tx.execute("DELETE FROM findings WHERE job_id = ?1 AND state = 'pending'", [job_id])?;
+	}
+	let row = get(&tx, job_id)?.expect("cancelled job row still exists");
+	tx.commit()?;
+	Ok(CancelOutcome::Cancelled(row))
 }
 
 pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
@@ -599,6 +638,101 @@ mod tests {
 		assert_eq!(row.state, JobState::Succeeded);
 		assert_eq!(row.head_sha.as_deref(), Some("abc"));
 		assert_eq!(row.finished_at, Some(200));
+	}
+
+	#[test]
+	fn cancel_queued_job_marks_cancelled_and_unleasable() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		let job_id = db
+			.with_conn(|c| {
+				Ok(enqueue(
+					c,
+					&NewJob {
+						repo_id,
+						kind: JobKind::Scan,
+						incremental: false,
+						since_sha: None,
+						parent_job_id: None,
+						target_finding_id: None,
+					},
+					100,
+				)?)
+			})
+			.unwrap();
+
+		let outcome = db.with_conn(|c| Ok(cancel(c, job_id, 200)?)).unwrap();
+		let CancelOutcome::Cancelled(row) = outcome else { panic!("expected cancelled outcome") };
+		assert_eq!(row.state, JobState::Cancelled);
+		assert_eq!(row.finished_at, Some(200));
+		assert_eq!(row.error.as_deref(), Some("cancelled by admin"));
+		assert!(row.worker_id.is_none());
+		assert!(row.lease_expires_at.is_none());
+
+		let leased = db.with_conn(|c| Ok(lease_next(c, worker_id, false, 300, 60)?)).unwrap();
+		assert!(leased.is_none(), "cancelled job must not be leased");
+		let second = db.with_conn(|c| Ok(cancel(c, job_id, 400)?)).unwrap();
+		assert_eq!(second, CancelOutcome::NotCancellable(JobState::Cancelled));
+	}
+
+	#[test]
+	fn cancel_leased_scan_discards_pending_findings() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		db.with_conn(|c| {
+			Ok(enqueue(
+				c,
+				&NewJob {
+					repo_id,
+					kind: JobKind::Scan,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				},
+				100,
+			)?)
+		})
+		.unwrap();
+		let leased =
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 200, 60)?)).unwrap().unwrap();
+		db.with_conn(|c| {
+			Ok(crate::findings::insert_or_ignore(
+				c,
+				repo_id,
+				leased.id,
+				&Finding {
+					scanner_id: "regex".into(),
+					severity: Severity::High,
+					title: "Cancelled finding".into(),
+					description: "submitted before cancellation".into(),
+					file_path: Some("src/x.rs".into()),
+					line_start: Some(1),
+					line_end: Some(1),
+					cwe: None,
+					patch_unified: None,
+					poc_unified: None,
+					fingerprint: "fp-cancelled".into(),
+				},
+				true,
+				210,
+			)?)
+		})
+		.unwrap();
+
+		let outcome = db.with_conn(|c| Ok(cancel(c, leased.id, 300)?)).unwrap();
+		let CancelOutcome::Cancelled(row) = outcome else { panic!("expected cancelled outcome") };
+		assert_eq!(row.state, JobState::Cancelled);
+		assert!(row.worker_id.is_none());
+		assert!(row.lease_expires_at.is_none());
+		let pending_findings: i64 = db
+			.with_conn(|c| {
+				Ok(c.query_row(
+					"SELECT COUNT(*) FROM findings WHERE job_id = ?1",
+					[leased.id],
+					|r| r.get(0),
+				)?)
+			})
+			.unwrap();
+		assert_eq!(pending_findings, 0);
 	}
 
 	#[test]

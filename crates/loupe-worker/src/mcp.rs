@@ -870,7 +870,7 @@ async fn tool_submit_verdict(session: &Arc<Session>, args: &Value) -> Result<Str
 	let verdict = match verdict_str {
 		"confirmed" => loupe_core::Verdict::Confirmed { notes: Some(notes), patch: None },
 		"dismissed" => loupe_core::Verdict::Dismissed { notes: Some(notes) },
-		"inconclusive" => loupe_core::Verdict::Inconclusive { reason: notes },
+		"inconclusive" => loupe_core::Verdict::Inconclusive { reason: notes, terminal: false },
 		other => anyhow::bail!(
 			"unknown verdict `{other}`; must be one of `confirmed`, `dismissed`, `inconclusive`"
 		),
