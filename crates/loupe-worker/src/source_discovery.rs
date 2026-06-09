@@ -14,9 +14,9 @@ use serde::Deserialize;
 use crate::llm::DEFAULT_REQUEST_TIMEOUT;
 
 /// Config knobs operators can set via the repo's `scanner_config`
-/// JSON. Defaults cover Rust, C/C++, JS/TS, Python, Go, Ruby, PHP, and
-/// JVM/Swift sources, plus an excludelist that drops common build /
-/// vendor / test dirs across those ecosystems. Tighten or loosen
+/// JSON. Defaults cover Rust, C/C++, JS/TS, Python, Go, Ruby, PHP,
+/// JVM/Swift, and .NET sources, plus an excludelist that drops common
+/// build / vendor / test dirs across those ecosystems. Tighten or loosen
 /// per-repo by sending a partial JSON override (see
 /// `ScannerConfigPatch`).
 #[derive(Debug, Clone)]
@@ -28,9 +28,10 @@ pub struct ScannerConfig {
 	/// the leading dot (e.g. `["rs", "cpp"]`).
 	pub include_extensions: Vec<String>,
 	/// Exclusion patterns that disqualify a path. Built-in patterns
-	/// use `dir:<name>` for exact path components and `file:<glob>`
-	/// for basename matches. Legacy custom strings still match as
-	/// path substrings, except `/name` matches an exact component.
+	/// use `dir:<name>` for exact path components, `file:<glob>` for
+	/// basename matches, and `dotnet-output:<name>` for .NET build
+	/// output directories. Legacy custom strings still match as path
+	/// substrings, except `/name` matches an exact component.
 	pub exclude_path_substrings: Vec<String>,
 }
 
@@ -97,7 +98,8 @@ fn default_extensions() -> Vec<String> {
 		"rb",  // PHP.
 		"php", // JVM family.
 		"java", "kt", "kts", "scala", "groovy", // Swift.
-		"swift",  // Misc.
+		"swift",  // .NET.
+		"cs", "fs", "fsi", "fsx", "vb", // Misc.
 		"dart", "ex", "exs", "rs.in",
 	]
 	.into_iter()
@@ -120,6 +122,8 @@ fn default_excludes() -> Vec<String> {
 		"dir:fuzz",
 		// Build artefacts across ecosystems.
 		"dir:target",
+		"dotnet-output:bin",
+		"dotnet-output:obj",
 		"dir:build",
 		"dir:dist",
 		"dir:out",
@@ -151,6 +155,7 @@ fn default_excludes() -> Vec<String> {
 ///   packages that are path dependencies but not workspace members.
 /// - JS/TS roots under directories containing `package.json`.
 /// - C/C++ roots under directories containing common build-system markers.
+/// - .NET roots under directories containing solution or project files.
 /// - Fallback to the whole worktree if no project roots are discovered.
 ///
 /// All walks honour the extension allowlist, exclude patterns, and
@@ -186,6 +191,7 @@ fn discover_roots(workdir: &Path, cfg: &ScannerConfig) -> DiscoveryRoots {
 	let mut roots = DiscoveryRoots::default();
 	add_cargo_roots(workdir, cfg, &mut roots);
 	add_marker_roots(workdir, cfg, &mut roots);
+	add_dotnet_roots(workdir, cfg, &mut roots);
 	roots.roots.sort();
 	roots.roots.dedup();
 	roots.files.sort();
@@ -310,6 +316,14 @@ fn add_marker_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRo
 	}
 }
 
+fn add_dotnet_roots(workdir: &Path, cfg: &ScannerConfig, roots: &mut DiscoveryRoots) {
+	for marker_dir in
+		dotnet_marker_dirs(workdir, cfg, &["sln", "slnx", "csproj", "fsproj", "vbproj"])
+	{
+		roots.roots.push(marker_dir);
+	}
+}
+
 fn marker_dirs(workdir: &Path, cfg: &ScannerConfig, marker: &str) -> Vec<PathBuf> {
 	walkdir::WalkDir::new(workdir)
 		.max_depth(5)
@@ -317,6 +331,24 @@ fn marker_dirs(workdir: &Path, cfg: &ScannerConfig, marker: &str) -> Vec<PathBuf
 		.filter_entry(|entry| !is_excluded_dir(entry.path(), cfg))
 		.filter_map(Result::ok)
 		.filter(|entry| entry.file_type().is_file() && entry.file_name() == marker)
+		.filter_map(|entry| entry.path().parent().map(Path::to_path_buf))
+		.collect()
+}
+
+fn dotnet_marker_dirs(workdir: &Path, cfg: &ScannerConfig, exts: &[&str]) -> Vec<PathBuf> {
+	walkdir::WalkDir::new(workdir)
+		.into_iter()
+		.filter_entry(|entry| !is_excluded_dir(entry.path(), cfg))
+		.filter_map(Result::ok)
+		.filter(|entry| {
+			entry.file_type().is_file()
+				&& entry
+					.path()
+					.extension()
+					.and_then(|ext| ext.to_str())
+					.map(|ext| exts.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext)))
+					.unwrap_or(false)
+		})
 		.filter_map(|entry| entry.path().parent().map(Path::to_path_buf))
 		.collect()
 }
@@ -374,6 +406,9 @@ fn matches_exclude(path: &Path, pattern: &str) -> bool {
 			.map(|name| Pattern::new(glob).map(|p| p.matches(name)).unwrap_or(false))
 			.unwrap_or(false);
 	}
+	if let Some(component) = pattern.strip_prefix("dotnet-output:") {
+		return is_dotnet_output_path(path, component);
+	}
 	if let Some(component) = pattern.strip_prefix('/') {
 		if !component.contains('/') {
 			return has_component(path, component);
@@ -384,6 +419,32 @@ fn matches_exclude(path: &Path, pattern: &str) -> bool {
 
 fn has_component(path: &Path, needle: &str) -> bool {
 	path.components().any(|component| component.as_os_str() == needle)
+}
+
+fn is_dotnet_output_path(path: &Path, output_dir: &str) -> bool {
+	path.ancestors().any(|candidate| {
+		candidate.file_name().and_then(|name| name.to_str()) == Some(output_dir)
+			&& candidate.parent().map(has_dotnet_project_marker).unwrap_or(false)
+	})
+}
+
+fn has_dotnet_project_marker(dir: &Path) -> bool {
+	let Ok(entries) = std::fs::read_dir(dir) else {
+		return false;
+	};
+	entries.filter_map(Result::ok).any(|entry| {
+		entry.file_type().map(|file_type| file_type.is_file()).unwrap_or(false)
+			&& entry
+				.path()
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.map(|ext| {
+					["csproj", "fsproj", "vbproj"]
+						.iter()
+						.any(|allowed| allowed.eq_ignore_ascii_case(ext))
+				})
+				.unwrap_or(false)
+	})
 }
 
 fn has_allowed_extension(path: &Path, exts: &[String]) -> bool {
@@ -432,11 +493,16 @@ mod tests {
 	fn defaults_cover_common_languages() {
 		let cfg = ScannerConfig::default();
 		assert_eq!(cfg.max_file_bytes, 2 * 1024 * 1024);
-		for ext in ["rs", "c", "cpp", "h", "hpp", "js", "ts", "tsx", "py", "go", "java", "swift"] {
+		for ext in [
+			"rs", "c", "cpp", "h", "hpp", "js", "ts", "tsx", "py", "go", "java", "swift", "cs",
+			"fs", "fsi", "fsx", "vb",
+		] {
 			assert!(cfg.include_extensions.iter().any(|e| e == ext), "missing: {ext}");
 		}
 		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:node_modules"));
 		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:target"));
+		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dotnet-output:bin"));
+		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dotnet-output:obj"));
 		assert!(cfg.exclude_path_substrings.iter().any(|e| e == "dir:fuzz"));
 	}
 
@@ -525,6 +591,32 @@ mod tests {
 	}
 
 	#[test]
+	fn rust_src_bin_targets_are_discovered() {
+		let tmp = tempfile::tempdir().unwrap();
+		write_crate(
+			tmp.path(),
+			&[
+				("src/lib.rs", "// library\n"),
+				("src/bin/cli.rs", "// binary\n"),
+				("src/bin/net8.rs", "// binary with tfm-like name\n"),
+				("src/bin/net8/main.rs", "// nested binary with tfm-like name\n"),
+				("src/bin/admin/main.rs", "// nested binary\n"),
+			],
+		);
+
+		let names = rel_names(tmp.path(), walk_source_files(tmp.path(), &ScannerConfig::default()));
+		for expected in [
+			"src/lib.rs",
+			"src/bin/cli.rs",
+			"src/bin/net8.rs",
+			"src/bin/net8/main.rs",
+			"src/bin/admin/main.rs",
+		] {
+			assert!(names.iter().any(|n| n == expected), "missing {expected} in {names:?}");
+		}
+	}
+
+	#[test]
 	fn mixed_rust_cpp_js_and_typescript_sources_are_discovered() {
 		let tmp = tempfile::tempdir().unwrap();
 		std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = [\"crates/*\"]\n")
@@ -546,6 +638,73 @@ mod tests {
 			assert!(names.iter().any(|n| n == expected), "missing {expected} in {names:?}");
 		}
 		assert!(names.iter().all(|n| n != "src/widget.test.ts"), "names: {names:?}");
+	}
+
+	#[test]
+	fn dotnet_solution_and_project_sources_are_discovered_in_mixed_repos() {
+		let tmp = tempfile::tempdir().unwrap();
+		std::fs::write(tmp.path().join("package.json"), "{}\n").unwrap();
+		std::fs::write(tmp.path().join("Widget.sln"), "\n").unwrap();
+		std::fs::create_dir_all(tmp.path().join("frontend/src")).unwrap();
+		std::fs::write(tmp.path().join("frontend/src/index.ts"), "// ts\n").unwrap();
+
+		for (path, body) in [
+			("src/Web/Web.csproj", "<Project />\n"),
+			("src/Web/Program.cs", "class Program {}\n"),
+			("src/Web/Controllers/HomeController.cs", "class HomeController {}\n"),
+			("src/Domain/Domain.fsproj", "<Project />\n"),
+			("src/Domain/Model.fs", "module Model\n"),
+			("src/Domain/Model.fsi", "module Model\n"),
+			("src/Domain/Scripts/Seed.fsx", "printfn \"seed\"\n"),
+			("src/Legacy/Legacy.vbproj", "<Project />\n"),
+			("src/Legacy/Module.vb", "Module Legacy\nEnd Module\n"),
+			("src/Web/bin/Debug/net8.0/Generated.cs", "class Generated {}\n"),
+			("src/Web/obj/Debug/net8.0/AssemblyInfo.cs", "class AssemblyInfo {}\n"),
+			("src/Web/obj/Debug/GeneratedFile.cs", "class GeneratedFile {}\n"),
+		] {
+			let p = tmp.path().join(path);
+			if let Some(parent) = p.parent() {
+				std::fs::create_dir_all(parent).unwrap();
+			}
+			std::fs::write(p, body).unwrap();
+		}
+
+		let names = rel_names(tmp.path(), walk_source_files(tmp.path(), &ScannerConfig::default()));
+		for expected in [
+			"frontend/src/index.ts",
+			"src/Web/Program.cs",
+			"src/Web/Controllers/HomeController.cs",
+			"src/Domain/Model.fs",
+			"src/Domain/Model.fsi",
+			"src/Domain/Scripts/Seed.fsx",
+			"src/Legacy/Module.vb",
+		] {
+			assert!(names.iter().any(|n| n == expected), "missing {expected} in {names:?}");
+		}
+		assert!(names.iter().all(|n| !n.contains("/bin/")), "bin leak: {names:?}");
+		assert!(names.iter().all(|n| !n.contains("/obj/")), "obj leak: {names:?}");
+	}
+
+	#[test]
+	fn deeply_nested_dotnet_projects_are_discovered() {
+		let tmp = tempfile::tempdir().unwrap();
+
+		for (path, body) in [
+			("src/services/api/v2/foo/app/Foo.csproj", "<Project />\n"),
+			("src/services/api/v2/foo/app/Program.cs", "class Program {}\n"),
+		] {
+			let p = tmp.path().join(path);
+			if let Some(parent) = p.parent() {
+				std::fs::create_dir_all(parent).unwrap();
+			}
+			std::fs::write(p, body).unwrap();
+		}
+
+		let names = rel_names(tmp.path(), walk_source_files(tmp.path(), &ScannerConfig::default()));
+		assert!(
+			names.iter().any(|n| n == "src/services/api/v2/foo/app/Program.cs"),
+			"names: {names:?}"
+		);
 	}
 
 	#[test]
