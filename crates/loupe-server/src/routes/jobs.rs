@@ -62,12 +62,6 @@ fn job_to_info(row: &JobRow) -> JobInfo {
 	}
 }
 
-enum RetryJobResult {
-	Retried(JobRow),
-	NotFound,
-	Conflict(String),
-}
-
 /// `POST /v1/repos/:id/scan` — admin enqueues a scan job for `id`.
 pub async fn enqueue_scan(
 	State(state): State<AppState>, Path(repo_id): Path<i64>, Json(req): Json<ScanRequest>,
@@ -142,107 +136,18 @@ pub async fn retry(
 	let now = now_secs();
 	let result = state
 		.db
-		.with_conn(|c| {
-			let tx = c.transaction()?;
-			let Some(row) = jobs::get(&tx, id)? else {
-				return Ok(RetryJobResult::NotFound);
-			};
-			if row.state != JobState::Failed {
-				return Ok(RetryJobResult::Conflict(format!(
-					"job {id} is {:?}, not failed",
-					row.state
-				)));
-			}
-			if row.kind == JobKind::Verify {
-				let Some(finding_id) = row.target_finding_id else {
-					return Ok(RetryJobResult::Conflict(format!(
-						"verify job {id} has no target finding"
-					)));
-				};
-				let Some(finding) = findings::get(&tx, finding_id)? else {
-					return Ok(RetryJobResult::Conflict(format!(
-						"verify job {id} target finding {finding_id} no longer exists"
-					)));
-				};
-				let deadline = now + DEFAULT_VALIDATING_BUDGET_SECS;
-				match finding.state {
-					FindingState::Validating => {},
-					FindingState::Dismissed => {
-						let deadline_dismissed_without_terminal_verdict: bool = tx.query_row(
-							"SELECT
-							    EXISTS(
-							      SELECT 1 FROM finding_verifications
-							       WHERE finding_id = ?1
-							         AND job_id IS NULL
-							         AND verdict = 'inconclusive'
-							         AND notes = 'validating_deadline expired'
-							    )
-							    AND NOT EXISTS(
-							      SELECT 1 FROM finding_verifications
-							       WHERE finding_id = ?1
-							         AND verdict IN ('confirmed', 'dismissed')
-							    )",
-							[finding_id],
-							|r| r.get(0),
-						)?;
-						if !deadline_dismissed_without_terminal_verdict {
-							return Ok(RetryJobResult::Conflict(format!(
-								"verify job {id} target finding {finding_id} is dismissed by a terminal verdict"
-							)));
-						}
-						tx.execute(
-							"UPDATE findings
-							   SET state = 'validating',
-							       dismissed_at = NULL,
-							       validating_deadline = ?1
-							 WHERE id = ?2 AND state = 'dismissed'",
-							(deadline, finding_id),
-						)?;
-					},
-					other => {
-						return Ok(RetryJobResult::Conflict(format!(
-							"verify job {id} target finding {finding_id} is {other}, not validating"
-						)));
-					},
-				}
-				tx.execute(
-					"UPDATE findings
-					   SET validating_deadline = ?1
-					 WHERE id = ?2 AND state = 'validating'",
-					(deadline, finding_id),
-				)?;
-			}
-
-			let updated = tx.execute(
-				"UPDATE jobs
-				   SET state = 'queued',
-				       worker_id = NULL,
-				       lease_expires_at = NULL,
-				       attempts = 0,
-				       started_at = NULL,
-				       finished_at = NULL,
-				       error = NULL,
-				       head_sha = NULL,
-				       enqueued_at = ?2
-				 WHERE id = ?1 AND state = 'failed'",
-				(id, now),
-			)?;
-			if updated == 0 {
-				return Ok(RetryJobResult::Conflict(format!("job {id} changed before retry")));
-			}
-			let row = jobs::get(&tx, id)?.expect("updated job row still exists");
-			tx.commit()?;
-			Ok(RetryJobResult::Retried(row))
-		})
+		.with_conn(|c| Ok(jobs::retry_failed(c, id, now, now + DEFAULT_VALIDATING_BUDGET_SECS)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("retry job: {e}")))?;
 
 	match result {
-		RetryJobResult::Retried(row) => {
+		jobs::RetryOutcome::Retried(row) => {
 			state.job_arrived.notify_waiters();
 			Ok(Json(job_to_info(&row)))
 		},
-		RetryJobResult::NotFound => Err((StatusCode::NOT_FOUND, format!("no job with id {id}"))),
-		RetryJobResult::Conflict(msg) => Err((StatusCode::CONFLICT, msg)),
+		jobs::RetryOutcome::NotFound => {
+			Err((StatusCode::NOT_FOUND, format!("no job with id {id}")))
+		},
+		jobs::RetryOutcome::Conflict(msg) => Err((StatusCode::CONFLICT, msg)),
 	}
 }
 
@@ -379,19 +284,7 @@ fn build_lease_envelope(state: &AppState, row: &JobRow) -> anyhow::Result<LeaseE
 				.db
 				.with_conn(|c| Ok(jobs::get(c, reviewed_job_id)?))?
 				.and_then(|j| if j.kind == JobKind::Scan { j.head_sha } else { None });
-			let finding = loupe_core::Finding {
-				scanner_id: finding_row.scanner_id,
-				severity: finding_row.severity,
-				title: finding_row.title,
-				description: finding_row.description,
-				file_path: finding_row.file_path,
-				line_start: finding_row.line_start,
-				line_end: finding_row.line_end,
-				cwe: finding_row.cwe,
-				patch_unified: finding_row.patch_unified,
-				poc_unified: finding_row.poc_unified,
-				fingerprint: finding_row.fingerprint,
-			};
+			let finding = finding_row.into_finding();
 			LeasePayload::Verify { finding_id: target_id, finding: Box::new(finding), reviewed_sha }
 		},
 	};
@@ -544,7 +437,7 @@ pub async fn submit_verdict(
 	// transaction so a concurrent verdict from a second verifier
 	// can't catch us mid-state-flip and observe "confirmed AND
 	// dismissed" simultaneously.
-	let new_state: Option<&str> = state
+	let new_state: Option<FindingState> = state
 		.db
 		.with_conn(|c| {
 			let tx = c.transaction()?;
@@ -571,65 +464,13 @@ pub async fn submit_verdict(
 					now,
 				)?;
 			}
-			// Bail out early if the finding was already terminal — a
-			// concurrent reaper or earlier verdict beat us here.
-			let current: String = tx.query_row(
-				"SELECT state FROM findings WHERE id = ?1",
-				[target_finding_id],
-				|r| r.get(0),
+			let next_state = loupe_storage::findings::roll_up_verdicts_for_finding(
+				&tx,
+				target_finding_id,
+				terminal_inconclusive,
+				require_approval,
+				now,
 			)?;
-			if current != "validating" {
-				tx.commit()?;
-				return Ok(None);
-			}
-			// Default rollup policy:
-			//   terminal inconclusive ⇒ dismissed
-			//   else any 'dismissed'  ⇒ dismissed
-			//   else any 'confirmed' ⇒ confirmed
-			//   else stay 'validating' (waiting for more verdicts or
-			//        the deadline reaper).
-			let next_state: Option<&'static str> = if terminal_inconclusive {
-				Some("dismissed")
-			} else {
-				let any_dismissed: bool = tx.query_row(
-					"SELECT EXISTS(SELECT 1 FROM finding_verifications
-					                 WHERE finding_id = ?1 AND verdict = 'dismissed')",
-					[target_finding_id],
-					|r| r.get(0),
-				)?;
-				if any_dismissed {
-					Some("dismissed")
-				} else {
-					let any_confirmed: bool = tx.query_row(
-						"SELECT EXISTS(SELECT 1 FROM finding_verifications
-						                 WHERE finding_id = ?1 AND verdict = 'confirmed')",
-						[target_finding_id],
-						|r| r.get(0),
-					)?;
-					if any_confirmed {
-						if require_approval {
-							Some("awaiting_approval")
-						} else {
-							Some("confirmed")
-						}
-					} else {
-						None
-					}
-				}
-			};
-			if let Some(s) = next_state {
-				// `awaiting_approval` doesn't stamp anything yet —
-				// `approved_at` lands later when the operator approves.
-				let stamp_clause = match s {
-					"confirmed" => ", confirmed_at = ?2",
-					"dismissed" => ", dismissed_at = ?2",
-					_ => "",
-				};
-				tx.execute(
-					&format!("UPDATE findings SET state = ?1{stamp_clause} WHERE id = ?3"),
-					(s, now, target_finding_id),
-				)?;
-			}
 			tx.commit()?;
 			Ok(next_state)
 		})
@@ -637,7 +478,7 @@ pub async fn submit_verdict(
 			(StatusCode::INTERNAL_SERVER_ERROR, format!("submit verdict: {e}"))
 		})?;
 
-	if matches!(new_state, Some("confirmed")) {
+	if matches!(new_state, Some(FindingState::Confirmed)) {
 		if let Err(e) = dispatch_finding(&state, target_finding_id, now).await {
 			tracing::warn!(
 				finding_id = target_finding_id,
@@ -764,55 +605,16 @@ pub async fn complete(
 					),
 				)?;
 
-				// Transition each finding produced by this scan. The
-				// auto-pass branch (verification_required = 0) lands on
-				// either `confirmed` (dispatcher picks up later) or
-				// `awaiting_approval` (parked until a human runs
-				// `loupectl finding approve`), driven by the repo's
-				// effective `require_approval`. `confirmed_at` is only
-				// stamped on the `confirmed` path — `awaiting_approval`
-				// stamps `approved_at` later when (and if) approved.
-				if require_approval {
-					tx.execute(
-						"UPDATE findings
-						   SET state = 'awaiting_approval'
-						 WHERE job_id = ?1 AND verification_required = 0 AND state = 'pending'",
-						[job_id],
-					)?;
-				} else {
-					tx.execute(
-						"UPDATE findings
-						   SET state = 'confirmed', confirmed_at = ?1
-						 WHERE job_id = ?2 AND verification_required = 0 AND state = 'pending'",
-						(now, job_id),
-					)?;
-				}
-				tx.execute(
-					"UPDATE findings
-					   SET state = 'validating', validating_deadline = ?1
-					 WHERE job_id = ?2 AND verification_required = 1 AND state = 'pending'",
-					(now + DEFAULT_VALIDATING_BUDGET_SECS, job_id),
+				findings::transition_scan_findings_after_success(
+					&tx,
+					job_id,
+					require_approval,
+					now + DEFAULT_VALIDATING_BUDGET_SECS,
+					now,
 				)?;
-
-				// Enqueue one verify job per finding now in 'validating'
-				// for this scan. We use a stand-alone INSERT…SELECT so
-				// the verify-job rows go in inside the same transaction
-				// as the state flips.
-				tx.execute(
-					"INSERT INTO jobs
-					   (repo_id, kind, state, incremental, parent_job_id,
-					    target_finding_id, enqueued_at)
-					 SELECT ?1, 'verify', 'queued', 0, ?2, id, ?3
-					 FROM findings
-					 WHERE job_id = ?2 AND state = 'validating'",
-					(job.repo_id, job_id, now),
-				)?;
+				jobs::enqueue_verify_jobs_for_scan(&tx, job.repo_id, job_id, now)?;
 			} else if matches!(new_state, JobState::Failed) && job.kind == JobKind::Scan {
-				tx.execute(
-					"DELETE FROM findings
-					 WHERE job_id = ?1 AND state = 'pending'",
-					[job_id],
-				)?;
+				findings::delete_pending_for_job(&tx, job_id)?;
 			}
 			tx.commit()?;
 			Ok(true)
@@ -992,45 +794,17 @@ fn reporter_secret(state: &AppState, repo: &repos::RepoRow) -> anyhow::Result<St
 	}
 }
 
-fn finding_from_row(row: findings::FindingRow) -> loupe_core::Finding {
-	loupe_core::Finding {
-		scanner_id: row.scanner_id,
-		severity: row.severity,
-		title: row.title,
-		description: row.description,
-		file_path: row.file_path,
-		line_start: row.line_start,
-		line_end: row.line_end,
-		cwe: row.cwe,
-		patch_unified: row.patch_unified,
-		poc_unified: row.poc_unified,
-		fingerprint: row.fingerprint,
-	}
-}
-
 fn report_finding_from_row(
 	state: &AppState, row: findings::FindingRow,
 ) -> anyhow::Result<reporters::ReportFinding> {
 	let job_id = row.job_id;
-	let finding = finding_from_row(row);
+	let finding = row.into_finding();
 	let reviewed_revision =
 		state.db.with_conn(|c| Ok(jobs::get(c, job_id)?))?.and_then(|j| j.head_sha);
 	Ok(reporters::ReportFinding { finding, reviewed_revision })
 }
 
 fn mark_reported(state: &AppState, ids: &[i64], now: i64) -> anyhow::Result<usize> {
-	let n = state.db.with_conn(|c| {
-		let tx = c.transaction()?;
-		let mut n = 0usize;
-		for id in ids {
-			n += tx.execute(
-				"UPDATE findings SET reported_at = ?1, state = 'reported'
-				 WHERE id = ?2 AND state = 'confirmed'",
-				(now, id),
-			)?;
-		}
-		tx.commit()?;
-		Ok(n)
-	})?;
+	let n = state.db.with_conn(|c| Ok(findings::mark_reported(c, ids, now)?))?;
 	Ok(n)
 }

@@ -5,7 +5,9 @@
 //! `JobKind::as_str` exactly so callers can shuttle them through SQL
 //! without having to define their own constants.
 
-use loupe_core::{JobKind, JobState};
+use loupe_core::{
+	initial_job_state, FindingState, JobKind, JobState, JobTransition, StateTransitionError,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// Lease lifetime in seconds. Worker must heartbeat or complete before
@@ -15,6 +17,13 @@ pub const DEFAULT_LEASE_SECONDS: i64 = 600;
 /// Cap on retry attempts. After this many leases-then-failures, the job
 /// is moved to `failed` rather than back to `queued`.
 pub const MAX_ATTEMPTS: u32 = 3;
+
+pub const JOB_CANCELLED_BY_ADMIN_ERROR: &str = "cancelled by admin";
+pub const LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR: &str = "lease expired after max attempts";
+
+const JOB_COLUMNS: &str = "id, repo_id, kind, state, incremental, since_sha, head_sha,
+        parent_job_id, target_finding_id, worker_id, lease_expires_at,
+        attempts, enqueued_at, started_at, finished_at, error";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRow {
@@ -53,16 +62,26 @@ pub enum CancelOutcome {
 	NotCancellable(JobState),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryOutcome {
+	Retried(JobRow),
+	NotFound,
+	Conflict(String),
+}
+
 /// Insert a `queued` job, returning the new id.
 pub fn enqueue(conn: &Connection, new: &NewJob, now: i64) -> rusqlite::Result<i64> {
+	let initial_state =
+		initial_job_state(JobTransition::Enqueue).map_err(sql_state_transition_error)?;
 	conn.execute(
 		"INSERT INTO jobs
 		   (repo_id, kind, state, incremental, since_sha,
 		    parent_job_id, target_finding_id, enqueued_at)
-		 VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7)",
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
 		params![
 			new.repo_id,
 			new.kind.as_str(),
+			initial_state.as_str(),
 			new.incremental as i64,
 			new.since_sha,
 			new.parent_job_id,
@@ -88,28 +107,30 @@ pub fn lease_next(
 	conn: &Connection, worker_id: i64, accepts_verify: bool, now: i64, lease_seconds: i64,
 ) -> rusqlite::Result<Option<JobRow>> {
 	let lease_until = now + lease_seconds;
-	let mut stmt = conn.prepare(
+	let target_state =
+		JobState::Queued.apply(JobTransition::Lease).map_err(sql_state_transition_error)?;
+	let mut stmt = conn.prepare(&format!(
 		"UPDATE jobs
-		   SET state = 'leased',
-		       worker_id = ?1,
-		       lease_expires_at = ?2,
+		   SET state = ?1,
+		       worker_id = ?2,
+		       lease_expires_at = ?3,
 		       attempts = attempts + 1,
-		       started_at = COALESCE(started_at, ?3)
+		       started_at = COALESCE(started_at, ?4)
 		 WHERE id = (
 		     SELECT id FROM jobs
 		     WHERE state = 'queued'
-		       AND (kind = 'scan' OR (kind = 'verify' AND ?4 = 1))
+		       AND (kind = 'scan' OR (kind = 'verify' AND ?5 = 1))
 		     ORDER BY
-		       CASE WHEN kind = 'verify' AND ?4 = 1 THEN 0 ELSE 1 END,
+		       CASE WHEN kind = 'verify' AND ?5 = 1 THEN 0 ELSE 1 END,
 		       enqueued_at ASC
 		     LIMIT 1
 		 )
-		 RETURNING id, repo_id, kind, state, incremental, since_sha, head_sha,
-		           parent_job_id, target_finding_id, worker_id, lease_expires_at,
-		           attempts, enqueued_at, started_at, finished_at, error",
+		 RETURNING {JOB_COLUMNS}",
+	))?;
+	let mut iter = stmt.query_map(
+		params![target_state.as_str(), worker_id, lease_until, now, accepts_verify as i64],
+		row_to_job,
 	)?;
-	let mut iter =
-		stmt.query_map(params![worker_id, lease_until, now, accepts_verify as i64], row_to_job)?;
 	match iter.next() {
 		Some(row) => Ok(Some(row?)),
 		None => Ok(None),
@@ -123,11 +144,13 @@ pub fn heartbeat(
 	conn: &Connection, job_id: i64, worker_id: i64, now: i64, lease_seconds: i64,
 ) -> rusqlite::Result<Option<i64>> {
 	let lease_until = now + lease_seconds;
+	let leased_state =
+		JobState::Leased.apply(JobTransition::Heartbeat).map_err(sql_state_transition_error)?;
 	let n = conn.execute(
 		"UPDATE jobs
 		   SET lease_expires_at = ?1
-		 WHERE id = ?2 AND state = 'leased' AND worker_id = ?3",
-		params![lease_until, job_id, worker_id],
+		 WHERE id = ?2 AND state = ?3 AND worker_id = ?4",
+		params![lease_until, job_id, leased_state.as_str(), worker_id],
 	)?;
 	Ok(if n > 0 { Some(lease_until) } else { None })
 }
@@ -138,6 +161,17 @@ pub fn complete(
 	conn: &Connection, job_id: i64, worker_id: i64, new_state: JobState, head_sha: Option<&str>,
 	error: Option<&str>, now: i64,
 ) -> rusqlite::Result<bool> {
+	let transition = match new_state {
+		JobState::Succeeded => JobTransition::CompleteSucceeded,
+		JobState::Failed => JobTransition::CompleteFailed,
+		other => {
+			return Err(rusqlite::Error::InvalidParameterName(format!(
+				"job completion target must be succeeded or failed, got {}",
+				other.as_str()
+			)));
+		},
+	};
+	let target_state = JobState::Leased.apply(transition).map_err(sql_state_transition_error)?;
 	let n = conn.execute(
 		"UPDATE jobs
 		   SET state = ?1,
@@ -145,8 +179,16 @@ pub fn complete(
 		       error = ?3,
 		       finished_at = ?4,
 		       lease_expires_at = NULL
-		 WHERE id = ?5 AND state = 'leased' AND worker_id = ?6",
-		params![new_state.as_str(), head_sha, error, now, job_id, worker_id],
+		 WHERE id = ?5 AND state = ?6 AND worker_id = ?7",
+		params![
+			target_state.as_str(),
+			head_sha,
+			error,
+			now,
+			job_id,
+			JobState::Leased.as_str(),
+			worker_id,
+		],
 	)?;
 	Ok(n > 0)
 }
@@ -157,38 +199,134 @@ pub fn complete(
 pub fn cancel(conn: &mut Connection, job_id: i64, now: i64) -> rusqlite::Result<CancelOutcome> {
 	let tx = conn.transaction()?;
 	let Some(row) = get(&tx, job_id)? else { return Ok(CancelOutcome::NotFound) };
-	if !matches!(row.state, JobState::Queued | JobState::Leased) {
-		return Ok(CancelOutcome::NotCancellable(row.state));
-	}
+	let target_state = match row.state.apply(JobTransition::Cancel) {
+		Ok(state) => state,
+		Err(_) => return Ok(CancelOutcome::NotCancellable(row.state)),
+	};
 
 	let updated = tx.execute(
 		"UPDATE jobs
-		   SET state = 'cancelled',
+		   SET state = ?2,
 		       worker_id = NULL,
 		       lease_expires_at = NULL,
-		       finished_at = ?2,
-		       error = 'cancelled by admin'
+		       finished_at = ?3,
+		       error = ?4
 		 WHERE id = ?1 AND state IN ('queued','leased')",
-		(job_id, now),
+		(job_id, target_state.as_str(), now, JOB_CANCELLED_BY_ADMIN_ERROR),
 	)?;
 	if updated == 0 {
 		let state = get(&tx, job_id)?.map(|row| row.state).unwrap_or(JobState::Cancelled);
 		return Ok(CancelOutcome::NotCancellable(state));
 	}
 	if row.kind == JobKind::Scan {
-		tx.execute("DELETE FROM findings WHERE job_id = ?1 AND state = 'pending'", [job_id])?;
+		crate::findings::delete_pending_for_job(&tx, job_id)?;
 	}
 	let row = get(&tx, job_id)?.expect("cancelled job row still exists");
 	tx.commit()?;
 	Ok(CancelOutcome::Cancelled(row))
 }
 
+pub fn enqueue_verify_jobs_for_scan(
+	conn: &Connection, repo_id: i64, scan_job_id: i64, now: i64,
+) -> rusqlite::Result<usize> {
+	let initial_state =
+		initial_job_state(JobTransition::Enqueue).map_err(sql_state_transition_error)?;
+	conn.execute(
+		"INSERT INTO jobs
+		   (repo_id, kind, state, incremental, parent_job_id,
+		    target_finding_id, enqueued_at)
+		 SELECT ?1, ?2, ?3, 0, ?4, id, ?5
+		 FROM findings
+		 WHERE job_id = ?4 AND state = ?6",
+		params![
+			repo_id,
+			JobKind::Verify.as_str(),
+			initial_state.as_str(),
+			scan_job_id,
+			now,
+			FindingState::Validating.as_str(),
+		],
+	)
+}
+
+pub fn retry_failed(
+	conn: &mut Connection, job_id: i64, now: i64, validating_deadline: i64,
+) -> rusqlite::Result<RetryOutcome> {
+	let tx = conn.transaction()?;
+	let Some(row) = get(&tx, job_id)? else { return Ok(RetryOutcome::NotFound) };
+	if row.state != JobState::Failed {
+		return Ok(RetryOutcome::Conflict(format!("job {job_id} is {:?}, not failed", row.state)));
+	}
+	if row.kind == JobKind::Verify {
+		let Some(finding_id) = row.target_finding_id else {
+			return Ok(RetryOutcome::Conflict(format!(
+				"verify job {job_id} has no target finding"
+			)));
+		};
+		let Some(finding) = crate::findings::get(&tx, finding_id)? else {
+			return Ok(RetryOutcome::Conflict(format!(
+				"verify job {job_id} target finding {finding_id} no longer exists"
+			)));
+		};
+		match finding.state {
+			FindingState::Validating => {},
+			FindingState::Dismissed => {
+				if !crate::findings::is_deadline_dismissed_without_terminal_verdict(
+					&tx, finding_id,
+				)? {
+					return Ok(RetryOutcome::Conflict(format!(
+						"verify job {job_id} target finding {finding_id} is dismissed by a terminal verdict"
+					)));
+				}
+			},
+			other => {
+				return Ok(RetryOutcome::Conflict(format!(
+					"verify job {job_id} target finding {finding_id} is {other}, not validating"
+				)));
+			},
+		}
+		if !crate::findings::retry_verification(&tx, finding_id, validating_deadline)? {
+			return Ok(RetryOutcome::Conflict(format!(
+				"verify job {job_id} target finding {finding_id} changed before retry"
+			)));
+		}
+	}
+
+	let Some(row) = requeue_failed(&tx, job_id, now)? else {
+		return Ok(RetryOutcome::Conflict(format!("job {job_id} changed before retry")));
+	};
+	tx.commit()?;
+	Ok(RetryOutcome::Retried(row))
+}
+
+pub fn requeue_failed(
+	conn: &Connection, job_id: i64, now: i64,
+) -> rusqlite::Result<Option<JobRow>> {
+	let target_state =
+		JobState::Failed.apply(JobTransition::Retry).map_err(sql_state_transition_error)?;
+	let updated = conn.execute(
+		"UPDATE jobs
+		   SET state = ?1,
+		       worker_id = NULL,
+		       lease_expires_at = NULL,
+		       attempts = 0,
+		       started_at = NULL,
+		       finished_at = NULL,
+		       error = NULL,
+		       head_sha = NULL,
+		       enqueued_at = ?2
+		 WHERE id = ?3 AND state = ?4",
+		(target_state.as_str(), now, job_id, JobState::Failed.as_str()),
+	)?;
+	if updated == 0 {
+		return Ok(None);
+	}
+	get(conn, job_id)
+}
+
 pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
 	conn.query_row(
-		"SELECT id, repo_id, kind, state, incremental, since_sha, head_sha,
-		        parent_job_id, target_finding_id, worker_id, lease_expires_at,
-		        attempts, enqueued_at, started_at, finished_at, error
-		 FROM jobs WHERE id = ?1",
+		&format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"),
 		params![id],
 		row_to_job,
 	)
@@ -196,13 +334,11 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
 }
 
 pub fn list(conn: &Connection) -> rusqlite::Result<Vec<JobRow>> {
-	let mut stmt = conn.prepare(
-		"SELECT id, repo_id, kind, state, incremental, since_sha, head_sha,
-		        parent_job_id, target_finding_id, worker_id, lease_expires_at,
-		        attempts, enqueued_at, started_at, finished_at, error
+	let mut stmt = conn.prepare(&format!(
+		"SELECT {JOB_COLUMNS}
 		 FROM jobs
 		 ORDER BY enqueued_at DESC, id DESC",
-	)?;
+	))?;
 	let rows = stmt.query_map([], row_to_job)?.collect::<rusqlite::Result<Vec<_>>>()?;
 	Ok(rows)
 }
@@ -245,6 +381,10 @@ pub fn worker_has_active_lease_for_repo(
 /// `queued` if `attempts < MAX_ATTEMPTS`, else `failed` with an error
 /// message. Returns the number of rows affected.
 pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+	let requeued_state =
+		JobState::Leased.apply(JobTransition::ReapToQueued).map_err(sql_state_transition_error)?;
+	let failed_state =
+		JobState::Leased.apply(JobTransition::ReapToFailed).map_err(sql_state_transition_error)?;
 	let failing_scan_jobs = {
 		let mut stmt = conn.prepare(
 			"SELECT id FROM jobs
@@ -258,30 +398,34 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 	};
 	let requeued = conn.execute(
 		"UPDATE jobs
-		   SET state = 'queued',
+		   SET state = ?2,
 		       worker_id = NULL,
 		       lease_expires_at = NULL
 		 WHERE state = 'leased'
 		   AND lease_expires_at < ?1
-		   AND attempts < ?2",
-		params![now, MAX_ATTEMPTS],
+		   AND attempts < ?3",
+		params![now, requeued_state.as_str(), MAX_ATTEMPTS],
 	)?;
 	let failed = conn.execute(
 		"UPDATE jobs
-		   SET state = 'failed',
+		   SET state = ?3,
 		       worker_id = NULL,
 		       lease_expires_at = NULL,
 		       finished_at = ?1,
-		       error = COALESCE(error, 'lease expired after max attempts')
+		       error = COALESCE(error, ?4)
 		 WHERE state = 'leased'
 		   AND lease_expires_at < ?1
 		   AND attempts >= ?2",
-		params![now, MAX_ATTEMPTS],
+		params![now, MAX_ATTEMPTS, failed_state.as_str(), LEASE_EXPIRED_AFTER_MAX_ATTEMPTS_ERROR],
 	)?;
 	for job_id in failing_scan_jobs {
-		conn.execute("DELETE FROM findings WHERE job_id = ?1 AND state = 'pending'", [job_id])?;
+		crate::findings::delete_pending_for_job(conn, job_id)?;
 	}
 	Ok(requeued + failed)
+}
+
+fn sql_state_transition_error(error: StateTransitionError) -> rusqlite::Error {
+	rusqlite::Error::InvalidParameterName(error.to_string())
 }
 
 fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
@@ -664,7 +808,7 @@ mod tests {
 		let CancelOutcome::Cancelled(row) = outcome else { panic!("expected cancelled outcome") };
 		assert_eq!(row.state, JobState::Cancelled);
 		assert_eq!(row.finished_at, Some(200));
-		assert_eq!(row.error.as_deref(), Some("cancelled by admin"));
+		assert_eq!(row.error.as_deref(), Some(JOB_CANCELLED_BY_ADMIN_ERROR));
 		assert!(row.worker_id.is_none());
 		assert!(row.lease_expires_at.is_none());
 

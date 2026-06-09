@@ -1,7 +1,12 @@
 //! DAO for the `findings` table.
 
-use loupe_core::{Finding, FindingState, Severity};
+use loupe_core::{
+	initial_finding_state, roll_up_verdicts, Finding, FindingState, FindingTransition, Severity,
+	StateTransitionError, VerdictRollup,
+};
 use rusqlite::{params, Connection, OptionalExtension};
+
+pub const VALIDATING_DEADLINE_EXPIRED_NOTE: &str = "validating_deadline expired";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindingRow {
@@ -31,24 +36,44 @@ pub struct FindingRow {
 	pub patch_notes: Option<String>,
 }
 
+impl FindingRow {
+	pub fn into_finding(self) -> Finding {
+		Finding {
+			scanner_id: self.scanner_id,
+			severity: self.severity,
+			title: self.title,
+			description: self.description,
+			file_path: self.file_path,
+			line_start: self.line_start,
+			line_end: self.line_end,
+			cwe: self.cwe,
+			patch_unified: self.patch_unified,
+			poc_unified: self.poc_unified,
+			fingerprint: self.fingerprint,
+		}
+	}
+}
+
 /// Insert a finding produced by a scan job. Idempotent on
 /// `UNIQUE(repo_id, fingerprint)`: a duplicate insert returns `None`
 /// rather than erroring, so the worker can retry safely.
 ///
 /// `verification_required` controls whether the finding starts in
 /// `validating` (the verify flow will confirm or dismiss it) or goes
-/// straight through. The state column itself is still left at the
-/// schema default `'pending'`; the complete handler is what flips it.
+/// straight through. Inserted rows start as `pending`; the complete
+/// handler is what flips them.
 pub fn insert_or_ignore(
 	conn: &Connection, repo_id: i64, job_id: i64, f: &Finding, verification_required: bool,
 	now: i64,
 ) -> rusqlite::Result<Option<i64>> {
+	let initial_state = initial_finding_state(FindingTransition::ScanAccepted)
+		.map_err(sql_state_transition_error)?;
 	let n = conn.execute(
 		"INSERT OR IGNORE INTO findings
 		   (repo_id, job_id, scanner_id, severity, title, description,
 		    file_path, line_start, line_end, cwe, patch_unified,
-		    poc_unified, fingerprint, verification_required, created_at)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+		    poc_unified, fingerprint, state, verification_required, created_at)
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
 		params![
 			repo_id,
 			job_id,
@@ -63,6 +88,7 @@ pub fn insert_or_ignore(
 			&f.patch_unified,
 			&f.poc_unified,
 			&f.fingerprint,
+			initial_state.as_str(),
 			verification_required as i64,
 			now,
 		],
@@ -87,38 +113,163 @@ pub fn list_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<Vec<Find
 	rows.collect()
 }
 
+pub fn transition_scan_findings_after_success(
+	conn: &Connection, job_id: i64, require_approval: bool, validating_deadline: i64, now: i64,
+) -> rusqlite::Result<usize> {
+	let source_state = FindingState::Pending;
+	let auto_transition = if require_approval {
+		FindingTransition::ScanAwaitApproval
+	} else {
+		FindingTransition::ScanAutoConfirm
+	};
+	let auto_target = source_state.apply(auto_transition).map_err(sql_state_transition_error)?;
+	let verify_target = source_state
+		.apply(FindingTransition::ScanRequireVerification)
+		.map_err(sql_state_transition_error)?;
+
+	let auto_count = if require_approval {
+		conn.execute(
+			"UPDATE findings
+			   SET state = ?1
+			 WHERE job_id = ?2 AND verification_required = 0 AND state = ?3",
+			(auto_target.as_str(), job_id, source_state.as_str()),
+		)?
+	} else {
+		conn.execute(
+			"UPDATE findings
+			   SET state = ?1, confirmed_at = ?2
+			 WHERE job_id = ?3 AND verification_required = 0 AND state = ?4",
+			(auto_target.as_str(), now, job_id, source_state.as_str()),
+		)?
+	};
+	let verify_count = conn.execute(
+		"UPDATE findings
+		   SET state = ?1, validating_deadline = ?2
+		 WHERE job_id = ?3 AND verification_required = 1 AND state = ?4",
+		(verify_target.as_str(), validating_deadline, job_id, source_state.as_str()),
+	)?;
+	Ok(auto_count + verify_count)
+}
+
+pub fn delete_pending_for_job(conn: &Connection, job_id: i64) -> rusqlite::Result<usize> {
+	conn.execute(
+		"DELETE FROM findings WHERE job_id = ?1 AND state = ?2",
+		(job_id, FindingState::Pending.as_str()),
+	)
+}
+
 /// Reap findings whose `validating_deadline` has elapsed without
 /// enough verdicts to flip state. Each reaped finding gets a
 /// system-issued `inconclusive` verdict in `finding_verifications`
 /// (with `job_id = NULL`) and transitions to `dismissed`. Returns the
 /// number of findings reaped.
 pub fn reap_stale_validating(conn: &mut Connection, now: i64) -> rusqlite::Result<usize> {
+	let source_state = FindingState::Validating;
+	let target_state = source_state
+		.apply(FindingTransition::DeadlineExpire)
+		.map_err(sql_state_transition_error)?;
 	let tx = conn.transaction()?;
 	let stale: Vec<i64> = {
 		let mut stmt = tx.prepare(
 			"SELECT id FROM findings
-			 WHERE state = 'validating'
+			 WHERE state = ?2
 			   AND validating_deadline IS NOT NULL
 			   AND validating_deadline < ?1",
 		)?;
-		let rows = stmt.query_map([now], |r| r.get::<_, i64>(0))?;
+		let rows = stmt.query_map((now, source_state.as_str()), |r| r.get::<_, i64>(0))?;
 		rows.collect::<rusqlite::Result<Vec<i64>>>()?
 	};
 	for fid in &stale {
 		tx.execute(
 			"INSERT INTO finding_verifications
 			   (finding_id, job_id, verdict, notes, created_at)
-			 VALUES (?1, NULL, 'inconclusive', 'validating_deadline expired', ?2)",
-			(fid, now),
+			 VALUES (?1, NULL, 'inconclusive', ?2, ?3)",
+			(fid, VALIDATING_DEADLINE_EXPIRED_NOTE, now),
 		)?;
 		tx.execute(
-			"UPDATE findings SET state = 'dismissed', dismissed_at = ?1
-			 WHERE id = ?2 AND state = 'validating'",
-			(now, fid),
+			"UPDATE findings SET state = ?1, dismissed_at = ?2
+			 WHERE id = ?3 AND state = ?4",
+			(target_state.as_str(), now, fid, source_state.as_str()),
 		)?;
 	}
 	tx.commit()?;
 	Ok(stale.len())
+}
+
+pub fn roll_up_verdicts_for_finding(
+	conn: &Connection, finding_id: i64, terminal_inconclusive: bool, require_approval: bool,
+	now: i64,
+) -> rusqlite::Result<Option<FindingState>> {
+	let current = get(conn, finding_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?.state;
+	let has_dismissed: bool = conn.query_row(
+		"SELECT EXISTS(SELECT 1 FROM finding_verifications
+		                 WHERE finding_id = ?1 AND verdict = 'dismissed')",
+		[finding_id],
+		|r| r.get(0),
+	)?;
+	let has_confirmed: bool = conn.query_row(
+		"SELECT EXISTS(SELECT 1 FROM finding_verifications
+		                 WHERE finding_id = ?1 AND verdict = 'confirmed')",
+		[finding_id],
+		|r| r.get(0),
+	)?;
+	let next = roll_up_verdicts(
+		current,
+		VerdictRollup { has_confirmed, has_dismissed, terminal_inconclusive, require_approval },
+	)
+	.map_err(sql_state_transition_error)?;
+	let Some(next_state) = next else { return Ok(None) };
+	let stamp_clause = match next_state {
+		FindingState::Confirmed => ", confirmed_at = ?2",
+		FindingState::Dismissed => ", dismissed_at = ?2",
+		_ => "",
+	};
+	conn.execute(
+		&format!("UPDATE findings SET state = ?1{stamp_clause} WHERE id = ?3"),
+		(next_state.as_str(), now, finding_id),
+	)?;
+	Ok(Some(next_state))
+}
+
+pub fn is_deadline_dismissed_without_terminal_verdict(
+	conn: &Connection, finding_id: i64,
+) -> rusqlite::Result<bool> {
+	conn.query_row(
+		"SELECT
+		    EXISTS(
+		      SELECT 1 FROM finding_verifications
+		       WHERE finding_id = ?1
+		         AND job_id IS NULL
+		         AND verdict = 'inconclusive'
+		         AND notes = ?2
+		    )
+		    AND NOT EXISTS(
+		      SELECT 1 FROM finding_verifications
+		       WHERE finding_id = ?1
+		         AND verdict IN ('confirmed', 'dismissed')
+		    )",
+		(finding_id, VALIDATING_DEADLINE_EXPIRED_NOTE),
+		|r| r.get(0),
+	)
+}
+
+pub fn retry_verification(
+	conn: &Connection, finding_id: i64, validating_deadline: i64,
+) -> rusqlite::Result<bool> {
+	let Some(row) = get(conn, finding_id)? else { return Ok(false) };
+	let target_state = row
+		.state
+		.apply(FindingTransition::RetryVerification)
+		.map_err(sql_state_transition_error)?;
+	let updated = conn.execute(
+		"UPDATE findings
+		   SET state = ?1,
+		       dismissed_at = NULL,
+		       validating_deadline = ?2
+		 WHERE id = ?3 AND state = ?4",
+		(target_state.as_str(), validating_deadline, finding_id, row.state.as_str()),
+	)?;
+	Ok(updated > 0)
 }
 
 /// List findings for one repo, most recent first. `limit` caps the
@@ -269,18 +420,6 @@ pub enum ApprovalOutcome {
 	NotFound,
 }
 
-/// Park a freshly-`confirmed` finding in `awaiting_approval` because
-/// the repo (or server default) requires human sign-off before
-/// dispatch. No-op if the finding isn't in `confirmed`.
-pub fn transition_to_awaiting_approval(conn: &Connection, finding_id: i64) -> rusqlite::Result<()> {
-	conn.execute(
-		"UPDATE findings SET state = 'awaiting_approval'
-		 WHERE id = ?1 AND state = 'confirmed'",
-		[finding_id],
-	)?;
-	Ok(())
-}
-
 /// Approve a finding. Stamps `approved_at`/`approved_by_cn` and
 /// transitions `awaiting_approval → confirmed` so the dispatcher can
 /// pick it up. Idempotent on already-approved rows: re-running on a
@@ -288,11 +427,14 @@ pub fn transition_to_awaiting_approval(conn: &Connection, finding_id: i64) -> ru
 pub fn approve(
 	conn: &Connection, id: i64, by_cn: &str, now: i64,
 ) -> rusqlite::Result<ApprovalOutcome> {
+	let target_state = FindingState::AwaitingApproval
+		.apply(FindingTransition::Approve)
+		.map_err(sql_state_transition_error)?;
 	let n = conn.execute(
 		"UPDATE findings
-		    SET state = 'confirmed', approved_at = ?1, approved_by_cn = ?2
-		  WHERE id = ?3 AND state = 'awaiting_approval'",
-		params![now, by_cn, id],
+		    SET state = ?1, approved_at = ?2, approved_by_cn = ?3
+		  WHERE id = ?4 AND state = ?5",
+		params![target_state.as_str(), now, by_cn, id, FindingState::AwaitingApproval.as_str()],
 	)?;
 	Ok(if n > 0 {
 		ApprovalOutcome::Applied
@@ -311,12 +453,15 @@ pub fn approve(
 pub fn reject(
 	conn: &Connection, id: i64, by_cn: &str, now: i64,
 ) -> rusqlite::Result<ApprovalOutcome> {
+	let target_state = FindingState::AwaitingApproval
+		.apply(FindingTransition::Reject)
+		.map_err(sql_state_transition_error)?;
 	let n = conn.execute(
 		"UPDATE findings
-		    SET state = 'dismissed', dismissed_at = ?1,
-		        rejected_at = ?1, rejected_by_cn = ?2
-		  WHERE id = ?3 AND state = 'awaiting_approval'",
-		params![now, by_cn, id],
+		    SET state = ?1, dismissed_at = ?2,
+		        rejected_at = ?2, rejected_by_cn = ?3
+		  WHERE id = ?4 AND state = ?5",
+		params![target_state.as_str(), now, by_cn, id, FindingState::AwaitingApproval.as_str()],
 	)?;
 	Ok(if n > 0 {
 		ApprovalOutcome::Applied
@@ -326,6 +471,27 @@ pub fn reject(
 			None => ApprovalOutcome::NotFound,
 		}
 	})
+}
+
+pub fn mark_reported(conn: &Connection, ids: &[i64], now: i64) -> rusqlite::Result<usize> {
+	let target_state = FindingState::Confirmed
+		.apply(FindingTransition::MarkReported)
+		.map_err(sql_state_transition_error)?;
+	let tx = conn.unchecked_transaction()?;
+	let mut n = 0usize;
+	for id in ids {
+		n += tx.execute(
+			"UPDATE findings SET reported_at = ?1, state = ?2
+			 WHERE id = ?3 AND state = ?4",
+			(now, target_state.as_str(), id, FindingState::Confirmed.as_str()),
+		)?;
+	}
+	tx.commit()?;
+	Ok(n)
+}
+
+fn sql_state_transition_error(error: StateTransitionError) -> rusqlite::Error {
+	rusqlite::Error::InvalidParameterName(error.to_string())
 }
 
 fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<FindingRow> {

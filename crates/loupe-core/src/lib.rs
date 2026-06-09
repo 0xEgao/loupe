@@ -10,6 +10,7 @@ mod finding_state;
 mod job;
 mod repo;
 mod severity;
+mod state_machine;
 mod verdict;
 
 pub use error::{Error, Result};
@@ -18,4 +19,8 @@ pub use finding_state::FindingState;
 pub use job::{JobKind, JobState};
 pub use repo::{RepoSpec, ReportingDestination};
 pub use severity::Severity;
+pub use state_machine::{
+	initial_finding_state, initial_job_state, roll_up_verdicts, FindingTransition, JobTransition,
+	StateTransitionError, VerdictRollup,
+};
 pub use verdict::{Verdict, VerdictPatch};
