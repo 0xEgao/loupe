@@ -33,10 +33,8 @@ use serde::Deserialize;
 use crate::auth::AuthedWorker;
 use crate::state::AppState;
 
-/// How many findings the listing endpoint returns by default. Operators
-/// who need to page further should narrow by repo and follow up via
-/// `loupectl finding get <id>` for individual rows.
-const LIST_LIMIT: i64 = 100;
+/// How many findings the listing endpoint returns by default.
+const LIST_DEFAULT_LIMIT: i64 = 100;
 
 /// Default cap on `search` results. The agent typically only needs
 /// the top handful of "is this a duplicate of any prior finding?"
@@ -81,16 +79,31 @@ fn authorize_prior_finding_repo(
 }
 
 pub async fn list_for_repo(
-	State(state): State<AppState>, Path(repo_id): Path<i64>,
+	State(state): State<AppState>, Path(repo_id): Path<i64>, Query(qp): Query<ListQuery>,
 ) -> Result<Json<ListFindingsResponse>, (StatusCode, String)> {
+	let limit = positive_limit(qp.limit)?.unwrap_or(LIST_DEFAULT_LIMIT);
 	let rows = state
 		.db
-		.with_conn(|c| Ok(findings::list_for_repo(c, repo_id, LIST_LIMIT)?))
+		.with_conn(|c| Ok(findings::list_for_repo(c, repo_id, limit)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listing findings: {e}")))?;
 	Ok(Json(ListFindingsResponse {
 		protocol_version: PROTOCOL_VERSION,
 		findings: rows.into_iter().map(row_to_summary).collect(),
 	}))
+}
+
+/// Query string for `GET /v1/repos/:id/findings`.
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+	#[serde(default)]
+	pub limit: Option<i64>,
+}
+
+fn positive_limit(limit: Option<i64>) -> Result<Option<i64>, (StatusCode, String)> {
+	if matches!(limit, Some(n) if n <= 0) {
+		return Err((StatusCode::BAD_REQUEST, "limit must be positive".into()));
+	}
+	Ok(limit)
 }
 
 /// Query string for `GET /v1/repos/:id/findings/search`.

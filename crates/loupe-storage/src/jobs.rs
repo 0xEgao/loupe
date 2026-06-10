@@ -333,13 +333,19 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
 	.optional()
 }
 
-pub fn list(conn: &Connection) -> rusqlite::Result<Vec<JobRow>> {
-	let mut stmt = conn.prepare(&format!(
+pub fn list(conn: &Connection, limit: Option<i64>) -> rusqlite::Result<Vec<JobRow>> {
+	let sql = format!(
 		"SELECT {JOB_COLUMNS}
 		 FROM jobs
 		 ORDER BY enqueued_at DESC, id DESC",
-	))?;
-	let rows = stmt.query_map([], row_to_job)?.collect::<rusqlite::Result<Vec<_>>>()?;
+	);
+	let Some(limit) = limit else {
+		let mut stmt = conn.prepare(&sql)?;
+		let rows = stmt.query_map([], row_to_job)?.collect::<rusqlite::Result<Vec<_>>>()?;
+		return Ok(rows);
+	};
+	let mut stmt = conn.prepare(&format!("{sql} LIMIT ?1"))?;
+	let rows = stmt.query_map(params![limit], row_to_job)?.collect::<rusqlite::Result<Vec<_>>>()?;
 	Ok(rows)
 }
 
@@ -901,7 +907,7 @@ mod tests {
 		db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 10)?)).unwrap();
 		let n = db.with_conn(|c| Ok(reap_stale_leases(c, 200)?)).unwrap();
 		assert_eq!(n, 1);
-		let row = db.with_conn(|c| Ok(list(c)?)).unwrap().pop().unwrap();
+		let row = db.with_conn(|c| Ok(list(c, None)?)).unwrap().pop().unwrap();
 		assert_eq!(row.state, JobState::Queued);
 		assert_eq!(row.attempts, 1, "reap doesn't reset attempts");
 	}
@@ -935,7 +941,7 @@ mod tests {
 		// to failed.
 		db.with_conn(|c| Ok(lease_next(c, worker_id, false, 999, 10)?)).unwrap();
 		db.with_conn(|c| Ok(reap_stale_leases(c, 9_999)?)).unwrap();
-		let row = db.with_conn(|c| Ok(list(c)?)).unwrap().pop().unwrap();
+		let row = db.with_conn(|c| Ok(list(c, None)?)).unwrap().pop().unwrap();
 		assert_eq!(row.state, JobState::Failed);
 	}
 
@@ -994,7 +1000,7 @@ mod tests {
 		.unwrap();
 
 		db.with_conn(|c| Ok(reap_stale_leases(c, 9_999)?)).unwrap();
-		let row = db.with_conn(|c| Ok(list(c)?)).unwrap().pop().unwrap();
+		let row = db.with_conn(|c| Ok(list(c, None)?)).unwrap().pop().unwrap();
 		assert_eq!(row.state, JobState::Failed);
 		let pending_findings: i64 = db
 			.with_conn(|c| {

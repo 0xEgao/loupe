@@ -203,6 +203,13 @@ async fn submit_finding(worker: &reqwest::Client, job_id: i64, finding: Finding)
 	assert_eq!(resp.status(), 204);
 }
 
+async fn submit_many_findings(worker: &reqwest::Client, job_id: i64, count: usize) {
+	for i in 0..count {
+		submit_finding(worker, job_id, finding(&format!("Finding {i:03}"), &format!("fp-{i:03}")))
+			.await;
+	}
+}
+
 fn finding(title: &str, fingerprint: &str) -> Finding {
 	Finding {
 		scanner_id: "regex".into(),
@@ -217,6 +224,79 @@ fn finding(title: &str, fingerprint: &str) -> Finding {
 		poc_unified: None,
 		fingerprint: fingerprint.into(),
 	}
+}
+
+#[tokio::test]
+async fn list_routes_accept_positive_limits() {
+	let f = bring_up_with_repo_and_worker().await;
+	let repo_b = register_repo(&f, "https://github.com/acme/b.git", "tracker-b").await;
+	let repo_c = register_repo(&f, "https://github.com/acme/c.git", "tracker-c").await;
+
+	let repos = f.admin.get("https://loupe-server/v1/repos?limit=2").send().await.unwrap();
+	assert!(repos.status().is_success());
+	let repos: loupe_proto::ListReposResponse = repos.json().await.unwrap();
+	assert_eq!(repos.repos.len(), 2);
+
+	enqueue_scan(&f, f.repo_id).await;
+	enqueue_scan(&f, repo_b).await;
+	enqueue_scan(&f, repo_c).await;
+
+	let jobs = f.admin.get("https://loupe-server/v1/jobs?limit=2").send().await.unwrap();
+	assert!(jobs.status().is_success());
+	let jobs: Vec<JobInfo> = jobs.json().await.unwrap();
+	assert_eq!(jobs.len(), 2);
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn list_routes_reject_non_positive_limits() {
+	let f = bring_up_with_repo_and_worker().await;
+	let paths = [
+		"/v1/repos?limit=0".to_owned(),
+		"/v1/jobs?limit=-1".to_owned(),
+		format!("/v1/repos/{}/findings?limit=0", f.repo_id),
+	];
+
+	for path in paths {
+		let resp = f.admin.get(format!("https://loupe-server{path}")).send().await.unwrap();
+		assert_eq!(resp.status(), 400, "{path} should reject non-positive limits");
+		let body = resp.text().await.unwrap();
+		assert!(body.contains("limit must be positive"), "unexpected body for {path}: {body}");
+	}
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn finding_list_limit_can_exceed_default_page() {
+	let f = bring_up_with_repo_and_worker().await;
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let env = lease_job(&f.worker).await;
+	assert_eq!(env.job_id, scan.job_id);
+	submit_many_findings(&f.worker, env.job_id, 101).await;
+
+	let default_resp = f
+		.admin
+		.get(format!("https://loupe-server/v1/repos/{}/findings", f.repo_id))
+		.send()
+		.await
+		.unwrap();
+	assert!(default_resp.status().is_success());
+	let default_body: ListFindingsResponse = default_resp.json().await.unwrap();
+	assert_eq!(default_body.findings.len(), 100);
+
+	let resp = f
+		.admin
+		.get(format!("https://loupe-server/v1/repos/{}/findings?limit=101", f.repo_id))
+		.send()
+		.await
+		.unwrap();
+	assert!(resp.status().is_success());
+	let body: ListFindingsResponse = resp.json().await.unwrap();
+	assert_eq!(body.findings.len(), 101);
+
+	f.handle.shutdown().await;
 }
 
 #[tokio::test]

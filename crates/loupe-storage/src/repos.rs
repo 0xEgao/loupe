@@ -73,9 +73,15 @@ pub fn insert(conn: &Connection, new: &NewRepo, now: i64) -> rusqlite::Result<i6
 	Ok(conn.last_insert_rowid())
 }
 
-pub fn list(conn: &Connection) -> rusqlite::Result<Vec<RepoRow>> {
-	let mut stmt = conn.prepare(SELECT_REPO_COLUMNS)?;
-	let rows = stmt.query_map([], row_to_repo)?.collect::<rusqlite::Result<Vec<_>>>()?;
+pub fn list(conn: &Connection, limit: Option<i64>) -> rusqlite::Result<Vec<RepoRow>> {
+	let Some(limit) = limit else {
+		let mut stmt = conn.prepare(SELECT_REPO_COLUMNS)?;
+		let rows = stmt.query_map([], row_to_repo)?.collect::<rusqlite::Result<Vec<_>>>()?;
+		return Ok(rows);
+	};
+	let mut stmt = conn.prepare(&format!("{SELECT_REPO_COLUMNS} LIMIT ?1"))?;
+	let rows =
+		stmt.query_map(params![limit], row_to_repo)?.collect::<rusqlite::Result<Vec<_>>>()?;
 	Ok(rows)
 }
 
@@ -260,7 +266,7 @@ mod tests {
 			.unwrap();
 		let id = db.with_conn(|c| Ok(insert(c, &fake_repo(secret_id), 100)?)).unwrap();
 
-		let listed = db.with_conn(|c| Ok(list(c)?)).unwrap();
+		let listed = db.with_conn(|c| Ok(list(c, None)?)).unwrap();
 		assert_eq!(listed.len(), 1);
 		assert_eq!(listed[0].id, id);
 		assert_eq!(listed[0].clone_url, "https://github.com/acme/widget.git");
@@ -277,7 +283,7 @@ mod tests {
 		}
 
 		assert!(db.with_conn(|c| Ok(delete(c, id)?)).unwrap());
-		assert!(db.with_conn(|c| Ok(list(c)?)).unwrap().is_empty());
+		assert!(db.with_conn(|c| Ok(list(c, None)?)).unwrap().is_empty());
 	}
 
 	#[test]

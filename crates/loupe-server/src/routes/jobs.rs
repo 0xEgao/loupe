@@ -18,7 +18,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use loupe_core::{FindingState, JobKind, JobState};
@@ -29,6 +29,7 @@ use loupe_proto::{
 };
 use loupe_storage::jobs::{self, JobRow, NewJob, DEFAULT_LEASE_SECONDS};
 use loupe_storage::{findings, repos, secrets};
+use serde::Deserialize;
 
 use crate::auth::AuthedWorker;
 use crate::reporters;
@@ -60,6 +61,19 @@ fn job_to_info(row: &JobRow) -> JobInfo {
 		attempts: row.attempts,
 		enqueued_at: row.enqueued_at,
 	}
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+	#[serde(default)]
+	pub limit: Option<i64>,
+}
+
+fn positive_limit(limit: Option<i64>) -> Result<Option<i64>, (StatusCode, String)> {
+	if matches!(limit, Some(n) if n <= 0) {
+		return Err((StatusCode::BAD_REQUEST, "limit must be positive".into()));
+	}
+	Ok(limit)
 }
 
 /// `POST /v1/repos/:id/scan` — admin enqueues a scan job for `id`.
@@ -100,11 +114,12 @@ pub async fn enqueue_scan(
 
 /// `GET /v1/jobs` — admin lists jobs (most recent first).
 pub async fn list(
-	State(state): State<AppState>,
+	State(state): State<AppState>, Query(qp): Query<ListQuery>,
 ) -> Result<Json<Vec<JobInfo>>, (StatusCode, String)> {
+	let limit = positive_limit(qp.limit)?;
 	let rows = state
 		.db
-		.with_conn(|c| Ok(jobs::list(c)?))
+		.with_conn(|c| Ok(jobs::list(c, limit)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list jobs: {e}")))?;
 	Ok(Json(rows.iter().map(job_to_info).collect()))
 }
