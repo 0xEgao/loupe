@@ -49,7 +49,7 @@ impl ServerClient {
 			.send()
 			.await
 			.context("lease request")?;
-		ensure_ok(&resp)?;
+		let resp = ensure_ok(resp).await?;
 		resp.json().await.context("decoding lease response")
 	}
 
@@ -62,7 +62,7 @@ impl ServerClient {
 			.send()
 			.await
 			.context("heartbeat request")?;
-		ensure_ok(&resp)?;
+		let resp = ensure_ok(resp).await?;
 		resp.json().await.context("decoding heartbeat")
 	}
 
@@ -74,7 +74,7 @@ impl ServerClient {
 			.send()
 			.await
 			.context("findings request")?;
-		ensure_ok(&resp)
+		ensure_ok(resp).await.map(|_| ())
 	}
 
 	pub async fn complete(&self, job_id: i64, req: &CompleteRequest) -> Result<()> {
@@ -85,7 +85,7 @@ impl ServerClient {
 			.send()
 			.await
 			.context("complete request")?;
-		ensure_ok(&resp)
+		ensure_ok(resp).await.map(|_| ())
 	}
 
 	pub async fn submit_verdict(&self, job_id: i64, req: &VerdictSubmission) -> Result<()> {
@@ -96,7 +96,7 @@ impl ServerClient {
 			.send()
 			.await
 			.context("verdict request")?;
-		ensure_ok(&resp)
+		ensure_ok(resp).await.map(|_| ())
 	}
 
 	/// FTS keyword search over a repo's accumulated findings. The
@@ -111,7 +111,7 @@ impl ServerClient {
 			.send()
 			.await
 			.context("search request")?;
-		ensure_ok(&resp)?;
+		let resp = ensure_ok(resp).await?;
 		resp.json().await.context("decoding search response")
 	}
 
@@ -123,7 +123,7 @@ impl ServerClient {
 		let url = self.url(&format!("/v1/findings/{id}"));
 		let resp =
 			self.with_protocol(self.http.get(url)).send().await.context("get_finding request")?;
-		ensure_ok(&resp)?;
+		let resp = ensure_ok(resp).await?;
 		resp.json().await.context("decoding finding detail")
 	}
 
@@ -147,9 +147,16 @@ fn build_identity(cert_pem: &str, key_pem: &str) -> Result<reqwest::Identity> {
 		.map_err(|e| anyhow!("building reqwest identity from PEM: {e}"))
 }
 
-fn ensure_ok(resp: &reqwest::Response) -> Result<()> {
+async fn ensure_ok(resp: reqwest::Response) -> Result<reqwest::Response> {
 	if !resp.status().is_success() {
-		return Err(anyhow!("server returned {}", resp.status()));
+		let status = resp.status();
+		let body =
+			resp.text().await.unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+		let body = body.trim();
+		if body.is_empty() {
+			return Err(anyhow!("server returned {status}"));
+		}
+		return Err(anyhow!("server returned {status}: {body}"));
 	}
 	let header = resp
 		.headers()
@@ -165,5 +172,58 @@ fn ensure_ok(resp: &reqwest::Response) -> Result<()> {
 			"server protocol mismatch: worker speaks {PROTOCOL_VERSION}, server sent {server_version}"
 		));
 	}
-	Ok(())
+	Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+	use loupe_proto::CompleteOutcome;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	use tokio::net::TcpListener;
+
+	use super::*;
+
+	#[tokio::test]
+	async fn server_error_includes_response_body() {
+		let body = "successful verify completion requires a submitted verdict";
+		let base = serve_once("HTTP/1.1 409 Conflict", body).await;
+		let client = ServerClient::from_parts(reqwest::Client::new(), base);
+		let err = client
+			.complete(
+				1513,
+				&CompleteRequest {
+					protocol_version: PROTOCOL_VERSION,
+					outcome: CompleteOutcome::Succeeded,
+					head_sha: None,
+					error: None,
+				},
+			)
+			.await
+			.expect_err("complete should fail on server 409");
+
+		let msg = err.to_string();
+		assert!(msg.contains("409 Conflict"), "error should include status: {msg}");
+		assert!(
+			msg.contains(body),
+			"error should include response body so worker logs show the failure reason: {msg}",
+		);
+	}
+
+	async fn serve_once(status_line: &str, body: &str) -> Url {
+		let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+		let addr = listener.local_addr().expect("test server addr");
+		let status_line = status_line.to_owned();
+		let body = body.to_owned();
+		tokio::spawn(async move {
+			let (mut stream, _) = listener.accept().await.expect("accept test request");
+			let mut buf = [0_u8; 1024];
+			let _ = stream.read(&mut buf).await.expect("read test request");
+			let response = format!(
+				"{status_line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+				body.len(),
+			);
+			stream.write_all(response.as_bytes()).await.expect("write test response");
+		});
+		Url::parse(&format!("http://{addr}/")).expect("test server URL")
+	}
 }
