@@ -68,7 +68,7 @@ enum RepoCmd {
 	/// Register a new repo for scanning.
 	Add(RepoAddArgs),
 	/// List registered repos.
-	List,
+	List(ListArgs),
 	/// Deregister a repo (cascades to its jobs and findings).
 	Rm { id: i64 },
 	/// Patch a repo's scheduling / verification settings. Each flag is
@@ -221,7 +221,7 @@ struct WorkerRegisterArgs {
 #[derive(Debug, Subcommand)]
 enum JobCmd {
 	/// List jobs with the newest row printed last.
-	List,
+	List(ListArgs),
 	Get {
 		id: i64,
 	},
@@ -238,7 +238,7 @@ enum JobCmd {
 #[derive(Debug, Subcommand)]
 enum FindingCmd {
 	/// List recent findings for a repo (recent page, newest row printed last).
-	List { repo_id: i64 },
+	List(FindingListArgs),
 	/// FTS5 keyword search over a repo's findings (title, description,
 	/// file path). Free-form keywords are sanitized server-side; the
 	/// match is "every term must appear" with BM25 ranking. Useful for
@@ -272,6 +272,29 @@ enum FindingCmd {
 	/// it to terminal `dismissed` with the rejection audit trail
 	/// stamped (distinct from a verifier-issued dismiss).
 	Reject { id: i64 },
+}
+
+#[derive(Debug, Args)]
+struct ListArgs {
+	/// Number of rows to return.
+	#[arg(short = 'n', long = "limit", value_parser = parse_positive_i64)]
+	limit: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct FindingListArgs {
+	repo_id: i64,
+	/// Number of rows to return.
+	#[arg(short = 'n', long = "limit", value_parser = parse_positive_i64)]
+	limit: Option<i64>,
+}
+
+fn parse_positive_i64(raw: &str) -> Result<i64, String> {
+	let value = raw.parse::<i64>().map_err(|_| "limit must be an integer".to_owned())?;
+	if value <= 0 {
+		return Err("limit must be positive".to_owned());
+	}
+	Ok(value)
 }
 
 #[derive(Debug, Args)]
@@ -331,9 +354,9 @@ async fn main() -> Result<()> {
 				let (client, base) = client_and_url(&conn)?;
 				repo_add(&client, base, a).await
 			},
-			RepoCmd::List => {
+			RepoCmd::List(args) => {
 				let (client, base) = client_and_url(&conn)?;
-				repo_list(&client, base).await
+				repo_list(&client, base, args.limit).await
 			},
 			RepoCmd::Rm { id } => {
 				let (client, base) = client_and_url(&conn)?;
@@ -367,9 +390,9 @@ async fn main() -> Result<()> {
 			},
 		},
 		Cmd::Job(c) => match c {
-			JobCmd::List => {
+			JobCmd::List(args) => {
 				let (client, base) = client_and_url(&conn)?;
-				job_list(&client, base).await
+				job_list(&client, base, args.limit).await
 			},
 			JobCmd::Get { id } => {
 				let (client, base) = client_and_url(&conn)?;
@@ -385,9 +408,9 @@ async fn main() -> Result<()> {
 			},
 		},
 		Cmd::Finding(c) => match c {
-			FindingCmd::List { repo_id } => {
+			FindingCmd::List(args) => {
 				let (client, base) = client_and_url(&conn)?;
-				finding_list(&client, base, repo_id).await
+				finding_list(&client, base, args.repo_id, args.limit).await
 			},
 			FindingCmd::Search { repo_id, query, limit } => {
 				let (client, base) = client_and_url(&conn)?;
@@ -534,8 +557,12 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 	Ok(())
 }
 
-async fn repo_list(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
-	let resp = client.get(url(base, "/v1/repos")).send().await?;
+async fn repo_list(
+	client: &reqwest::Client, base: &reqwest::Url, limit: Option<i64>,
+) -> Result<()> {
+	let req = client.get(url(base, "/v1/repos"));
+	let req = if let Some(limit) = limit { req.query(&[("limit", limit)]) } else { req };
+	let resp = req.send().await?;
 	let body: ListReposResponse = resp.error_for_status()?.json().await?;
 	for r in body.repos {
 		let approval = r.require_approval.map_or("inherit".to_owned(), |v| v.to_string());
@@ -778,8 +805,10 @@ async fn worker_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Re
 	Ok(())
 }
 
-async fn job_list(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
-	let resp = client.get(url(base, "/v1/jobs")).send().await?;
+async fn job_list(client: &reqwest::Client, base: &reqwest::Url, limit: Option<i64>) -> Result<()> {
+	let req = client.get(url(base, "/v1/jobs"));
+	let req = if let Some(limit) = limit { req.query(&[("limit", limit)]) } else { req };
+	let resp = req.send().await?;
 	let jobs: Vec<JobInfo> = resp.error_for_status()?.json().await?;
 	for j in jobs.into_iter().rev() {
 		println!(
@@ -819,8 +848,12 @@ async fn job_cancel(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> R
 	Ok(())
 }
 
-async fn finding_list(client: &reqwest::Client, base: &reqwest::Url, repo_id: i64) -> Result<()> {
-	let resp = client.get(url(base, &format!("/v1/repos/{repo_id}/findings"))).send().await?;
+async fn finding_list(
+	client: &reqwest::Client, base: &reqwest::Url, repo_id: i64, limit: Option<i64>,
+) -> Result<()> {
+	let req = client.get(url(base, &format!("/v1/repos/{repo_id}/findings")));
+	let req = if let Some(limit) = limit { req.query(&[("limit", limit)]) } else { req };
+	let resp = req.send().await?;
 	let body: ListFindingsResponse = resp.error_for_status()?.json().await?;
 	for f in body.findings.into_iter().rev() {
 		let loc = match (f.file_path.as_deref(), f.line_start) {
@@ -1118,6 +1151,72 @@ mod tests {
 			panic!("expected finding retry-report command");
 		};
 		assert_eq!(id, 11);
+	}
+
+	#[test]
+	fn list_limits_parse() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"list",
+			"-n",
+			"25",
+		])
+		.unwrap();
+		let Cmd::Repo(RepoCmd::List(args)) = cli.cmd else {
+			panic!("expected repo list command");
+		};
+		assert_eq!(args.limit, Some(25));
+
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"job",
+			"list",
+			"-n",
+			"25",
+		])
+		.unwrap();
+		let Cmd::Job(JobCmd::List(args)) = cli.cmd else {
+			panic!("expected job list command");
+		};
+		assert_eq!(args.limit, Some(25));
+
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"finding",
+			"list",
+			"7",
+			"-n",
+			"250",
+		])
+		.unwrap();
+		let Cmd::Finding(FindingCmd::List(args)) = cli.cmd else {
+			panic!("expected finding list command");
+		};
+		assert_eq!(args.repo_id, 7);
+		assert_eq!(args.limit, Some(250));
+	}
+
+	#[test]
+	fn list_limits_must_be_positive() {
+		let err = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"finding",
+			"list",
+			"7",
+			"-n",
+			"0",
+		])
+		.expect_err("zero limit must be rejected");
+		assert!(err.to_string().contains("limit must be positive"));
 	}
 
 	#[test]

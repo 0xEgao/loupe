@@ -2,7 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use loupe_core::ReportingDestination;
@@ -12,6 +12,7 @@ use loupe_proto::{
 };
 use loupe_storage::repos::{self, NewRepo, RepoRow, RepoUpdate};
 use loupe_storage::secrets::{self, SecretKind};
+use serde::Deserialize;
 
 use crate::state::AppState;
 
@@ -31,6 +32,19 @@ fn row_to_summary(r: RepoRow) -> RepoSummary {
 		last_scanned_at: r.last_scanned_at,
 		created_at: r.created_at,
 	}
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+	#[serde(default)]
+	pub limit: Option<i64>,
+}
+
+fn positive_limit(limit: Option<i64>) -> Result<Option<i64>, (StatusCode, String)> {
+	if matches!(limit, Some(n) if n <= 0) {
+		return Err((StatusCode::BAD_REQUEST, "limit must be positive".into()));
+	}
+	Ok(limit)
 }
 
 /// `POST /v1/repos` — admin only. Stores the GitHub PAT inline to the
@@ -111,11 +125,12 @@ pub async fn create(
 /// JSON is **not** included: it carries `pat_secret_id` references that
 /// are storage-internal.
 pub async fn list(
-	State(state): State<AppState>,
+	State(state): State<AppState>, Query(qp): Query<ListQuery>,
 ) -> Result<Json<ListReposResponse>, (StatusCode, String)> {
+	let limit = positive_limit(qp.limit)?;
 	let rows = state
 		.db
-		.with_conn(|c| Ok(repos::list(c)?))
+		.with_conn(|c| Ok(repos::list(c, limit)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listing repos: {e}")))?;
 	Ok(Json(ListReposResponse {
 		protocol_version: PROTOCOL_VERSION,

@@ -380,10 +380,11 @@ Reject still moves a held finding to terminal `dismissed`.
 ### 7. Inspect what happened
 
 ```
-loupectl job list
+loupectl repo list [-n <limit>]
+loupectl job list [-n <limit>]
 loupectl job get  <job-id>
 loupectl job retry <job-id>                # requeue a failed job
-loupectl finding list <repo-id>
+loupectl finding list <repo-id> [-n <limit>] # default limit is 100
 loupectl finding show <finding-id>          # pretty-printed for human review
 loupectl finding show <finding-id> --json   # raw FindingDetail DTO
 loupectl finding search <repo-id> "<keywords>"  # FTS5 keyword search
