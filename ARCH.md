@@ -83,8 +83,8 @@ inside the sandbox.
                        │   /tmp + /home/scanner)│
                        │                        │
                        │  ┌──────────────────┐  │ HTTPS  ┌────────────────┐
-                       │  │  claude (agent)  │ ─┼───────►│ api.anthropic. │
-                       │  │  --mcp-config    │  │        │      com       │
+                       │  │ configured agent │ ─┼───────►│ provider API   │
+                       │  │  + MCP config    │  │        │                │
                        │  └─┬─────────┬──────┘  │        └────────────────┘
                        │    │         │
                        │    │         │ stdio JSON-RPC (MCP)
@@ -122,9 +122,9 @@ inside the sandbox.
 ```
 
 The `bkb-mcp` block is dashed because it's optional: the worker
-attaches it to `--mcp-config` only when `bkb-mcp` is on PATH at
-startup. Workers that don't have it installed run without that
-branch and the agent's prompt makes no mention of bkb tools.
+attaches it to the per-call MCP configuration only when `bkb-mcp` is
+on PATH at startup. Workers that don't have it installed run without
+that branch and the agent's prompt makes no mention of bkb tools.
 
 The `loupe-worker mcp-serve` tool list shown above is the
 **discovery-mode** catalogue. A verify-mode session (spawned for a
@@ -147,7 +147,7 @@ A finding's journey from "agent saw something" to "human looked at it":
                                          │  loupe-worker
    ┌─────────────────────────────────┐   │
    │ for each file in parallel:      │   │
-   │   spawn `claude` inside bwrap   │   │
+   │   spawn agent in bwrap          │   │
    │   prompt: DISCOVERY             │   │
    │   ┌── one agent session ──────┐ │   │   agent fan-out
    │   │ • read /workdir/{file}    │ │   │

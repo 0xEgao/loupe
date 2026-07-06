@@ -1,9 +1,9 @@
 //! LLM verifier scanner — implements `Scanner::verify` only.
 //!
-//! Used in the cross-model second-opinion path: a `kind=verify` job
-//! lands on a worker advertising `verify:llm`, the runner's lease
-//! response carries the target Finding, and this scanner asks a
-//! (potentially different) LLM backend whether the finding holds up.
+//! Used in the LLM second-opinion path: a `kind=verify` job lands on
+//! a worker advertising `verify:llm`, the runner's lease response
+//! carries the target Finding, and this scanner asks the configured
+//! LLM backend whether the finding holds up.
 //!
 //! Two-phase MCP-driven flow. The agent is given the loupe MCP
 //! server in verify mode (`--finding-id` + `--job-id` set), which

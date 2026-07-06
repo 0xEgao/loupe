@@ -130,7 +130,7 @@ pub const BKB_HINT_ATTACHED: &str = r#"
   bkb output, name the call you made in the finding's
   `description` so a human can audit the chain."#;
 
-/// Cross-model verification prompt — runs once per finding when the
+/// LLM verification prompt — runs once per finding when the
 /// server has enqueued a `kind=verify` job. Independent second
 /// opinion: takes the original finding (rendered as JSON) and asks
 /// the model whether it agrees with the diagnosis, with an optional

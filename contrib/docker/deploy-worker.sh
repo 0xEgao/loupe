@@ -155,6 +155,10 @@ build_worker_config_file() {
 		printf 'json = %s\n' "$(bool_value "${LOUPE_LOG_JSON:-}")"
 		printf 'agent_output = %s\n\n' "$(bool_value "${LOUPE_LOG_AGENT_OUTPUT:-}")"
 
+		printf '[agents]\n'
+		printf 'scan = %s\n' "$(toml_string "${LOUPE_SCAN_AGENT:-auto}")"
+		printf 'verify = %s\n\n' "$(toml_string "${LOUPE_VERIFY_AGENT:-auto}")"
+
 		printf '[agents.claude]\n'
 		printf 'model = %s\n' "$(toml_string "${LOUPE_CLAUDE_MODEL:-claude-opus-4-7}")"
 		printf 'effort = %s\n\n' "$(toml_string "${LOUPE_CLAUDE_EFFORT:-max}")"

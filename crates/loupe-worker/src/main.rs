@@ -5,10 +5,10 @@
 //! - `run` (default when no subcommand is given): the long-running
 //!   worker loop — leases jobs, runs scanners, submits findings.
 //! - `mcp-serve`: a one-shot stdio MCP server, spawned as a child of
-//!   `claude` for the duration of one discovery / validation call.
-//!   Talks to the same `loupe-server` over the same mTLS cert; the
-//!   only difference is the surface (JSON-RPC over stdio vs. the
-//!   long-poll lease loop).
+//!   the configured agent for the duration of one discovery /
+//!   validation call. Talks to the same `loupe-server` over the same
+//!   mTLS cert; the only difference is the surface (JSON-RPC over
+//!   stdio vs. the long-poll lease loop).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,8 +17,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use loupe_worker::config::{LoggingConfig, WorkerConfig, WorkerConfigOverrides};
 use loupe_worker::llm::{
-	bkb_mcp_available, build_verifier_backend, claude_auth_available, claude_available,
-	codex_auth_available, codex_available, ClaudeCliBackend, McpContext, McpTlsSource,
+	bkb_mcp_available, build_scan_backend, build_verifier_backend, claude_auth_available,
+	claude_available, codex_auth_available, codex_available, JobAgent, McpContext, McpTlsSource,
 };
 use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecretsScanner};
 use loupe_worker::{mcp, sandbox, RepoCache, Runner, Scanner, ServerClient};
@@ -40,9 +40,8 @@ enum Cmd {
 	/// `loupe-worker --server-url ... ...` invocation keeps working.
 	Run(Box<RunArgs>),
 	/// Serve the MCP protocol over stdio for one agent invocation.
-	/// Spawned by `claude --mcp-config <file>` from inside the
-	/// sandbox the runner sets up; reads JSON-RPC from stdin, writes
-	/// to stdout, logs to stderr.
+	/// Spawned by an agent CLI from inside the sandbox the runner sets
+	/// up; reads JSON-RPC from stdin, writes to stdout, logs to stderr.
 	McpServe(Box<McpServeArgs>),
 }
 
@@ -102,6 +101,12 @@ struct RunArgs {
 	/// Dump full successful agent stdout/stderr at info level.
 	#[arg(long, env = "LOUPE_LOG_AGENT_OUTPUT", value_parser = clap::builder::BoolishValueParser::new())]
 	log_agent_output: Option<bool>,
+	/// Agent backend for LLM scan jobs: auto, claude, or codex.
+	#[arg(long, env = "LOUPE_SCAN_AGENT", value_enum)]
+	scan_agent: Option<JobAgent>,
+	/// Agent backend for LLM verify jobs: auto, claude, or codex.
+	#[arg(long, env = "LOUPE_VERIFY_AGENT", value_enum)]
+	verify_agent: Option<JobAgent>,
 	/// Claude model for every Claude-backed invocation.
 	#[arg(long, env = "LOUPE_CLAUDE_MODEL")]
 	claude_model: Option<String>,
@@ -233,18 +238,16 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 
 	let mut scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
 
-	// LLM scanners auto-wire based on which authenticated agent CLIs
-	// are available:
+	// LLM scanners wire through worker-local job-agent policy:
 	//
-	// - authenticated `claude` → discovery scanner (only claude has
-	//   the MCP `--mcp-config` plumbing today, so it owns submission
-	//   via the loupe MCP server).
-	// - authenticated `claude` or `codex` → verifier scanner (codex
-	//   preferred for a true cross-model second opinion; claude
-	//   fallback when codex is not ready).
-	// - no authenticated CLI → hard-fatal at startup. Docker images
-	//   can install both CLIs, but missing API keys should fail before
-	//   a worker leases jobs.
+	// - [agents].scan = "auto" preserves the historical discovery
+	//   default: use claude when ready, otherwise advertise verify-only.
+	// - [agents].verify = "auto" preserves the historical verifier
+	//   default: prefer codex, falling back to claude.
+	// - explicit claude/codex selections fail startup when unavailable.
+	// - no authenticated CLI still hard-fatals at startup. Docker
+	//   images can install both CLIs, but missing API keys should fail
+	//   before a worker leases jobs.
 	let claude_installed = claude_available();
 	let codex_installed = codex_available();
 	let claude_auth = claude_auth_available();
@@ -320,35 +323,32 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		bkb_api_url: cfg.bkb.api_url.clone(),
 	};
 
-	if claude {
-		let backend = Arc::new(
-			ClaudeCliBackend::new()
-				.with_agent_config(cfg.agents.claude.clone())
-				.with_log_agent_output(cfg.logging.agent_output)
-				.with_mcp_context(mcp_ctx.clone()),
-		);
+	if let Some(backend) = build_scan_backend(
+		Some(mcp_ctx.clone()),
+		cfg.agents.scan,
+		claude,
+		codex,
+		cfg.agents.codex.clone(),
+		cfg.agents.claude.clone(),
+		cfg.logging.agent_output,
+	)? {
 		scanners.push(Arc::new(
 			LlmCodeReviewScanner::new(backend)
 				.with_config(cfg.scanner_defaults.clone())
 				.with_bkb(bkb_mcp_path.is_some()),
 		));
-		tracing::info!("LLM code-review scanner enabled (claude with MCP submit_finding)");
-	} else {
-		tracing::info!(
-			"`claude` not ready; LLM code-review (discovery) scanner not registered \
-			 — this worker advertises verify-only"
-		);
+		tracing::info!("LLM code-review scanner enabled (scan:llm advertised, MCP-driven)");
 	}
 
-	// Verifier always wires up when *either* CLI is present. The
-	// helper logs which backend it picked. MCP context is required
-	// for the new verify-mode tool surface (`submit_verdict` /
-	// `submit_patch` / `validate_patch`); without it, the agent
-	// has no way to commit a verdict.
+	// The helper logs which backend it picked. MCP context is required
+	// for the verify-mode tool surface (`submit_verdict` /
+	// `submit_patch` / `validate_patch`); without it, the agent has
+	// no way to commit a verdict.
 	let backend = build_verifier_backend(
 		Some(mcp_ctx),
-		codex,
+		cfg.agents.verify,
 		claude,
+		codex,
 		cfg.agents.codex.clone(),
 		cfg.agents.claude.clone(),
 		cfg.logging.agent_output,
@@ -422,6 +422,8 @@ fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
 			log_level: args.log_level.clone(),
 			log_json: args.log_json,
 			log_agent_output: args.log_agent_output,
+			scan_agent: args.scan_agent,
+			verify_agent: args.verify_agent,
 			claude_model: args.claude_model.clone(),
 			claude_effort: args.claude_effort.clone(),
 			codex_model: args.codex_model.clone(),

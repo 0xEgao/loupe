@@ -1,4 +1,4 @@
-//! MCP server exposed to the agent (`claude` and friends) for the
+//! MCP server exposed to the configured agent for the
 //! duration of one scan session over one source file.
 //!
 //! Wire shape: JSON-RPC 2.0 over stdio. The agent is the JSON-RPC
@@ -16,7 +16,7 @@
 //!   over the repo's accumulated findings. Backed by
 //!   `loupe-server`'s `GET /v1/repos/{repo_id}/findings/search`
 //!   endpoint via the worker's mTLS client cert. The MCP server is
-//!   spawned per `claude` invocation by the worker, with the
+//!   spawned per agent invocation by the worker, with the
 //!   `repo_id` baked in as a CLI arg, so the tool doesn't need to
 //!   take it as a parameter.
 //! - `get_finding_by_id(id)` — full detail view for one finding.

@@ -30,6 +30,10 @@ level = "info"
 json = false
 agent_output = false
 
+[agents]
+scan = "auto"
+verify = "auto"
+
 [agents.claude]
 model = "claude-opus-4-7"
 effort = "max"

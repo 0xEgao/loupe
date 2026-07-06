@@ -18,7 +18,7 @@ mTLS:
 - **`loupe-worker`** — fleet of stateless workers. Authenticate with the
   server using a client cert minted at registration time, lease a job,
   clone the repo into a local cache, run the configured scanners, and
-  submit findings back. A worker can also serve cross-model verification
+  submit findings back. A worker can also serve LLM verification
   jobs by advertising a `verify:*` capability.
 - **`loupectl`** — operator CLI. Authenticates with the admin client
   cert produced by `loupe-server init` and exposes the things you'd
@@ -48,16 +48,16 @@ Before installing, the host needs:
   bubblewrap`. macOS does not have a port; LLM scanning runs on Linux
   workers only.
 - **`claude` CLI** on PATH on every machine running `loupe-worker`
-  *with the LLM scanner enabled*. The discovery backend shells out to
-  `claude --dangerously-skip-permissions -p`, with the worker's
-  bubblewrap mount keeping each invocation's `/tmp` and `$HOME` fresh.
-  See https://github.com/anthropics/claude-code for install
-  instructions.
-- **`codex` CLI** (optional) on PATH on every machine running
-  `loupe-worker` *with the LLM verifier enabled*. The verifier prefers
-  codex so the cross-model second opinion comes from a different model
-  family than discovery; falls back to `claude` if `codex` isn't
-  installed. The verifier shells out to `codex exec
+  that uses Claude for scan or verify jobs. The default scan agent is
+  Claude when it is authenticated. Claude invocations run inside
+  bubblewrap, with the worker's mount keeping each invocation's `/tmp`
+  and `$HOME` fresh. See https://github.com/anthropics/claude-code for
+  install instructions.
+- **`codex` CLI** on PATH on every machine running `loupe-worker` that
+  uses Codex for scan or verify jobs. The default verifier prefers
+  Codex so the second opinion comes from a different model family than
+  the default scanner; it falls back to Claude if Codex is not ready.
+  Codex invocations shell out to `codex exec
   --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check`.
   For API-key auth, set `CODEX_API_KEY`; `OPENAI_API_KEY` remains a
   compatibility alias in the Docker deploy helper.
@@ -249,32 +249,35 @@ loupe-worker run --config /etc/loupe/worker.config.toml
 ```
 
 The worker config owns non-secret runtime settings: server URL, TLS
-file paths, cache settings, logging, Claude/Codex model + effort,
-scanner defaults, and BKB API URL. CLI flags and matching env vars
-override the config. API keys and PEM contents still belong in env or
-secret files.
+file paths, cache settings, logging, LLM job-agent selection,
+Claude/Codex model + effort, scanner defaults, and BKB API URL. CLI
+flags and matching env vars override the config. API keys and PEM
+contents still belong in env or secret files.
 
 The worker auto-detects authenticated `claude` and `codex` CLIs at
-startup and wires the LLM scanners accordingly:
+startup. `[agents].scan` and `[agents].verify` choose which LLM agent
+is used for each job kind:
 
-- **authenticated `claude`** → discovery scanner advertises `scan:llm`
-  (claude owns submission via the loupe MCP server's
-  `submit_finding` tool).
-- **authenticated `claude` or `codex`** → verifier scanner advertises
-  `verify:llm`. Codex is preferred when both are ready so the second
-  opinion comes from a different model family than discovery; claude
-  is the fallback when codex is not ready.
+- `scan = "auto"` → discovery scanner advertises `scan:llm` only when
+  authenticated Claude is ready. This preserves the historical default.
+- `verify = "auto"` → verifier scanner advertises `verify:llm` with
+  Codex preferred and Claude as the fallback.
+- `scan = "claude" | "codex"` or `verify = "claude" | "codex"` →
+  require that exact authenticated CLI and fail startup if it is not
+  ready.
+- CLI/env overrides are `--scan-agent` / `LOUPE_SCAN_AGENT` and
+  `--verify-agent` / `LOUPE_VERIFY_AGENT`.
 - **No authenticated agent CLI** → worker refuses to start. A
   "regex-only" loupe-worker isn't a deployment we want operators to
   fall into by accident; install at least one agent CLI and provide
   its API key or login state.
 
 > **Note:** scan jobs use LLM providers and may count against paid,
-> metered, or rate-limited usage. The discovery scanner currently uses
-> `claude-cli` and can launch one Claude agent session per discovered
-> source file, so large repositories may trigger hundreds or thousands
-> of Claude CLI invocations. `codex` is used for verifier jobs after a
-> finding already exists. Actual cost or quota impact depends on the
+> metered, or rate-limited usage. The discovery scanner launches one
+> configured agent session per discovered source file, so large
+> repositories may trigger hundreds or thousands of LLM CLI invocations.
+> Verifier jobs run after a finding already exists. Actual cost or quota
+> impact depends on the
 > provider, model, account plan, retries, failed-call accounting, and
 > token usage. Run a small test repository or narrow scanner
 > configuration first if usage limits matter.
@@ -491,7 +494,7 @@ reporting with `repo set-github-reporting`, then run
 verifier-issued `dismiss` and a human `reject` both land on
 `state = 'dismissed'`, but only the human path stamps `rejected_*`.
 
-## Verification flow (cross-model second opinion)
+## Verification flow (LLM second opinion)
 
 Setting `verification_enabled = true` on a repo causes scan-time
 findings to land in `validating` state with one `kind=verify` job
@@ -516,13 +519,14 @@ in `validating`). The full state machine + reaper details are in
 `ARCH.md` and the `submit_verdict` / `complete` handlers in
 `crates/loupe-server/src/routes/jobs.rs`.
 
-A worker with `codex` (or just `claude`) on PATH advertises
-`verify:llm` automatically — see step 5 for backend selection. A
+A worker with an authenticated verifier agent advertises `verify:llm`
+according to `[agents].verify` — see step 5 for backend selection. A
 deployment can run discovery and verifier on the same worker, on
-separate workers, or share a single worker with both — the lease
-loop matches by capability, not by binary. To force role separation,
-install only `claude` on the discovery hosts and only `codex` on the
-verifier hosts; the auto-detect picks the matching capability tags.
+separate workers, or share a single worker with both — the lease loop
+matches by capability, not by binary. To force role separation, either
+install only the desired CLI on each host with `auto`, or set
+`scan = "claude" | "codex"` and `verify = "claude" | "codex"` in each
+worker's config.
 
 ## Continuous integration
 
