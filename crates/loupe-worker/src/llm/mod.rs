@@ -11,14 +11,11 @@
 //!   Carries optional MCP context so each invocation can call back
 //!   into `loupe-worker mcp-serve` over stdio JSON-RPC — used by the
 //!   discovery scanner to query prior findings and submit new ones.
-//! - [`CodexCliBackend`] shells out to OpenAI's `codex` CLI. No MCP
-//!   plumbing yet; used by the cross-model verifier where the prompt
-//!   is self-contained and the only output is a JSON verdict.
+//! - [`CodexCliBackend`] shells out to OpenAI's `codex` CLI. Carries
+//!   the same optional MCP context via Codex CLI config overrides.
 //!
-//! Picking between them at runtime: see [`build_verifier_backend`],
-//! which probes PATH for `codex` and falls back to `claude` so a
-//! cross-model second opinion happens when both are available
-//! without mandating both.
+//! Picking between them at runtime: see [`build_scan_backend`] and
+//! [`build_verifier_backend`].
 
 pub mod claude_cli;
 pub mod codex_cli;
@@ -32,15 +29,42 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use clap::ValueEnum;
 pub use claude_cli::ClaudeCliBackend;
 pub use codex_cli::CodexCliBackend;
 pub use mcp::{McpContext, McpTlsSource};
+use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliModelConfig {
 	pub model: String,
 	pub effort: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum JobAgent {
+	#[default]
+	Auto,
+	Claude,
+	Codex,
+}
+
+impl JobAgent {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Auto => "auto",
+			Self::Claude => "claude",
+			Self::Codex => "codex",
+		}
+	}
+}
+
+impl std::fmt::Display for JobAgent {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.as_str())
+	}
 }
 
 const CLI_STREAM_OMISSION: &str = " ... ";
@@ -169,10 +193,9 @@ pub trait LlmBackend: Send + Sync {
 /// invocation succeeds — a missing binary, non-zero exit, or any IO
 /// error all read as "not available."
 ///
-/// Cheap to call at startup. The discovery scanner needs claude
-/// specifically (its MCP `--mcp-config` surface is the contract for
-/// `submit_finding`); the verifier accepts either, see
-/// [`build_verifier_backend`].
+/// Cheap to call at startup. Used with the worker's job-agent
+/// selection to decide whether Claude-backed scan or verify work can
+/// be registered.
 pub fn claude_available() -> bool {
 	std::process::Command::new("claude")
 		.arg("--version")
@@ -197,8 +220,8 @@ pub fn claude_auth_available() -> bool {
 /// scanner advertises bkb's `bkb_search` / `bkb_lookup_bip` /
 /// `bkb_lookup_bolt` / etc. tools to the agent so it can pull spec +
 /// historical context for bitcoin/lightning code that the worktree alone won't surface. See
-/// [`crate::llm::claude_cli::McpContext`] for the attachment plumbing and
-/// [`crate::llm::prompts::DISCOVERY`] for the conditional prompt section.
+/// [`McpContext`] for the attachment plumbing and [`crate::llm::prompts::DISCOVERY`] for the
+/// conditional prompt section.
 ///
 /// Install via `cargo install bkb-mcp`; the worker config controls
 /// the `BKB_API_URL` passed to the child.
@@ -226,9 +249,9 @@ pub fn bkb_mcp_available() -> Option<PathBuf> {
 /// invocation succeeds — a missing binary, non-zero exit, or any IO
 /// error all read as "not available."
 ///
-/// Cheap to call at startup. Used by [`build_verifier_backend`] to
-/// pick between codex (preferred — the verifier's whole point is a
-/// *cross-model* second opinion) and a claude fallback.
+/// Cheap to call at startup. Used with the worker's job-agent
+/// selection to decide whether Codex-backed scan or verify work can
+/// be registered.
 pub fn codex_available() -> bool {
 	std::process::Command::new("codex")
 		.arg("--version")
@@ -271,10 +294,53 @@ fn home_path(child: &str) -> Option<PathBuf> {
 	std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| PathBuf::from(h).join(child))
 }
 
-/// Build the verifier's [`LlmBackend`]. Prefers codex (cross-model
-/// second opinion is the whole point of the verifier flow); falls
-/// back to claude when codex isn't installed so single-CLI hosts
-/// still get *some* verifier coverage even if it's same-family.
+/// Build the scan [`LlmBackend`] according to the configured agent
+/// selection. `auto` preserves the historical behaviour: Claude owns
+/// LLM discovery when ready; Codex-only workers advertise verify-only
+/// unless the operator explicitly selects Codex for scan jobs.
+pub fn build_scan_backend(
+	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
+	codex_agent: CliModelConfig, claude_agent: CliModelConfig, log_agent_output: bool,
+) -> Result<Option<Arc<dyn LlmBackend>>> {
+	match selection {
+		JobAgent::Auto if claude_ready => {
+			tracing::info!(
+				model = %claude_agent.model,
+				effort = %claude_agent.effort,
+				"scan backend: claude (auto)"
+			);
+			Ok(Some(build_claude_backend(mcp, claude_agent, log_agent_output)))
+		},
+		JobAgent::Auto => {
+			tracing::info!(
+				"`claude` not ready and scan agent is auto; LLM code-review scanner not registered"
+			);
+			Ok(None)
+		},
+		JobAgent::Claude => {
+			require_agent_ready("scan", JobAgent::Claude, claude_ready)?;
+			tracing::info!(
+				model = %claude_agent.model,
+				effort = %claude_agent.effort,
+				"scan backend: claude (configured)"
+			);
+			Ok(Some(build_claude_backend(mcp, claude_agent, log_agent_output)))
+		},
+		JobAgent::Codex => {
+			require_agent_ready("scan", JobAgent::Codex, codex_ready)?;
+			tracing::info!(
+				model = %codex_agent.model,
+				effort = %codex_agent.effort,
+				"scan backend: codex (configured)"
+			);
+			Ok(Some(build_codex_backend(mcp, codex_agent, log_agent_output)))
+		},
+	}
+}
+
+/// Build the verifier's [`LlmBackend`]. `auto` preserves the
+/// historical verifier behaviour: prefer Codex, falling back to
+/// Claude when Codex is unavailable.
 ///
 /// `mcp` (optional) attaches the loupe MCP server to the backend's
 /// per-call invocation. Required for the verify-mode tool surface
@@ -287,38 +353,78 @@ fn home_path(child: &str) -> Option<PathBuf> {
 /// Logs the choice at info level so operators can see which backend
 /// is actually verifying without having to inspect process listings.
 pub fn build_verifier_backend(
-	mcp: Option<McpContext>, codex_ready: bool, claude_ready: bool, codex_agent: CliModelConfig,
-	claude_agent: CliModelConfig, log_agent_output: bool,
+	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
+	codex_agent: CliModelConfig, claude_agent: CliModelConfig, log_agent_output: bool,
 ) -> Result<Arc<dyn LlmBackend>> {
-	if codex_ready {
-		tracing::info!(
-			model = %codex_agent.model,
-			effort = %codex_agent.effort,
-			"verifier backend: codex (cross-model second opinion)"
-		);
-		let mut backend = CodexCliBackend::new()
-			.with_agent_config(codex_agent)
-			.with_log_agent_output(log_agent_output);
-		if let Some(ctx) = mcp {
-			backend = backend.with_mcp_context(ctx);
-		}
-		Ok(Arc::new(backend))
-	} else if claude_ready {
-		tracing::info!(
-			model = %claude_agent.model,
-			effort = %claude_agent.effort,
-			"verifier backend: claude (codex unavailable; same-family fallback)"
-		);
-		let mut backend = ClaudeCliBackend::new()
-			.with_agent_config(claude_agent)
-			.with_log_agent_output(log_agent_output);
-		if let Some(ctx) = mcp {
-			backend = backend.with_mcp_context(ctx);
-		}
-		Ok(Arc::new(backend))
-	} else {
-		anyhow::bail!("no authenticated verifier backend available")
+	match selection {
+		JobAgent::Auto if codex_ready => {
+			tracing::info!(
+				model = %codex_agent.model,
+				effort = %codex_agent.effort,
+				"verifier backend: codex (auto)"
+			);
+			Ok(build_codex_backend(mcp, codex_agent, log_agent_output))
+		},
+		JobAgent::Auto if claude_ready => {
+			tracing::info!(
+				model = %claude_agent.model,
+				effort = %claude_agent.effort,
+				"verifier backend: claude (auto, codex unavailable)"
+			);
+			Ok(build_claude_backend(mcp, claude_agent, log_agent_output))
+		},
+		JobAgent::Auto => anyhow::bail!("no authenticated verifier backend available"),
+		JobAgent::Claude => {
+			require_agent_ready("verify", JobAgent::Claude, claude_ready)?;
+			tracing::info!(
+				model = %claude_agent.model,
+				effort = %claude_agent.effort,
+				"verifier backend: claude (configured)"
+			);
+			Ok(build_claude_backend(mcp, claude_agent, log_agent_output))
+		},
+		JobAgent::Codex => {
+			require_agent_ready("verify", JobAgent::Codex, codex_ready)?;
+			tracing::info!(
+				model = %codex_agent.model,
+				effort = %codex_agent.effort,
+				"verifier backend: codex (configured)"
+			);
+			Ok(build_codex_backend(mcp, codex_agent, log_agent_output))
+		},
 	}
+}
+
+fn require_agent_ready(job_kind: &str, agent: JobAgent, ready: bool) -> Result<()> {
+	if !ready {
+		anyhow::bail!(
+			"{job_kind} agent `{agent}` was explicitly selected but that CLI is not installed \
+			 or not authenticated"
+		);
+	}
+	Ok(())
+}
+
+fn build_claude_backend(
+	mcp: Option<McpContext>, agent: CliModelConfig, log_agent_output: bool,
+) -> Arc<dyn LlmBackend> {
+	let mut backend =
+		ClaudeCliBackend::new().with_agent_config(agent).with_log_agent_output(log_agent_output);
+	if let Some(ctx) = mcp {
+		backend = backend.with_mcp_context(ctx);
+	}
+	Arc::new(backend)
+}
+
+fn build_codex_backend(
+	mcp: Option<McpContext>, agent: CliModelConfig, log_agent_output: bool,
+) -> Arc<dyn LlmBackend> {
+	let mut backend =
+		CodexCliBackend::new().with_agent_config(agent).with_log_agent_output(log_agent_output);
+	if let Some(ctx) = mcp {
+		backend = backend.with_mcp_context(ctx);
+	}
+	Arc::new(backend)
 }
 
 #[cfg(test)]
@@ -413,23 +519,125 @@ mod tests {
 	}
 
 	#[test]
-	fn verifier_backend_prefers_codex_then_claude() {
+	fn scan_backend_auto_preserves_claude_only_discovery_default() {
 		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
 		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
-		let backend =
-			build_verifier_backend(None, true, true, codex.clone(), claude.clone(), false).unwrap();
-		assert_eq!(backend.id(), "codex-cli");
 
-		let backend =
-			build_verifier_backend(None, false, true, codex.clone(), claude.clone(), false)
-				.unwrap();
+		let backend = build_scan_backend(
+			None,
+			JobAgent::Auto,
+			true,
+			true,
+			codex.clone(),
+			claude.clone(),
+			false,
+		)
+		.unwrap()
+		.expect("claude-ready auto scan should register");
 		assert_eq!(backend.id(), "claude-cli");
 
-		let err = match build_verifier_backend(None, false, false, codex, claude, false) {
+		let backend =
+			build_scan_backend(None, JobAgent::Auto, false, true, codex.clone(), claude, false)
+				.unwrap();
+		assert!(
+			backend.is_none(),
+			"auto scan should not switch to codex unless explicitly configured"
+		);
+	}
+
+	#[test]
+	fn scan_backend_allows_explicit_codex_and_fails_when_unavailable() {
+		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
+		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
+
+		let backend = build_scan_backend(
+			None,
+			JobAgent::Codex,
+			true,
+			true,
+			codex.clone(),
+			claude.clone(),
+			false,
+		)
+		.unwrap()
+		.expect("explicit codex scan should register when codex is ready");
+		assert_eq!(backend.id(), "codex-cli");
+
+		let err = match build_scan_backend(None, JobAgent::Codex, true, false, codex, claude, false)
+		{
+			Ok(_) => panic!("explicit unavailable codex scan should fail"),
+			Err(e) => e,
+		};
+		assert!(err.to_string().contains("scan agent `codex`"), "got: {err}");
+	}
+
+	#[test]
+	fn verifier_backend_auto_prefers_codex_then_claude() {
+		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
+		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
+		let backend = build_verifier_backend(
+			None,
+			JobAgent::Auto,
+			true,
+			true,
+			codex.clone(),
+			claude.clone(),
+			false,
+		)
+		.unwrap();
+		assert_eq!(backend.id(), "codex-cli");
+
+		let backend = build_verifier_backend(
+			None,
+			JobAgent::Auto,
+			true,
+			false,
+			codex.clone(),
+			claude.clone(),
+			false,
+		)
+		.unwrap();
+		assert_eq!(backend.id(), "claude-cli");
+
+		let err = match build_verifier_backend(
+			None,
+			JobAgent::Auto,
+			false,
+			false,
+			codex,
+			claude,
+			false,
+		) {
 			Ok(_) => panic!("missing verifier backend should be rejected"),
 			Err(e) => e,
 		};
 		assert!(err.to_string().contains("no authenticated verifier backend"));
+	}
+
+	#[test]
+	fn verifier_backend_honors_explicit_selection() {
+		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
+		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
+
+		let backend = build_verifier_backend(
+			None,
+			JobAgent::Claude,
+			true,
+			true,
+			codex.clone(),
+			claude.clone(),
+			false,
+		)
+		.unwrap();
+		assert_eq!(backend.id(), "claude-cli");
+
+		let err =
+			match build_verifier_backend(None, JobAgent::Claude, false, true, codex, claude, false)
+			{
+				Ok(_) => panic!("explicit unavailable claude verifier should fail"),
+				Err(e) => e,
+			};
+		assert!(err.to_string().contains("verify agent `claude`"), "got: {err}");
 	}
 }
 

@@ -509,8 +509,8 @@ mod tests {
 	async fn checkout_revision_uses_original_sha_not_latest_branch_tip() {
 		let remote_tmp = tempfile::tempdir().unwrap();
 		init_git_repo(remote_tmp.path());
-		let first = commit_file(remote_tmp.path(), "one\n", "one");
-		let second = commit_file(remote_tmp.path(), "two\n", "two");
+		let first = commit_file(remote_tmp.path(), "one\n", "One");
+		let second = commit_file(remote_tmp.path(), "two\n", "Two");
 
 		let bare_tmp = tempfile::tempdir().unwrap();
 		let bare = bare_tmp.path().join("cache.git");

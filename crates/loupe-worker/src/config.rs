@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::llm::claude_cli::{DEFAULT_CLAUDE_EFFORT, DEFAULT_CLAUDE_MODEL};
 use crate::llm::codex_cli::{DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL};
 use crate::llm::mcp::DEFAULT_BKB_API_URL;
-use crate::llm::{CliModelConfig, DEFAULT_REQUEST_TIMEOUT};
+use crate::llm::{CliModelConfig, JobAgent, DEFAULT_REQUEST_TIMEOUT};
 use crate::runner::DEFAULT_MAX_WORKDIR_BYTES;
 use crate::scanners::LlmScannerConfig;
 
@@ -57,6 +57,8 @@ pub struct LoggingConfig {
 
 #[derive(Debug, Clone)]
 pub struct AgentsConfig {
+	pub scan: JobAgent,
+	pub verify: JobAgent,
 	pub claude: CliModelConfig,
 	pub codex: CliModelConfig,
 }
@@ -79,6 +81,8 @@ pub struct WorkerConfigOverrides {
 	pub log_level: Option<String>,
 	pub log_json: Option<bool>,
 	pub log_agent_output: Option<bool>,
+	pub scan_agent: Option<JobAgent>,
+	pub verify_agent: Option<JobAgent>,
 	pub claude_model: Option<String>,
 	pub claude_effort: Option<String>,
 	pub codex_model: Option<String>,
@@ -161,6 +165,10 @@ pub struct LoggingSection {
 #[serde(deny_unknown_fields)]
 pub struct AgentsSection {
 	#[serde(default)]
+	pub scan: Option<JobAgent>,
+	#[serde(default)]
+	pub verify: Option<JobAgent>,
+	#[serde(default)]
 	pub claude: AgentSection,
 	#[serde(default)]
 	pub codex: AgentSection,
@@ -240,6 +248,12 @@ impl WorkerConfig {
 		if let Some(v) = file.logging.agent_output {
 			self.logging.agent_output = v;
 		}
+		if let Some(v) = file.agents.scan {
+			self.agents.scan = v;
+		}
+		if let Some(v) = file.agents.verify {
+			self.agents.verify = v;
+		}
 		if let Some(v) = file.agents.claude.model {
 			self.agents.claude.model = v;
 		}
@@ -300,6 +314,12 @@ impl WorkerConfig {
 		}
 		if let Some(v) = overrides.log_agent_output {
 			self.logging.agent_output = v;
+		}
+		if let Some(v) = overrides.scan_agent {
+			self.agents.scan = v;
+		}
+		if let Some(v) = overrides.verify_agent {
+			self.agents.verify = v;
 		}
 		if let Some(v) = overrides.claude_model {
 			self.agents.claude.model = v;
@@ -381,6 +401,8 @@ impl Default for WorkerConfig {
 				agent_output: false,
 			},
 			agents: AgentsConfig {
+				scan: JobAgent::Auto,
+				verify: JobAgent::Auto,
 				claude: CliModelConfig {
 					model: DEFAULT_CLAUDE_MODEL.to_owned(),
 					effort: DEFAULT_CLAUDE_EFFORT.to_owned(),
@@ -461,6 +483,8 @@ mod tests {
 		assert_eq!(cfg.cache.dir, PathBuf::from(DEFAULT_CACHE_DIR));
 		assert_eq!(cfg.cache.max_gb, 40);
 		assert_eq!(cfg.logging.level, "info");
+		assert_eq!(cfg.agents.scan, JobAgent::Auto);
+		assert_eq!(cfg.agents.verify, JobAgent::Auto);
 		assert_eq!(cfg.agents.claude.model, "claude-opus-4-7");
 		assert_eq!(cfg.agents.claude.effort, "max");
 		assert_eq!(cfg.agents.codex.model, "gpt-5.5");
@@ -497,6 +521,10 @@ level = "debug"
 json = true
 agent_output = true
 
+[agents]
+scan = "codex"
+verify = "claude"
+
 [agents.claude]
 model = "claude-custom"
 effort = "xhigh"
@@ -529,6 +557,8 @@ api_url = "https://bkb.example.test"
 		assert_eq!(cfg.logging.level, "debug");
 		assert!(cfg.logging.json);
 		assert!(cfg.logging.agent_output);
+		assert_eq!(cfg.agents.scan, JobAgent::Codex);
+		assert_eq!(cfg.agents.verify, JobAgent::Claude);
 		assert_eq!(cfg.agents.claude.model, "claude-custom");
 		assert_eq!(cfg.agents.claude.effort, "xhigh");
 		assert_eq!(cfg.agents.codex.model, "gpt-custom");
@@ -556,6 +586,8 @@ effort = "low"
 		let cfg = WorkerConfig::load(
 			Some(&path),
 			WorkerConfigOverrides {
+				scan_agent: Some(JobAgent::Codex),
+				verify_agent: Some(JobAgent::Claude),
 				codex_model: Some("from-env".to_owned()),
 				codex_effort: Some("xhigh".to_owned()),
 				..WorkerConfigOverrides::default()
@@ -563,6 +595,8 @@ effort = "low"
 		)
 		.unwrap();
 
+		assert_eq!(cfg.agents.scan, JobAgent::Codex);
+		assert_eq!(cfg.agents.verify, JobAgent::Claude);
 		assert_eq!(cfg.agents.codex.model, "from-env");
 		assert_eq!(cfg.agents.codex.effort, "xhigh");
 	}
@@ -585,5 +619,16 @@ effort = "low"
 		)
 		.unwrap_err();
 		assert!(err.to_string().contains("agents.codex.effort"), "got: {err}");
+	}
+
+	#[test]
+	fn invalid_job_agent_is_rejected() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("worker.toml");
+		std::fs::write(&path, "[agents]\nscan = \"llama\"\n").unwrap();
+
+		let err = WorkerConfig::load(Some(&path), WorkerConfigOverrides::default()).unwrap_err();
+		let msg = format!("{err:#}");
+		assert!(msg.contains("llama") || msg.contains("scan"), "got: {msg}");
 	}
 }

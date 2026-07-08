@@ -133,8 +133,11 @@ set -a
 set +a
 
 export ANTHROPIC_API_KEY=...
-# Optional, enables Codex verifier:
+# Optional, enables Codex scan or verifier jobs:
 export CODEX_API_KEY=...
+# Optional, defaults preserve Claude scan + Codex verifier when ready:
+export LOUPE_SCAN_AGENT=auto
+export LOUPE_VERIFY_AGENT=auto
 export LOUPE_SERVER_URL=https://loupe.example.com:8443
 
 LOUPE_WORKER_SSH=deploy@worker \
@@ -146,11 +149,13 @@ The worker deploy writes `/etc/loupe-container/worker.secrets.env` with mode
 `0600`, owned by the container UID `10002`. It contains the worker certificate
 bundle and whichever LLM API keys are set. It also writes
 `/etc/loupe-container/worker.config.toml` for non-secret worker settings
-(cache, logging, scanner defaults, BKB API URL, and Claude/Codex
-model/effort), mounts it read-only into the container, and sets
-`LOUPE_WORKER_CONFIG`. For Codex, prefer `CODEX_API_KEY`; for compatibility
-the deploy script also writes `CODEX_API_KEY` from `OPENAI_API_KEY` when
-`CODEX_API_KEY` is absent.
+(cache, logging, job-agent selection, scanner defaults, BKB API URL, and
+Claude/Codex model/effort), mounts it read-only into the container, and sets
+`LOUPE_WORKER_CONFIG`. `LOUPE_SCAN_AGENT` and `LOUPE_VERIFY_AGENT` accept
+`auto`, `claude`, or `codex`; explicit `claude`/`codex` selections fail
+startup if that CLI is not authenticated. For Codex, prefer `CODEX_API_KEY`;
+for compatibility the deploy script also writes `CODEX_API_KEY` from
+`OPENAI_API_KEY` when `CODEX_API_KEY` is absent.
 
 As a temporary alternative to `CODEX_API_KEY`, a worker can use Codex login
 state from an explicit local `auth.json` path:

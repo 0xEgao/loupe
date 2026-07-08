@@ -587,14 +587,14 @@ mod tests {
 	fn fetch_bare_advances_branch_and_remote_head_refs() {
 		let remote_tmp = tempfile::tempdir().unwrap();
 		init_git_repo(remote_tmp.path());
-		commit_file(remote_tmp.path(), "one\n", "one");
+		commit_file(remote_tmp.path(), "one\n", "One");
 
 		let cache_tmp = tempfile::tempdir().unwrap();
 		let bare = cache_tmp.path().join("cache.git");
 		let url = format!("file://{}", remote_tmp.path().display());
 		RepoCache::clone_bare(&bare, &url, None).unwrap();
 
-		let second = commit_file(remote_tmp.path(), "two\n", "two");
+		let second = commit_file(remote_tmp.path(), "two\n", "Two");
 		RepoCache::fetch_bare(&bare, None).unwrap();
 
 		assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), second);
@@ -606,7 +606,7 @@ mod tests {
 	async fn ensure_repo_reclones_when_cache_dir_was_evicted() {
 		let remote_tmp = tempfile::tempdir().unwrap();
 		init_git_repo(remote_tmp.path());
-		let head = commit_file(remote_tmp.path(), "one\n", "one");
+		let head = commit_file(remote_tmp.path(), "one\n", "One");
 
 		let cache_tmp = tempfile::tempdir().unwrap();
 		let cache = Arc::new(RepoCache::new(cache_tmp.path().to_path_buf(), u64::MAX).unwrap());
@@ -627,7 +627,7 @@ mod tests {
 	async fn reclone_repo_replaces_stale_cache_with_fresh_clone() {
 		let remote_tmp = tempfile::tempdir().unwrap();
 		init_git_repo(remote_tmp.path());
-		commit_file(remote_tmp.path(), "one\n", "one");
+		commit_file(remote_tmp.path(), "one\n", "One");
 
 		let cache_tmp = tempfile::tempdir().unwrap();
 		let cache = Arc::new(RepoCache::new(cache_tmp.path().to_path_buf(), u64::MAX).unwrap());
@@ -638,7 +638,7 @@ mod tests {
 		assert!(first.path.exists());
 		drop(first);
 
-		let second_head = commit_file(remote_tmp.path(), "two\n", "two");
+		let second_head = commit_file(remote_tmp.path(), "two\n", "Two");
 		let fresh = cache.reclone_repo(&key, &url, None).await.unwrap();
 		assert_eq!(git(&fresh.path, &["rev-parse", "HEAD"]), second_head);
 	}
