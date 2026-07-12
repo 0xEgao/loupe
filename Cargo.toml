@@ -6,7 +6,7 @@ members = [
     "crates/loupe-proto",
     "crates/loupe-server",
     "crates/loupe-storage",
-    "crates/loupe-tls",
+    "crates/loupe-tls", "crates/loupe-tui",
     "crates/loupe-worker",
 ]
 
