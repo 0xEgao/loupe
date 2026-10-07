@@ -18,7 +18,7 @@ pub mod text;
 mod verdict;
 
 pub use error::{Error, Result};
-pub use finding::Finding;
+pub use finding::{format_finding_id, Finding};
 pub use finding_state::FindingState;
 pub use job::{JobKind, JobState};
 pub use repo::{RepoSpec, ReportingDestination};

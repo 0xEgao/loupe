@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use loupe_core::{Finding, ReportingDestination, Severity};
+use loupe_core::{format_finding_id, Finding, ReportingDestination, Severity};
 use loupe_storage::repos::RepoRow;
 use reqwest::{StatusCode, Url};
 use serde::Serialize;
@@ -212,7 +212,7 @@ fn compact_title(raw: &str) -> String {
 fn render_body(repo: &RepoRow, report_finding: &ReportFinding) -> String {
 	let finding = &report_finding.finding;
 	let mut out = String::new();
-	out.push_str("## Finding\n\n");
+	out.push_str(&format!("## Finding {}\n\n", format_finding_id(report_finding.id)));
 	out.push_str(&format!("- repo: `{}/{}` (`{}`)\n", repo.owner, repo.repo, repo.clone_url));
 	match &report_finding.reviewed_revision {
 		Some(revision) => out.push_str(&format!("- reviewed revision: `{revision}`\n")),
@@ -226,7 +226,6 @@ fn render_body(repo: &RepoRow, report_finding: &ReportFinding) -> String {
 	if let Some(cwe) = &finding.cwe {
 		out.push_str(&format!("- cwe: {cwe}\n"));
 	}
-	out.push_str(&format!("- scanner: `{}`\n", finding.scanner_id));
 	out.push_str(&format!("- fingerprint: `{}`\n\n", finding.fingerprint));
 
 	out.push_str("## Description\n\n");
@@ -334,9 +333,13 @@ mod tests {
 	fn body_describes_one_finding_not_a_scan_batch() {
 		let body = render_body(
 			&repo(),
-			&ReportFinding { finding: finding(), reviewed_revision: Some("abc123".into()) },
+			&ReportFinding {
+				id: 1234,
+				finding: finding(),
+				reviewed_revision: Some("abc123".into()),
+			},
 		);
-		assert!(body.starts_with("## Finding\n\n"));
+		assert!(body.starts_with("## Finding LUP-1234\n\n"), "body: {body}");
 		assert!(body.contains("- repo: `acme/widget` (`https://github.com/acme/widget.git`)"));
 		assert!(body.contains("- reviewed revision: `abc123`"));
 		assert!(body.contains("- title: Out-of-bounds index in idx"));
@@ -350,5 +353,14 @@ mod tests {
 		assert!(!body.contains("This issue tracks one loupe finding"));
 		assert!(!body.contains("finished a scan"));
 		assert!(!body.contains("Findings:"));
+	}
+
+	#[test]
+	fn body_omits_scanner_metadata() {
+		let body = render_body(
+			&repo(),
+			&ReportFinding { id: 1234, finding: finding(), reviewed_revision: None },
+		);
+		assert!(!body.contains("- scanner:"), "body must omit the scanner header: {body}");
 	}
 }

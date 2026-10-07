@@ -459,6 +459,14 @@ only knob, and it is deliberately uncapped so older rows stay reachable.
 MCP tool `query_prior_findings` calls the same endpoint, so the
 agent can ask "have we seen anything like this before?" mid-scan.
 
+Scanner tools and report headers identify findings as `LUP-1234`, so
+references are distinct from GitHub issue numbers such as `#1234`.
+The number is unique across repositories within one Loupe database.
+`get_finding_by_id` accepts `"LUP-1234"` and legacy numeric IDs such as
+`1234`; database IDs, HTTP endpoints, and CLI arguments remain numeric.
+New GitHub and email reports include the prefixed ID and omit the
+scanner metadata. Existing published reports are not rewritten.
+
 #### Continuous scans
 
 When you set `--scan-interval-seconds`, loupe runs the scan periodically

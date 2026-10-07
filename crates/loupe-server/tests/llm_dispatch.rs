@@ -253,12 +253,12 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 		.unwrap();
 	assert_eq!(finding_count, 1);
 
-	let (poc, scanner_id, severity): (Option<String>, String, String) = db
+	let (poc, scanner_id, severity, finding_id): (Option<String>, String, String, i64) = db
 		.with_conn(|c| {
 			Ok(c.query_row(
-				"SELECT poc_unified, scanner_id, severity FROM findings LIMIT 1",
+				"SELECT poc_unified, scanner_id, severity, id FROM findings LIMIT 1",
 				[],
-				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
 			)?)
 		})
 		.unwrap();
@@ -278,7 +278,11 @@ async fn llm_scanner_full_pipeline_dispatches_via_github() {
 	let issue_title = issue.body["title"].as_str().unwrap_or("");
 	assert_eq!(issue_title, "Out-of-bounds index in idx");
 	assert!(issue_body.contains("Out-of-bounds index"), "body: {issue_body}");
-	assert!(issue_body.contains("llm-code-review"), "body: {issue_body}");
+	assert!(
+		issue_body.starts_with(&format!("## Finding LUP-{finding_id}\n\n")),
+		"report header must include the stored finding ID: {issue_body}"
+	);
+	assert!(!issue_body.contains("- scanner:"), "body: {issue_body}");
 	assert!(issue_body.contains("#[test] fn oob_panic"), "body: {issue_body}");
 
 	server.shutdown().await;

@@ -42,7 +42,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use loupe_core::{Finding, Severity};
+use loupe_core::{format_finding_id, Finding, Severity};
 use loupe_proto::{
 	validate_llm_finding_submission, JobCapability, LlmFindingSubmission, PROTOCOL_VERSION,
 };
@@ -387,7 +387,7 @@ fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
 				 Use this to check whether a vulnerability you're about to report has already been \
 				 surfaced in an earlier scan — same bug, possibly different wording. Returns up to \
 				 `limit` matches ranked by relevance, with the title, severity, file location, \
-				 state (e.g. 'reported', 'awaiting_approval', 'dismissed'), and finding id of each. \
+				 state (e.g. 'reported', 'awaiting_approval', 'dismissed'), and LUP-prefixed finding id of each. \
 				 If a match looks like the same vulnerability you're investigating, do NOT submit \
 				 a duplicate — the agent surface is meant to suppress repeats, not amplify them.",
 			"inputSchema": {
@@ -423,9 +423,11 @@ fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
 				"required": ["id"],
 				"properties": {
 					"id": {
-						"type": "integer",
-						"description": "The finding id, as returned in `query_prior_findings` hits.",
-						"minimum": 1,
+						"description": "The full finding ID from `query_prior_findings`, e.g. LUP-1234. Legacy numeric IDs are also accepted.",
+						"anyOf": [
+							{ "type": "string", "pattern": "^LUP-[1-9][0-9]*$" },
+							{ "type": "integer", "minimum": 1, "maximum": i64::MAX },
+						],
 					},
 				},
 			},
@@ -583,7 +585,8 @@ fn tool_definitions(submissions_enabled: bool, verify_mode: bool) -> Value {
 						"type": "string",
 						"description":
 							"Mechanism + impact + reproduction sketch. Aim for ~200 words. \
-							 Mention any prior-finding ids you considered and ruled out.",
+							 Mention any prior findings you considered and ruled out using their \
+							 full IDs (e.g. LUP-1234), never GitHub-style #1234 references.",
 					},
 					"poc_unified": {
 						"type": "string",
@@ -737,8 +740,17 @@ async fn tool_get_finding_by_id(
 ) -> Result<String> {
 	let id = args
 		.get("id")
-		.and_then(|v| v.as_i64())
-		.context("`id` argument is required and must be an integer")?;
+		.and_then(|value| {
+			// Keep accepting numeric IDs from older MCP callers. Models see
+			// prefixed references in tool responses and can pass them back intact.
+			value.as_i64().or_else(|| {
+				let reference = value.as_str()?;
+				let id = reference.strip_prefix("LUP-")?.parse::<i64>().ok()?;
+				(format_finding_id(id) == reference).then_some(id)
+			})
+		})
+		.filter(|id| *id > 0)
+		.context("`id` must be a finding reference such as LUP-1234 or a positive integer")?;
 	let detail = client
 		.get_finding(id, job_capability)
 		.await
@@ -748,8 +760,12 @@ async fn tool_get_finding_by_id(
 	let _ = std::fmt::Write::write_fmt(
 		&mut out,
 		format_args!(
-			"Finding #{} [{:?}] state={} {}\n{}\n",
-			detail.id, detail.severity, detail.state, loc, detail.title,
+			"Finding {} [{:?}] state={} {}\n{}\n",
+			format_finding_id(detail.id),
+			detail.severity,
+			detail.state,
+			loc,
+			detail.title,
 		),
 	);
 	if let Some(cwe) = &detail.cwe {
@@ -794,8 +810,12 @@ async fn tool_query_prior_findings(
 		// helper renders `path:line` instead of falling through.
 		let loc = format_location(f.file_path.as_deref(), f.line_start, None);
 		out.push_str(&format!(
-			"- #{} [{:?}] state={} {} — {}\n",
-			f.id, f.severity, f.state, loc, f.title,
+			"- {} [{:?}] state={} {} — {}\n",
+			format_finding_id(f.id),
+			f.severity,
+			f.state,
+			loc,
+			f.title,
 		));
 	}
 	Ok(out)
@@ -1232,6 +1252,131 @@ async fn flush_verify_session(session: &Arc<Session>) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	async fn prior_findings_client() -> (Arc<ServerClient>, tokio::task::JoinHandle<()>) {
+		use axum::routing::get;
+		use axum::{Json, Router};
+		let finding = json!({
+			"protocol_version": PROTOCOL_VERSION,
+			"id": 1234, "repo_id": 1, "job_id": 2,
+			"scanner_id": "llm-code-review", "severity": "high",
+			"title": "Unchecked index", "description": "See upstream issue #1234.",
+			"file_path": "src/lib.rs", "line_start": 4, "line_end": 6,
+			"fingerprint": "fp", "state": "reported",
+			"verification_required": false, "created_at": 0,
+		});
+		let summary = finding.clone();
+		let app = Router::new()
+			.route(
+				"/v1/findings/1234",
+				get(move || async {
+					(
+						[(loupe_proto::PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())],
+						Json(finding),
+					)
+				}),
+			)
+			.route(
+				"/v1/repos/1/findings/search",
+				get(move || async move {
+					(
+						[(loupe_proto::PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())],
+						Json(
+							json!({ "protocol_version": PROTOCOL_VERSION, "findings": [summary] }),
+						),
+					)
+				}),
+			);
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let url = format!("http://{}", listener.local_addr().unwrap()).parse().unwrap();
+		let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+		(Arc::new(ServerClient::from_parts(reqwest::Client::new(), url)), task)
+	}
+
+	#[tokio::test]
+	async fn prior_finding_search_returns_prefixed_ids() {
+		let (client, task) = prior_findings_client().await;
+		let capability = JobCapability::from_secret("test-capability");
+		let text = tool_query_prior_findings(&client, &capability, 1, &json!({"query": "index"}))
+			.await
+			.unwrap();
+		task.abort();
+		assert!(text.contains("- LUP-1234 [High]"), "search must return prefixed IDs: {text}");
+	}
+
+	#[tokio::test]
+	async fn prior_finding_detail_returns_prefixed_id_for_legacy_numeric_input() {
+		let (client, task) = prior_findings_client().await;
+		let capability = JobCapability::from_secret("test-capability");
+		let text = tool_get_finding_by_id(&client, &capability, &json!({"id": 1234}))
+			.await
+			.expect("legacy numeric IDs must still work");
+		task.abort();
+		assert!(
+			text.starts_with("Finding LUP-1234 [High]"),
+			"detail must return a prefixed ID: {text}"
+		);
+		assert!(text.contains("See upstream issue #1234."), "real GitHub references must survive");
+	}
+
+	#[tokio::test]
+	async fn prior_finding_detail_accepts_prefixed_id() {
+		let (client, task) = prior_findings_client().await;
+		let capability = JobCapability::from_secret("test-capability");
+		let text = tool_get_finding_by_id(&client, &capability, &json!({"id": "LUP-1234"}))
+			.await
+			.expect("prefixed IDs must resolve through the numeric HTTP endpoint");
+		task.abort();
+		assert!(text.starts_with("Finding LUP-1234 [High]"), "detail: {text}");
+	}
+
+	#[tokio::test]
+	async fn prior_finding_detail_rejects_malformed_ids() {
+		let session = fake_session_for_verify(7);
+		for id in [
+			json!("#1234"),
+			json!("1234"),
+			json!("LUP-"),
+			json!("LUP-0"),
+			json!("LUP-01"),
+			json!("LUP--1"),
+			json!("LUP-+1"),
+			json!("lup-1"),
+			json!("LUP-9223372036854775808"),
+			json!("LUP-1\n"),
+			json!(1.5),
+			json!(null),
+			json!(0),
+			json!(-1),
+		] {
+			let error = tool_get_finding_by_id(
+				&session.client,
+				&session.job_capability,
+				&json!({"id": id}),
+			)
+			.await
+			.expect_err("malformed ID must be rejected before making an HTTP request");
+			assert!(
+				error.to_string().contains("LUP-1234"),
+				"error must explain the ID format: {error}"
+			);
+		}
+	}
+
+	#[test]
+	fn finding_lookup_schema_accepts_prefixed_and_legacy_ids() {
+		let tools = tool_definitions(true, false);
+		let lookup = tools
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|tool| tool["name"] == "get_finding_by_id")
+			.unwrap();
+		let schema = &lookup["inputSchema"]["properties"]["id"];
+		assert_eq!(schema["anyOf"][0]["type"], "string", "schema must advertise prefixed IDs");
+		assert_eq!(schema["anyOf"][0]["pattern"], "^LUP-[1-9][0-9]*$");
+		assert_eq!(schema["anyOf"][1]["type"], "integer", "legacy numeric IDs remain supported");
+	}
 
 	#[test]
 	fn tool_catalogue_round_trips_through_json() {
