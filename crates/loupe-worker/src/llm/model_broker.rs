@@ -238,12 +238,21 @@ impl UsageCounters {
 		if self.output_bytes.load(Ordering::Relaxed) >= limits.output_ceiling_bytes {
 			return Err(LimitKind::Output);
 		}
-		self.requests
-			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-				(current < limits.request_ceiling).then_some(current + 1)
-			})
-			.map(|_| ())
-			.map_err(|_| LimitKind::Requests)
+		let mut current = self.requests.load(Ordering::Relaxed);
+		loop {
+			if current >= limits.request_ceiling {
+				return Err(LimitKind::Requests);
+			}
+			match self.requests.compare_exchange_weak(
+				current,
+				current + 1,
+				Ordering::Relaxed,
+				Ordering::Relaxed,
+			) {
+				Ok(_) => return Ok(()),
+				Err(observed) => current = observed,
+			}
+		}
 	}
 
 	fn reserve_output(&self, requested: usize, ceiling: u64) -> usize {
