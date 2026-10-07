@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use loupe_proto::{
-	FindingDetail, JobInfo, ListFindingsResponse, ListReposResponse, RegisterRepoRequest,
-	RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	RetryVerifyRequest, RetryVerifyResponse, RotateRepoPatRequest, ScanRequest, ScanResponse,
-	SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
+	FindingDetail, GithubAppResponse, JobInfo, ListFindingsResponse, ListReposResponse,
+	RegisterRepoRequest, RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse,
+	ReportingSetup, RetryVerifyRequest, RetryVerifyResponse, RotateRepoPatRequest, ScanRequest,
+	ScanResponse, SetGithubAppRequest, SetRepoGithubReportingRequest, UpdateRepoRequest,
+	PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -61,6 +62,37 @@ enum Cmd {
 	Finding(FindingCmd),
 	#[command(subcommand)]
 	Cert(CertCmd),
+	/// Manage the server-wide GitHub App used to file issues.
+	#[command(subcommand)]
+	GithubApp(GithubAppCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum GithubAppCmd {
+	/// Store (or replace) the GitHub App credential. The server verifies
+	/// the key against GitHub before persisting it.
+	Set(GithubAppSetArgs),
+	/// Show which GitHub App is configured.
+	Show,
+	/// Remove the stored GitHub App credential.
+	Clear,
+}
+
+#[derive(Debug, Args)]
+struct GithubAppSetArgs {
+	/// Numeric App ID from the app's settings page on GitHub.
+	#[arg(long)]
+	app_id: u64,
+	/// Path to the private key PEM downloaded from the app's settings
+	/// page. Read from LOUPE_GITHUB_APP_KEY if omitted. Alternatively
+	/// pass the PEM itself via LOUPE_GITHUB_APP_KEY_PEM or, base64
+	/// encoded, via LOUPE_GITHUB_APP_KEY_PEM_B64.
+	#[arg(long, env = "LOUPE_GITHUB_APP_KEY")]
+	private_key_file: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_GITHUB_APP_KEY_PEM", hide_env_values = true)]
+	private_key_pem: Option<String>,
+	#[arg(long, env = "LOUPE_GITHUB_APP_KEY_PEM_B64", hide_env_values = true)]
+	private_key_pem_b64: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -440,7 +472,63 @@ async fn main() -> Result<()> {
 		Cmd::Cert(c) => match c {
 			CertCmd::MintServer(a) => cert_mint_server(a),
 		},
+		Cmd::GithubApp(c) => match c {
+			GithubAppCmd::Set(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				github_app_set(&client, base, a).await
+			},
+			GithubAppCmd::Show => {
+				let (client, base) = client_and_url(&conn)?;
+				github_app_show(&client, base).await
+			},
+			GithubAppCmd::Clear => {
+				let (client, base) = client_and_url(&conn)?;
+				github_app_clear(&client, base).await
+			},
+		},
 	}
+}
+
+async fn github_app_set(
+	client: &reqwest::Client, base: &reqwest::Url, a: GithubAppSetArgs,
+) -> Result<()> {
+	let private_key_pem = pem_from_env_or_file(
+		"GitHub App private key",
+		&a.private_key_pem,
+		&a.private_key_pem_b64,
+		a.private_key_file.as_ref(),
+		"GitHub App private key missing — pass --private-key-file or set LOUPE_GITHUB_APP_KEY_PEM / LOUPE_GITHUB_APP_KEY_PEM_B64",
+	)?;
+	let req = SetGithubAppRequest {
+		protocol_version: PROTOCOL_VERSION,
+		app_id: a.app_id,
+		private_key_pem,
+	};
+	let resp = client.put(url(base, "/v1/github-app")).json(&req).send().await?;
+	if !resp.status().is_success() {
+		anyhow::bail!("server returned {}: {}", resp.status(), resp.text().await?);
+	}
+	println!("github app {} configured", a.app_id);
+	Ok(())
+}
+
+async fn github_app_show(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
+	let resp = client.get(url(base, "/v1/github-app")).send().await?;
+	let body: GithubAppResponse = resp.error_for_status()?.json().await?;
+	match body.app {
+		Some(app) => println!("app_id={} slug={}", app.app_id, app.slug),
+		None => println!("no GitHub App configured"),
+	}
+	Ok(())
+}
+
+async fn github_app_clear(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
+	let resp = client.delete(url(base, "/v1/github-app")).send().await?;
+	if !resp.status().is_success() {
+		anyhow::bail!("server returned {}: {}", resp.status(), resp.text().await?);
+	}
+	println!("github app cleared");
+	Ok(())
 }
 
 fn client_and_url(c: &ConnArgs) -> Result<(reqwest::Client, &reqwest::Url)> {

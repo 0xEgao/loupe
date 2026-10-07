@@ -75,12 +75,15 @@ impl std::fmt::Debug for MasterKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretKind {
 	GithubPat,
+	/// The server-wide GitHub App credential; see `github_app`.
+	GithubApp,
 }
 
 impl SecretKind {
 	pub fn as_str(self) -> &'static str {
 		match self {
 			SecretKind::GithubPat => "github_pat",
+			SecretKind::GithubApp => "github_app",
 		}
 	}
 }

@@ -96,6 +96,33 @@ pub struct SetRepoGithubReportingRequest {
 	pub github_pat: String,
 }
 
+/// Body of `PUT /v1/github-app`. Carries the app's private key inline,
+/// the same way repo registration carries a PAT; the server verifies it
+/// against GitHub and moves it into the `secrets` table. The key never
+/// travels back out in any response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetGithubAppRequest {
+	pub protocol_version: u16,
+	pub app_id: u64,
+	pub private_key_pem: String,
+}
+
+/// Non-secret view of the configured GitHub App.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubAppSummary {
+	pub app_id: u64,
+	pub slug: String,
+}
+
+/// Response body of `GET /v1/github-app`. `app` is `None` until an
+/// operator stores a credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubAppResponse {
+	pub protocol_version: u16,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub app: Option<GithubAppSummary>,
+}
+
 /// Body of `PATCH /v1/repos/:id`. All fields are optional — only the
 /// ones present in the JSON are applied. `disabled = Some(true)` stamps
 /// `disabled_at = now`; `disabled = Some(false)` clears it. The repo's

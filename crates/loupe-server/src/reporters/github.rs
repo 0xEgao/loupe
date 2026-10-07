@@ -10,6 +10,7 @@ use loupe_storage::repos::RepoRow;
 use reqwest::{StatusCode, Url};
 use serde::Serialize;
 
+use super::github_app::{self, GithubAppInfo, GithubAppKey};
 use super::{DispatchReceipt, ReportFinding, Reporter};
 
 const DEFAULT_API_BASE: &str = "https://api.github.com";
@@ -36,6 +37,13 @@ impl GithubReporter {
 			.build()
 			.context("building GithubReporter http client")?;
 		Ok(Self { http, api_base })
+	}
+
+	/// Prove a GitHub App credential works by fetching the app it belongs
+	/// to. Used by the credential route so a bad key or app id fails at
+	/// configuration time rather than at the first dispatch.
+	pub async fn verify_app(&self, key: &GithubAppKey) -> Result<GithubAppInfo> {
+		github_app::fetch_app(&self.http, &self.api_base, key).await
 	}
 }
 
