@@ -26,6 +26,8 @@ pub struct DispatchReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportFinding {
+	/// Stored finding ID, used to render the public `LUP-…` reference.
+	pub id: i64,
 	pub finding: Finding,
 	pub reviewed_revision: Option<String>,
 }

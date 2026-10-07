@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::severity::Severity;
 
+/// Human-facing reference to a stored finding. The numeric ID remains
+/// unchanged in storage and HTTP APIs; the prefix distinguishes Loupe
+/// findings from issue numbers in a reporting repository.
+pub fn format_finding_id(id: i64) -> String {
+	format!("LUP-{id}")
+}
+
 /// A single security finding produced by a `Scanner` and ferried back to
 /// the server. The wire format intentionally mirrors the `findings` table
 /// columns one-for-one so the worker can construct one without consulting

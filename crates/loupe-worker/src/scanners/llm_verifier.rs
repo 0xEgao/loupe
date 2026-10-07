@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use loupe_core::Finding;
+use loupe_core::{format_finding_id, Finding};
 
 use crate::llm::prompts::{self, VERIFY};
 use crate::llm::{LlmBackend, LlmRequest};
@@ -63,6 +63,7 @@ impl Scanner for LlmVerifierScanner {
 		// server's `query_prior_findings` / `get_finding_by_id`
 		// tools cover everything else.
 		let finding_json = serde_json::json!({
+			"id": format_finding_id(ctx.finding_id),
 			"severity": ctx.finding.severity.as_str(),
 			"title": ctx.finding.title,
 			"file": ctx.finding.file_path,
@@ -141,6 +142,18 @@ mod tests {
 			config: serde_json::Value::Null,
 			cancel: CancellationToken::new(),
 		}
+	}
+
+	#[tokio::test]
+	async fn original_report_contains_prefixed_finding_id() {
+		let backend = Arc::new(StubLlmBackend::new("stub", |req: &LlmRequest| {
+			assert!(
+				req.prompt.contains("\"id\":\"LUP-7\""),
+				"original report must identify the finding as LUP-7"
+			);
+			Ok(String::new())
+		}));
+		LlmVerifierScanner::new(backend).verify(&ctx()).await.unwrap();
 	}
 
 	#[tokio::test]

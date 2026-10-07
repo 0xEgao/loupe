@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
-use loupe_core::{ReportingDestination, Severity};
+use loupe_core::{format_finding_id, ReportingDestination, Severity};
 use loupe_storage::repos::RepoRow;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -123,9 +123,14 @@ fn render_message(
 		repo.owner, repo.repo, repo.clone_url
 	));
 	out.push_str(&format!("Findings: {}\n\n", findings.len()));
-	for (i, report_finding) in findings.iter().enumerate() {
+	for report_finding in findings {
 		let f = &report_finding.finding;
-		out.push_str(&format!("{}. [{}] {}\n", i + 1, f.severity, f.title));
+		out.push_str(&format!(
+			"{} [{}] {}\n",
+			format_finding_id(report_finding.id),
+			f.severity,
+			f.title
+		));
 		match &report_finding.reviewed_revision {
 			Some(revision) => out.push_str(&format!("   reviewed revision: {revision}\n")),
 			None => out.push_str("   reviewed revision: not recorded\n"),
@@ -140,7 +145,6 @@ fn render_message(
 		if let Some(cwe) = &f.cwe {
 			out.push_str(&format!("   cwe:  {cwe}\n"));
 		}
-		out.push_str(&format!("   scanner: {}\n", f.scanner_id));
 		out.push_str(&format!("   {}\n\n", f.description));
 	}
 	out
@@ -195,7 +199,31 @@ mod tests {
 	}
 
 	fn report_finding() -> ReportFinding {
-		ReportFinding { finding: finding(), reviewed_revision: Some("abc123".into()) }
+		ReportFinding { id: 1234, finding: finding(), reviewed_revision: Some("abc123".into()) }
+	}
+
+	#[test]
+	fn message_identifies_findings_with_prefixed_ids() {
+		let message = render_message(
+			"loupe@example.com",
+			&[],
+			"findings",
+			&repo_with_email(None, vec![], None),
+			&[report_finding()],
+		);
+		assert!(message.contains("LUP-1234 [high] bug\n"), "message: {message}");
+	}
+
+	#[test]
+	fn message_omits_scanner_metadata() {
+		let message = render_message(
+			"loupe@example.com",
+			&[],
+			"findings",
+			&repo_with_email(None, vec![], None),
+			&[report_finding()],
+		);
+		assert!(!message.contains("scanner:"), "message must omit the scanner header: {message}");
 	}
 
 	#[tokio::test]
