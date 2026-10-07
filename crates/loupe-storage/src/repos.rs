@@ -105,7 +105,20 @@ pub fn update_reporting(
 	Ok(n > 0)
 }
 
+/// How many repos file issues with the PAT stored under `secret_id`.
 pub fn count_github_pat_references(conn: &Connection, secret_id: i64) -> rusqlite::Result<usize> {
+	count_github_destinations(conn, |pat_secret_id| pat_secret_id == Some(secret_id))
+}
+
+/// How many repos file issues through the server-wide GitHub App, i.e.
+/// GitHub destinations without a PAT of their own.
+pub fn count_github_app_references(conn: &Connection) -> rusqlite::Result<usize> {
+	count_github_destinations(conn, |pat_secret_id| pat_secret_id.is_none())
+}
+
+fn count_github_destinations(
+	conn: &Connection, matches: impl Fn(Option<i64>) -> bool,
+) -> rusqlite::Result<usize> {
 	let mut stmt = conn.prepare("SELECT reporting FROM registered_repos")?;
 	let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 	let mut count = 0usize;
@@ -115,10 +128,9 @@ pub fn count_github_pat_references(conn: &Connection, secret_id: i64) -> rusqlit
 			serde_json::from_str(&reporting_text).map_err(|e| {
 				rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
 			})?;
-		if matches!(
-			reporting,
-			ReportingDestination::GithubIssue { pat_secret_id, .. } if pat_secret_id == secret_id
-		) {
+		if let ReportingDestination::GithubIssue { pat_secret_id, .. } = reporting
+			&& matches(pat_secret_id)
+		{
 			count += 1;
 		}
 	}
@@ -251,7 +263,7 @@ mod tests {
 			reporting: ReportingDestination::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
-				pat_secret_id: secret_id,
+				pat_secret_id: Some(secret_id),
 			},
 			verification_enabled: false,
 			require_approval: None,
@@ -275,7 +287,7 @@ mod tests {
 		assert_eq!(one.scan_interval_seconds, Some(3600));
 		match one.reporting {
 			ReportingDestination::GithubIssue { pat_secret_id, .. } => {
-				assert_eq!(pat_secret_id, secret_id)
+				assert_eq!(pat_secret_id, Some(secret_id))
 			},
 			ReportingDestination::Email { .. } | ReportingDestination::Manual => {
 				panic!("fixture builds a github_issue destination")
@@ -320,7 +332,7 @@ mod tests {
 			reporting: ReportingDestination::GithubIssue {
 				target_owner: "x".into(),
 				target_repo: "y".into(),
-				pat_secret_id: sid,
+				pat_secret_id: Some(sid),
 			},
 			verification_enabled: false,
 			require_approval: None,
@@ -439,7 +451,7 @@ mod tests {
 				&ReportingDestination::GithubIssue {
 					target_owner: "acme".into(),
 					target_repo: "tracker".into(),
-					pat_secret_id: new_sid,
+					pat_secret_id: Some(new_sid),
 				},
 			)?)
 		})
@@ -448,7 +460,7 @@ mod tests {
 		let row = db.with_conn(|c| Ok(get(c, id)?)).unwrap().unwrap();
 		match row.reporting {
 			ReportingDestination::GithubIssue { pat_secret_id, .. } => {
-				assert_eq!(pat_secret_id, new_sid)
+				assert_eq!(pat_secret_id, Some(new_sid))
 			},
 			ReportingDestination::Email { .. } | ReportingDestination::Manual => {
 				panic!("fixture builds a github_issue destination")
@@ -474,6 +486,33 @@ mod tests {
 		db.with_conn(|c| Ok(insert(c, &b, 0)?)).unwrap();
 
 		assert_eq!(db.with_conn(|c| Ok(count_github_pat_references(c, sid)?)).unwrap(), 2);
+	}
+
+	#[test]
+	fn count_github_app_references_counts_only_pat_less_github_destinations() {
+		let db = Db::open_in_memory(&crate::secrets::MasterKey::for_tests()).unwrap();
+		let sid =
+			db.with_conn(|c| Ok(secrets::insert(c, SecretKind::GithubPat, "p", b"x", 0)?)).unwrap();
+		let pat_repo = fake_repo(sid);
+		let mut app_repo = fake_repo(sid);
+		app_repo.clone_url = "https://github.com/acme/app.git".into();
+		app_repo.repo = "app".into();
+		app_repo.reporting = ReportingDestination::GithubIssue {
+			target_owner: "acme".into(),
+			target_repo: "tracker".into(),
+			pat_secret_id: None,
+		};
+		let mut manual_repo = fake_repo(sid);
+		manual_repo.clone_url = "https://github.com/acme/manual.git".into();
+		manual_repo.repo = "manual".into();
+		manual_repo.reporting = ReportingDestination::Manual;
+		for repo in [&pat_repo, &app_repo, &manual_repo] {
+			db.with_conn(|c| Ok(insert(c, repo, 0)?)).unwrap();
+		}
+
+		assert_eq!(db.with_conn(|c| Ok(count_github_app_references(c)?)).unwrap(), 1);
+		// An app-mode destination references no PAT secret at all.
+		assert_eq!(db.with_conn(|c| Ok(count_github_pat_references(c, sid)?)).unwrap(), 1);
 	}
 
 	#[test]

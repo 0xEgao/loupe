@@ -54,7 +54,7 @@ fn v3_precommit_failures_reopen_as_complete_v2_and_retry() {
 		}
 		assert!(fk_enabled(&conn));
 		apply_pending(&mut conn).unwrap();
-		assert_eq!(markers(&conn), (3, 3));
+		assert_eq!(markers(&conn), (LATEST_SCHEMA_VERSION, LATEST_SCHEMA_VERSION));
 	}
 }
 
@@ -152,7 +152,7 @@ fn v3_restoration_failure_rejects_bootstrap_but_keeps_complete_v3() {
 	let db = Db::open(&path, &MasterKey::for_tests()).unwrap();
 	db.with_conn(|conn| {
 		assert_eq!(schema(conn), expected);
-		assert_eq!(markers(conn), (3, 3));
+		assert_eq!(markers(conn), (LATEST_SCHEMA_VERSION, LATEST_SCHEMA_VERSION));
 		assert!(fk_enabled(conn));
 		Ok(())
 	})
@@ -240,7 +240,7 @@ fn v3_real_commit_failure_rolls_back_and_restores_foreign_keys() {
 	assert_eq!(markers(&conn), (2, 2));
 	assert_eq!(schema(&conn), before);
 	apply_pending(&mut conn).unwrap();
-	assert_eq!(markers(&conn), (3, 3));
+	assert_eq!(markers(&conn), (LATEST_SCHEMA_VERSION, LATEST_SCHEMA_VERSION));
 }
 
 #[test]
@@ -276,7 +276,7 @@ fn v1_upgrade_and_v3_refusal_leave_committed_capability_migration() {
 		}
 		drop(conn);
 		let mut conn = open(&path);
-		let version = if refuse { 2 } else { 3 };
+		let version = if refuse { 2 } else { LATEST_SCHEMA_VERSION };
 		assert_eq!(markers(&conn), (version, version));
 		assert_eq!(rows(&conn, "SELECT state, worker_id, lease_expires_at, job_capability_hash, finished_at FROM jobs WHERE id = 2"),
 			vec![vec!["succeeded".to_owned().into(), rusqlite::types::Value::Null, rusqlite::types::Value::Null, rusqlite::types::Value::Null, 6.into()]]);
@@ -287,7 +287,7 @@ fn v1_upgrade_and_v3_refusal_leave_committed_capability_migration() {
 			settled(&mut expected);
 			assert_eq!(schema(&conn), schema(&expected));
 			apply_pending(&mut conn).unwrap();
-			assert_eq!(markers(&conn), (3, 3));
+			assert_eq!(markers(&conn), (LATEST_SCHEMA_VERSION, LATEST_SCHEMA_VERSION));
 		}
 	}
 }

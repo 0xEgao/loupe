@@ -767,7 +767,7 @@ mod tests {
 						reporting: ReportingDestination::GithubIssue {
 							target_owner: "a".into(),
 							target_repo: "t".into(),
-							pat_secret_id: secret_id,
+							pat_secret_id: Some(secret_id),
 						},
 						verification_enabled: false,
 						require_approval: None,

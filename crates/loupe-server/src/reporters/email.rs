@@ -14,7 +14,7 @@ use loupe_storage::repos::RepoRow;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use super::{DispatchReceipt, ReportFinding, Reporter};
+use super::{DispatchReceipt, ReportFinding, Reporter, ReporterCredential};
 
 const DEFAULT_SENDMAIL_BIN: &str = "/usr/sbin/sendmail";
 const DEFAULT_FROM: &str = "loupe-noreply@localhost";
@@ -47,7 +47,7 @@ impl Reporter for EmailReporter {
 	}
 
 	async fn dispatch(
-		&self, repo: &RepoRow, findings: &[ReportFinding], _pat: &str,
+		&self, repo: &RepoRow, findings: &[ReportFinding], _credential: &ReporterCredential,
 	) -> Result<DispatchReceipt> {
 		let (to, from, subject_prefix) = match &repo.reporting {
 			ReportingDestination::Email { to, from, subject_prefix } => {
@@ -248,8 +248,10 @@ mod tests {
 		];
 
 		for repo in cases {
-			let err =
-				reporter.dispatch(&repo, &[report_finding()], "").await.expect_err("must reject");
+			let err = reporter
+				.dispatch(&repo, &[report_finding()], &ReporterCredential::None)
+				.await
+				.expect_err("must reject");
 			let msg = err.to_string();
 			assert!(msg.contains("header contains a newline"), "got: {msg}");
 		}

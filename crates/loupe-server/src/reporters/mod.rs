@@ -33,11 +33,32 @@ pub struct ReportFinding {
 	pub reviewed_revision: Option<String>,
 }
 
+/// What the dispatcher resolved from the secrets table for one repo.
+/// Reporters that need no credential (email) ignore it.
+pub enum ReporterCredential {
+	None,
+	/// A personal access token stored for this repo.
+	GithubPat(String),
+	/// The server-wide GitHub App; the reporter mints a short-lived,
+	/// repo-scoped installation token from it per dispatch.
+	GithubApp(Box<github_app::GithubAppKey>),
+}
+
+impl std::fmt::Debug for ReporterCredential {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::None => f.write_str("None"),
+			Self::GithubPat(_) => f.write_str("GithubPat(redacted)"),
+			Self::GithubApp(key) => f.debug_tuple("GithubApp").field(&key.app_id()).finish(),
+		}
+	}
+}
+
 #[async_trait::async_trait]
 pub trait Reporter: Send + Sync {
 	fn kind(&self) -> &'static str;
 	async fn dispatch(
-		&self, repo: &RepoRow, findings: &[ReportFinding], pat: &str,
+		&self, repo: &RepoRow, findings: &[ReportFinding], credential: &ReporterCredential,
 	) -> Result<DispatchReceipt>;
 }
 

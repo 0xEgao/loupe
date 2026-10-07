@@ -8,16 +8,17 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use git2::{Repository, Signature};
 use loupe_core::{Finding, Severity};
 use loupe_proto::{
 	CompleteOutcome, CompleteRequest, FindingsBatch, LeaseRequest, LeaseResponse,
 	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	ScanRequest, JOB_CAPABILITY_HEADER, PROTOCOL_VERSION,
+	ScanRequest, SetGithubAppRequest, JOB_CAPABILITY_HEADER, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
+use loupe_server::reporters::github_app::testing::APP_PRIVATE_KEY_PEM;
 use loupe_server::reporters::GithubReporter;
 use loupe_server::{serve, AppState, Config};
 use loupe_storage::Db;
@@ -26,10 +27,66 @@ use loupe_worker::scanners::RegexSecretsScanner;
 use loupe_worker::{RepoCache, Runner, Scanner, ServerClient};
 use tokio_util::sync::CancellationToken;
 
+/// App id the stub's `GET /app` reports; the app-mode test registers the
+/// fixture key under this id.
+const STUB_APP_ID: u64 = 4242;
+const STUB_INSTALLATION_ID: u64 = 42;
+const STUB_INSTALLATION_TOKEN: &str = "ghs_stub_installation_token";
+
 #[derive(Clone, Default)]
 struct GithubStubState {
 	captured: Arc<Mutex<Vec<CapturedIssue>>>,
 	labels: Arc<Mutex<Vec<CapturedLabel>>>,
+	/// Authorization headers seen on the app-authenticated endpoints
+	/// (`GET /app`, installation lookup, token mint), in call order.
+	app_auths: Arc<Mutex<Vec<String>>>,
+	/// Bodies of `POST /app/installations/{id}/access_tokens`.
+	token_requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+fn bearer_of(headers: &axum::http::HeaderMap) -> String {
+	headers
+		.get(axum::http::header::AUTHORIZATION)
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or("")
+		.to_owned()
+}
+
+async fn stub_get_app(
+	State(stub): State<GithubStubState>, headers: axum::http::HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+	stub.app_auths.lock().unwrap().push(bearer_of(&headers));
+	(StatusCode::OK, Json(serde_json::json!({"id": STUB_APP_ID, "slug": "loupe-reporter"})))
+}
+
+async fn stub_get_installation(
+	State(stub): State<GithubStubState>,
+	axum::extract::Path((_owner, repo)): axum::extract::Path<(String, String)>,
+	headers: axum::http::HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+	stub.app_auths.lock().unwrap().push(bearer_of(&headers));
+	if repo == "tracker" {
+		(StatusCode::OK, Json(serde_json::json!({"id": STUB_INSTALLATION_ID})))
+	} else {
+		(StatusCode::NOT_FOUND, Json(serde_json::json!({"message": "Not Found"})))
+	}
+}
+
+async fn stub_mint_token(
+	State(stub): State<GithubStubState>,
+	axum::extract::Path(installation_id): axum::extract::Path<u64>, headers: axum::http::HeaderMap,
+	Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+	stub.app_auths.lock().unwrap().push(bearer_of(&headers));
+	stub.token_requests.lock().unwrap().push(body);
+	assert_eq!(installation_id, STUB_INSTALLATION_ID);
+	(
+		StatusCode::CREATED,
+		Json(serde_json::json!({
+			"token": STUB_INSTALLATION_TOKEN,
+			"expires_at": "2099-01-01T00:00:00Z",
+		})),
+	)
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +135,9 @@ async fn spawn_github_stub() -> (SocketAddr, GithubStubState, tokio::task::JoinH
 	let app = Router::new()
 		.route("/repos/{owner}/{repo}/labels", post(stub_create_label))
 		.route("/repos/{owner}/{repo}/issues", post(stub_create_issue))
+		.route("/app", get(stub_get_app))
+		.route("/repos/{owner}/{repo}/installation", get(stub_get_installation))
+		.route("/app/installations/{id}/access_tokens", post(stub_mint_token))
 		.with_state(stub.clone());
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let addr = listener.local_addr().unwrap();
@@ -163,7 +223,7 @@ async fn dispatcher_opens_a_github_issue_after_a_succeeded_scan() {
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
-				github_pat: "ghp_test_pat_value".into(),
+				github_pat: Some("ghp_test_pat_value".into()),
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
@@ -326,7 +386,7 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
-				github_pat: "ghp_test_pat_value".into(),
+				github_pat: Some("ghp_test_pat_value".into()),
 			},
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
@@ -503,6 +563,296 @@ async fn dispatch_only_marks_confirmed_findings_reported() {
 			("severity:high".into(), "d93f0b".into()),
 			("severity:critical".into(), "b60205".into())
 		]
+	);
+
+	server.shutdown().await;
+}
+
+/// A repo registered without a PAT reports through the server's GitHub
+/// App: the dispatcher signs an app JWT, resolves the tracker's
+/// installation, mints a repo-scoped token, and files labels and issues
+/// with that token. No PAT secret exists anywhere.
+#[tokio::test]
+async fn dispatcher_files_issues_through_the_github_app_without_a_pat() {
+	let (_repo_tmp, clone_url) = make_planted_repo();
+	let (stub_addr, stub_state, _stub_join) = spawn_github_stub().await;
+	let stub_base = format!("http://{stub_addr}");
+
+	let server_dir = tempfile::tempdir().unwrap();
+	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
+		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	)
+	.unwrap();
+	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
+	let cfg = Config {
+		bind_addr: "127.0.0.1:0".parse().unwrap(),
+		db_path: init.layout.db_path.clone(),
+		server_cert_pem: std::fs::read_to_string(&init.layout.server_cert).unwrap(),
+		server_key_pem: std::fs::read_to_string(&init.layout.server_key).unwrap(),
+		ca_cert_pem: ca_cert_pem.clone(),
+		ca_key_pem: std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	};
+	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
+	let state = AppState::new(db.clone(), Arc::new(ca), reporter);
+	let server = serve(cfg, state).await.unwrap();
+	let addr = server.local_addr;
+
+	let admin = reqwest::Client::builder()
+		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
+		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
+		.resolve("loupe-server", addr)
+		.use_rustls_tls()
+		.build()
+		.unwrap();
+
+	// Configure the app through the real route; the stub's GET /app
+	// verifies the key like GitHub would.
+	let resp = admin
+		.put("https://loupe-server/v1/github-app")
+		.json(&SetGithubAppRequest {
+			protocol_version: PROTOCOL_VERSION,
+			app_id: STUB_APP_ID,
+			private_key_pem: APP_PRIVATE_KEY_PEM.into(),
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204, "{}", resp.text().await.unwrap());
+
+	let resp = admin
+		.post("https://loupe-server/v1/repos")
+		.json(&RegisterRepoRequest {
+			protocol_version: PROTOCOL_VERSION,
+			clone_url: "https://github.com/loupe/test-target.git".into(),
+			branch: None,
+			scan_interval_seconds: None,
+			reporting: ReportingSetup::GithubIssue {
+				target_owner: "acme".into(),
+				target_repo: "tracker".into(),
+				github_pat: None,
+			},
+			scanner_config: serde_json::Value::Null,
+			verification_enabled: Some(false),
+			require_approval: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+	let body: serde_json::Value = resp.json().await.unwrap();
+	let repo_id = body["repo_id"].as_i64().unwrap();
+	db.with_conn(|c| {
+		c.execute(
+			"UPDATE registered_repos SET clone_url = ?1 WHERE id = ?2",
+			(&clone_url, repo_id),
+		)?;
+		Ok(())
+	})
+	.unwrap();
+
+	let resp = admin
+		.post("https://loupe-server/v1/workers")
+		.json(&RegisterWorkerRequest { protocol_version: PROTOCOL_VERSION, name: "w1".into() })
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201);
+	let bundle: RegisterWorkerResponse = resp.json().await.unwrap();
+	let raw = reqwest::Client::builder()
+		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
+		.identity(pem_to_identity(&bundle.client_cert_pem, &bundle.client_key_pem))
+		.resolve("loupe-server", addr)
+		.use_rustls_tls()
+		.build()
+		.unwrap();
+	let server_client =
+		Arc::new(ServerClient::from_parts(raw, "https://loupe-server/".parse().unwrap()));
+
+	admin
+		.post(format!("https://loupe-server/v1/repos/{repo_id}/scan"))
+		.json(&ScanRequest { protocol_version: PROTOCOL_VERSION, incremental: false })
+		.send()
+		.await
+		.unwrap();
+	let cache_dir = tempfile::tempdir().unwrap();
+	let cache = Arc::new(RepoCache::new(cache_dir.path().to_path_buf(), u64::MAX).unwrap());
+	let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(RegexSecretsScanner::new())];
+	let runner = Runner::new(server_client, cache, scanners);
+	assert!(runner.step(&CancellationToken::new()).await.unwrap());
+
+	// The issue and its label were filed with the installation token,
+	// never with an app JWT and never with anything PAT-shaped.
+	let captured = stub_state.captured.lock().unwrap().clone();
+	assert_eq!(captured.len(), 1, "expected exactly one issue, got {}", captured.len());
+	assert_eq!(captured[0].owner, "acme");
+	assert_eq!(captured[0].repo, "tracker");
+	assert_eq!(captured[0].auth, format!("Bearer {STUB_INSTALLATION_TOKEN}"));
+	let labels = stub_state.labels.lock().unwrap().clone();
+	assert_eq!(labels.len(), 1);
+	assert_eq!(labels[0].body["name"], "severity:high");
+
+	// GET /app at configuration time, then one installation lookup and
+	// one mint at dispatch, all authenticated with a three-segment JWT.
+	let app_auths = stub_state.app_auths.lock().unwrap().clone();
+	assert_eq!(app_auths.len(), 3, "app calls: {app_auths:?}");
+	for auth in &app_auths {
+		let jwt = auth.strip_prefix("Bearer ").expect("bearer JWT");
+		assert_eq!(jwt.split('.').count(), 3, "not a compact JWT: {auth}");
+	}
+	let token_requests = stub_state.token_requests.lock().unwrap().clone();
+	assert_eq!(
+		token_requests,
+		vec![serde_json::json!({
+			"repositories": ["tracker"],
+			"permissions": {"issues": "write"},
+		})],
+		"the installation token must be scoped to the tracker and to issues"
+	);
+
+	// No PAT row was ever created; the finding is reported.
+	let pat_rows: i64 = db
+		.with_conn(|c| {
+			Ok(c.query_row("SELECT COUNT(*) FROM secrets WHERE kind = 'github_pat'", [], |r| {
+				r.get(0)
+			})?)
+		})
+		.unwrap();
+	assert_eq!(pat_rows, 0);
+	let reported_count: i64 = db
+		.with_conn(|c| {
+			Ok(c.query_row("SELECT COUNT(*) FROM findings WHERE state = 'reported'", [], |r| {
+				r.get(0)
+			})?)
+		})
+		.unwrap();
+	assert_eq!(reported_count, 1);
+
+	server.shutdown().await;
+}
+
+/// The `allowed_target_owners` list is enforced when a finding is
+/// dispatched, not only when a repo is registered: a row that targets a
+/// foreign owner (registered before the list was tightened, or edited
+/// behind the server's back) must not be able to file an issue there.
+#[tokio::test]
+async fn dispatch_refuses_app_mode_targets_outside_the_owner_allowlist() {
+	let (stub_addr, stub_state, _stub_join) = spawn_github_stub().await;
+	let stub_base = format!("http://{stub_addr}");
+
+	let server_dir = tempfile::tempdir().unwrap();
+	let init = run_init(server_dir.path(), &["loupe-server".to_owned()], None).unwrap();
+	let ca = Ca::from_pem(
+		&std::fs::read_to_string(&init.layout.ca_cert).unwrap(),
+		&std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	)
+	.unwrap();
+	let ca_cert_pem = std::fs::read_to_string(&init.layout.ca_cert).unwrap();
+	let cfg = Config {
+		bind_addr: "127.0.0.1:0".parse().unwrap(),
+		db_path: init.layout.db_path.clone(),
+		server_cert_pem: std::fs::read_to_string(&init.layout.server_cert).unwrap(),
+		server_key_pem: std::fs::read_to_string(&init.layout.server_key).unwrap(),
+		ca_cert_pem: ca_cert_pem.clone(),
+		ca_key_pem: std::fs::read_to_string(&init.layout.ca_key).unwrap(),
+	};
+	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
+	let reporter = Arc::new(GithubReporter::with_base(&stub_base).unwrap());
+	let state = AppState::new(db.clone(), Arc::new(ca), reporter)
+		.with_github_app_allowed_owners(Some(vec!["acme".into()]));
+	let server = serve(cfg, state).await.unwrap();
+	let addr = server.local_addr;
+	let admin = reqwest::Client::builder()
+		.add_root_certificate(pem_to_certificate(&ca_cert_pem))
+		.identity(pem_to_identity(&init.admin_bundle.cert_pem, &init.admin_bundle.key_pem))
+		.resolve("loupe-server", addr)
+		.use_rustls_tls()
+		.build()
+		.unwrap();
+
+	let resp = admin
+		.put("https://loupe-server/v1/github-app")
+		.json(&SetGithubAppRequest {
+			protocol_version: PROTOCOL_VERSION,
+			app_id: STUB_APP_ID,
+			private_key_pem: APP_PRIVATE_KEY_PEM.into(),
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204, "{}", resp.text().await.unwrap());
+
+	// Register against the allowed owner, then re-point the stored row
+	// at a foreign tracker behind the registration checks.
+	let resp = admin
+		.post("https://loupe-server/v1/repos")
+		.json(&RegisterRepoRequest {
+			protocol_version: PROTOCOL_VERSION,
+			clone_url: "https://github.com/loupe/test-target.git".into(),
+			branch: None,
+			scan_interval_seconds: None,
+			reporting: ReportingSetup::GithubIssue {
+				target_owner: "acme".into(),
+				target_repo: "tracker".into(),
+				github_pat: None,
+			},
+			scanner_config: serde_json::Value::Null,
+			verification_enabled: Some(false),
+			require_approval: None,
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+	let body: serde_json::Value = resp.json().await.unwrap();
+	let repo_id = body["repo_id"].as_i64().unwrap();
+	let finding_id: i64 = db
+		.with_conn(|c| {
+			c.execute(
+				"UPDATE registered_repos SET reporting = ?1 WHERE id = ?2",
+				(
+					r#"{"kind":"github_issue","target_owner":"evil","target_repo":"tracker"}"#,
+					repo_id,
+				),
+			)?;
+			c.execute(
+				"INSERT INTO jobs (repo_id, kind, state, enqueued_at) VALUES (?1, 'scan', 'succeeded', 0)",
+				[repo_id],
+			)?;
+			let job_id = c.last_insert_rowid();
+			c.execute(
+				"INSERT INTO findings (repo_id, job_id, scanner_id, severity, title, description,
+				    fingerprint, state, verification_required, created_at)
+				 VALUES (?1, ?2, 'regex-secrets', 'high', 'leaked key', 'd', 'fp', 'confirmed', 0, 0)",
+				(repo_id, job_id),
+			)?;
+			Ok(c.last_insert_rowid())
+		})
+		.unwrap();
+
+	let resp = admin
+		.post(format!("https://loupe-server/v1/findings/{finding_id}/retry-report"))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 500, "dispatch to a foreign owner must fail");
+	let body = resp.text().await.unwrap();
+	assert!(body.contains("evil") && body.contains("acme"), "error must name both: {body}");
+
+	let state_now: String = db
+		.with_conn(|c| {
+			Ok(c.query_row("SELECT state FROM findings WHERE id = ?1", [finding_id], |r| r.get(0))?)
+		})
+		.unwrap();
+	assert_eq!(state_now, "confirmed", "finding must stay unreported");
+	assert!(stub_state.captured.lock().unwrap().is_empty(), "no issue may reach GitHub");
+	assert!(stub_state.labels.lock().unwrap().is_empty(), "no label may reach GitHub");
+	assert_eq!(
+		stub_state.app_auths.lock().unwrap().len(),
+		1,
+		"only the configuration-time GET /app may hit the app endpoints"
 	);
 
 	server.shutdown().await;

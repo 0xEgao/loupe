@@ -114,7 +114,7 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 		reporting: ReportingSetup::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: "tracker".into(),
-			github_pat: "ghp".into(),
+			github_pat: Some("ghp".into()),
 		},
 		scanner_config: serde_json::Value::Null,
 		verification_enabled: Some(false),
@@ -148,7 +148,7 @@ async fn register_repo(f: &Fixture, clone_url: &str, target_repo: &str) -> i64 {
 		reporting: ReportingSetup::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: target_repo.into(),
-			github_pat: "ghp".into(),
+			github_pat: Some("ghp".into()),
 		},
 		scanner_config: serde_json::Value::Null,
 		verification_enabled: Some(false),

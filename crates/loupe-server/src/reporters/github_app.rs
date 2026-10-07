@@ -126,7 +126,7 @@ pub async fn fetch_app(
 	let jwt = key.sign_jwt(now_unix())?;
 	let url = api_base.join("/app").map_err(|e| anyhow!("building app URL: {e}"))?;
 	let resp =
-		app_request(http.get(url), &jwt).send().await.context("fetching GitHub App metadata")?;
+		github_request(http.get(url), &jwt).send().await.context("fetching GitHub App metadata")?;
 	let status = resp.status();
 	if !status.is_success() {
 		let body = resp.text().await.unwrap_or_default();
@@ -135,8 +135,12 @@ pub async fn fetch_app(
 	resp.json().await.context("parsing GitHub App metadata")
 }
 
-fn app_request(req: reqwest::RequestBuilder, jwt: &str) -> reqwest::RequestBuilder {
-	req.bearer_auth(jwt).header("Accept", ACCEPT).header("X-GitHub-Api-Version", API_VERSION)
+/// Stamp the headers every GitHub API call carries. Shared with the
+/// issue reporter so the API version is pinned in exactly one place.
+pub(super) fn github_request(
+	req: reqwest::RequestBuilder, bearer: &str,
+) -> reqwest::RequestBuilder {
+	req.bearer_auth(bearer).header("Accept", ACCEPT).header("X-GitHub-Api-Version", API_VERSION)
 }
 
 type TokenKey = (u64, String, String);
@@ -199,6 +203,13 @@ impl InstallationTokens {
 		);
 		Ok(token)
 	}
+
+	/// Forget the cached token for one target so the next `token_for`
+	/// mints again. Called when GitHub answers 401 to a token that has
+	/// not reached its cached expiry — revoked, or expired early.
+	pub async fn invalidate(&self, app_id: u64, owner: &str, repo: &str) {
+		self.cache.lock().await.remove(&(app_id, owner.to_owned(), repo.to_owned()));
+	}
 }
 
 async fn lookup_installation(
@@ -207,7 +218,7 @@ async fn lookup_installation(
 	let url = api_base
 		.join(&format!("/repos/{owner}/{repo}/installation"))
 		.map_err(|e| anyhow!("building installation URL: {e}"))?;
-	let resp = app_request(http.get(url), jwt)
+	let resp = github_request(http.get(url), jwt)
 		.send()
 		.await
 		.with_context(|| format!("looking up the GitHub App installation for {owner}/{repo}"))?;
@@ -234,7 +245,7 @@ async fn mint_token(
 	let url = api_base
 		.join(&format!("/app/installations/{installation_id}/access_tokens"))
 		.map_err(|e| anyhow!("building access token URL: {e}"))?;
-	let resp = app_request(http.post(url), jwt)
+	let resp = github_request(http.post(url), jwt)
 		.json(&AccessTokenRequest {
 			repositories: [repo],
 			permissions: AccessTokenPermissions { issues: "write" },
@@ -489,5 +500,29 @@ VDqD0pzLw2aWYKoIWhPBO3MRWlrcq6SnRQ==
 			.unwrap_err()
 			.to_string();
 		assert!(err.contains("not installed on acme/elsewhere"), "error: {err}");
+	}
+
+	#[tokio::test]
+	async fn invalidate_forces_the_next_token_for_to_mint_again() {
+		let (addr, stub) = spawn_stub().await;
+		stub.installed.lock().unwrap().insert("acme/tracker".into(), 777);
+		let api_base: Url = format!("http://{addr}").parse().unwrap();
+		let http = reqwest::Client::new();
+		let key = GithubAppKey::from_pem(42, APP_PRIVATE_KEY_PEM).unwrap();
+		let tokens = InstallationTokens::default();
+
+		let first = tokens.token_for(&http, &api_base, &key, "acme", "tracker").await.unwrap();
+		assert_eq!(first, "ghs_stub_777_1");
+
+		// Dropping a token for another target must not touch this one.
+		tokens.invalidate(42, "acme", "elsewhere").await;
+		tokens.invalidate(7, "acme", "tracker").await;
+		let cached = tokens.token_for(&http, &api_base, &key, "acme", "tracker").await.unwrap();
+		assert_eq!(cached, first, "unrelated invalidations must keep the cached token");
+
+		tokens.invalidate(42, "acme", "tracker").await;
+		let fresh = tokens.token_for(&http, &api_base, &key, "acme", "tracker").await.unwrap();
+		assert_eq!(fresh, "ghs_stub_777_2", "an invalidated token must be minted anew");
+		assert_eq!(stub.token_mints.lock().unwrap().len(), 2);
 	}
 }

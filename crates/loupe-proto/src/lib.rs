@@ -22,9 +22,9 @@ pub use job_io::{
 };
 pub use lease::{JobCapability, LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse};
 pub use registry::{
-	GithubAppResponse, GithubAppSummary, ListReposResponse, RegisterRepoRequest,
-	RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse, RepoSummary,
-	ReportingSetup, ReportingSummary, RotateRepoPatRequest, SetGithubAppRequest,
+	GithubAppResponse, GithubAppSummary, GithubReportingAuth, ListReposResponse,
+	RegisterRepoRequest, RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse,
+	RepoSummary, ReportingSetup, ReportingSummary, RotateRepoPatRequest, SetGithubAppRequest,
 	SetRepoGithubReportingRequest, UpdateRepoRequest,
 };
 pub use scan::{JobInfo, ScanRequest, ScanResponse};

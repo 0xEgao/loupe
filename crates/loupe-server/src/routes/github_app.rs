@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use loupe_proto::{GithubAppResponse, GithubAppSummary, SetGithubAppRequest, PROTOCOL_VERSION};
 use loupe_storage::github_app::{self, StoredGithubApp};
+use loupe_storage::repos;
 
 use crate::reporters::github_app::GithubAppKey;
 use crate::state::AppState;
@@ -69,15 +70,38 @@ pub async fn get(
 	}))
 }
 
-/// `DELETE /v1/github-app` — admin only. Removes the stored credential.
+/// `DELETE /v1/github-app` — admin only. Removes the stored credential,
+/// unless a repo still reports through it: dropping the key under those
+/// repos would make every one of their dispatches fail, so the operator
+/// has to re-point them (to a PAT or another destination) first.
 pub async fn clear(State(state): State<AppState>) -> Result<StatusCode, (StatusCode, String)> {
-	let removed = state
+	enum Outcome {
+		Removed,
+		Missing,
+		InUse(usize),
+	}
+	let outcome = state
 		.db
-		.with_conn(|c| Ok(github_app::clear(c)?))
+		.with_conn(|c| {
+			let tx = c.transaction()?;
+			let referencing = repos::count_github_app_references(&tx)?;
+			if referencing > 0 {
+				return Ok(Outcome::InUse(referencing));
+			}
+			let removed = github_app::clear(&tx)?;
+			tx.commit()?;
+			Ok(if removed { Outcome::Removed } else { Outcome::Missing })
+		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("clearing GitHub App: {e}")))?;
-	if removed {
-		Ok(StatusCode::NO_CONTENT)
-	} else {
-		Err((StatusCode::NOT_FOUND, "no GitHub App configured".into()))
+	match outcome {
+		Outcome::Removed => Ok(StatusCode::NO_CONTENT),
+		Outcome::Missing => Err((StatusCode::NOT_FOUND, "no GitHub App configured".into())),
+		Outcome::InUse(n) => Err((
+			StatusCode::CONFLICT,
+			format!(
+				"{n} repo(s) still report through the GitHub App; switch them to a PAT or \
+				 another destination before clearing it"
+			),
+		)),
 	}
 }

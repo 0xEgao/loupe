@@ -41,6 +41,7 @@ const MIGRATIONS: &[Migration] = &[
 	Migration::Sql { version: 1, sql: V1_INITIAL },
 	Migration::Sql { version: 2, sql: V2_JOB_CAPABILITIES },
 	Migration::Structural { version: 3, run: v3::run },
+	Migration::Sql { version: 4, sql: V4_GITHUB_APP },
 ];
 
 /// The highest version this build knows about.
@@ -377,6 +378,18 @@ UPDATE jobs
  WHERE state = 'leased';
 "#;
 
+/// v4 — GitHub issue destinations may omit `pat_secret_id` to report
+/// through the server-wide GitHub App. No table changes: the destination
+/// is JSON inside `registered_repos.reporting`. The version bump exists so
+/// a server built before app support refuses the database up front instead
+/// of failing on the first repo row it cannot deserialize.
+const V4_GITHUB_APP: &str = r#"
+-- registered_repos.reporting: {"kind":"github_issue", ...} may now lack
+-- "pat_secret_id"; such repos file issues as the GitHub App stored in
+-- secrets (kind = 'github_app'). Older binaries do not understand this,
+-- hence the version bump without schema changes.
+"#;
+
 #[cfg(test)]
 mod tests {
 	use rusqlite::Connection;
@@ -433,6 +446,34 @@ mod tests {
 		apply_pending(&mut c).unwrap();
 		let v_after = current_schema_version(&c).unwrap();
 		assert_eq!(v_before, v_after);
+	}
+
+	#[test]
+	fn github_app_migration_bumps_a_v3_database_without_schema_changes() {
+		let mut c = Connection::open_in_memory().unwrap();
+		apply_migrations(&mut c, &MIGRATIONS[..3]).unwrap();
+		assert_eq!(current_schema_version(&c).unwrap(), 3);
+		let schema_before: Vec<(String, Option<String>)> = c
+			.prepare("SELECT name, sql FROM sqlite_master ORDER BY name")
+			.unwrap()
+			.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+			.unwrap()
+			.collect::<Result<_, _>>()
+			.unwrap();
+
+		apply_pending(&mut c).unwrap();
+
+		assert_eq!(current_schema_version(&c).unwrap(), 4);
+		let user_version: u32 = c.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+		assert_eq!(user_version, 4);
+		let schema_after: Vec<(String, Option<String>)> = c
+			.prepare("SELECT name, sql FROM sqlite_master ORDER BY name")
+			.unwrap()
+			.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+			.unwrap()
+			.collect::<Result<_, _>>()
+			.unwrap();
+		assert_eq!(schema_before, schema_after, "v4 is a version marker only");
 	}
 
 	#[test]

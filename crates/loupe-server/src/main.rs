@@ -287,9 +287,16 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 		"loupe-server: database ready"
 	);
 	let github = Arc::new(loupe_server::reporters::GithubReporter::new()?);
+	if let Some(owners) = &file_cfg.github_app.allowed_target_owners {
+		tracing::info!(
+			owners = ?owners,
+			"loupe-server: GitHub App reporting restricted to the listed tracker owners"
+		);
+	}
 	let state = AppState::new(Arc::new(db), Arc::new(ca), github)
 		.with_require_approval_default(require_approval_default)
-		.with_verification_default(verification_default);
+		.with_verification_default(verification_default)
+		.with_github_app_allowed_owners(file_cfg.github_app.allowed_target_owners);
 	let state = state.with_review_policy(review_policy)?;
 	if require_approval_default {
 		tracing::info!(

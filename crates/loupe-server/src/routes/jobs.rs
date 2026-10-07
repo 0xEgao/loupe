@@ -925,7 +925,7 @@ async fn dispatch_confirmed_rows(
 		return Ok(());
 	}
 
-	let pat = reporter_secret(state, repo)?;
+	let credential = reporter_credential(state, repo)?;
 	let reporter =
 		reporters::select(repo, state.github_reporter.clone(), state.email_reporter.clone())
 			.ok_or_else(|| anyhow::anyhow!("no reporter for destination kind"))?;
@@ -935,7 +935,7 @@ async fn dispatch_confirmed_rows(
 			let finding_id = row.id;
 			let report_finding = report_finding_from_row(state, row)?;
 			let findings_for_report = [report_finding];
-			let receipt = reporter.dispatch(repo, &findings_for_report, &pat).await?;
+			let receipt = reporter.dispatch(repo, &findings_for_report, &credential).await?;
 			match scope {
 				DispatchScope::Finding(_) => tracing::info!(
 					finding_id,
@@ -958,7 +958,7 @@ async fn dispatch_confirmed_rows(
 		.into_iter()
 		.map(|row| report_finding_from_row(state, row))
 		.collect::<anyhow::Result<_>>()?;
-	let receipt = reporter.dispatch(repo, &findings_for_report, &pat).await?;
+	let receipt = reporter.dispatch(repo, &findings_for_report, &credential).await?;
 	match scope {
 		DispatchScope::Finding(finding_id) => tracing::info!(
 			finding_id,
@@ -977,19 +977,47 @@ async fn dispatch_confirmed_rows(
 	Ok(())
 }
 
-fn reporter_secret(state: &AppState, repo: &repos::RepoRow) -> anyhow::Result<String> {
+/// Load whatever the repo's reporter needs to authenticate: its own PAT,
+/// or the server-wide GitHub App key for PAT-less GitHub destinations.
+fn reporter_credential(
+	state: &AppState, repo: &repos::RepoRow,
+) -> anyhow::Result<reporters::ReporterCredential> {
 	use loupe_core::ReportingDestination;
 
 	match &repo.reporting {
-		ReportingDestination::GithubIssue { pat_secret_id, .. } => {
+		ReportingDestination::GithubIssue { pat_secret_id: Some(pat_secret_id), .. } => {
 			let bytes = state
 				.db
 				.with_conn(|c| Ok(secrets::read(c, *pat_secret_id)?))?
 				.ok_or_else(|| anyhow::anyhow!("pat secret {pat_secret_id} not found"))?;
-			String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))
+			let pat =
+				String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("pat is not utf-8: {e}"))?;
+			Ok(reporters::ReporterCredential::GithubPat(pat))
 		},
-		ReportingDestination::Email { .. } => Ok(String::new()),
-		ReportingDestination::Manual => unreachable!("Manual handled before reporter_secret"),
+		ReportingDestination::GithubIssue { pat_secret_id: None, target_owner, .. } => {
+			// Enforced again here, not only at registration, so tightening
+			// `allowed_target_owners` later also stops already-registered
+			// repos (and rows edited behind the server's back).
+			state
+				.check_github_app_target_owner(target_owner)
+				.map_err(|msg| anyhow::anyhow!(msg))?;
+			let stored = state
+				.db
+				.with_conn(|c| Ok(loupe_storage::github_app::get(c)?))?
+				.ok_or_else(|| {
+					anyhow::anyhow!(
+						"repo {} reports through the GitHub App but none is configured",
+						repo.id
+					)
+				})?;
+			let key = reporters::github_app::GithubAppKey::from_pem(
+				stored.app_id,
+				&stored.private_key_pem,
+			)?;
+			Ok(reporters::ReporterCredential::GithubApp(Box::new(key)))
+		},
+		ReportingDestination::Email { .. } => Ok(reporters::ReporterCredential::None),
+		ReportingDestination::Manual => unreachable!("Manual handled before reporter_credential"),
 	}
 }
 

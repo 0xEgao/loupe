@@ -45,14 +45,14 @@ It binds loopback only, for the reasons in README §9.
                                     ▼
                        ┌────────────────────────┐           ┌────────────────────┐
                        │      loupe-server      │ ─HTTPS──► │ api.github.com     │
-                       │                        │  (PAT)    │ (GitHub Issues)    │
+                       │                        │ (PAT/App) │ (GitHub Issues)    │
                        │  ┌──────────────────┐  │           └────────────────────┘
                        │  │ SQLCipher DB     │  │ ─sendmail─► local MTA
                        │  │ • repos          │  │
                        │  │ • jobs           │  │
                        │  │ • findings       │  │
                        │  │ • finding_fts    │  │ FTS5 over title +
-                       │  │ • secrets (PATs) │  │ description + path
+                       │  │ • PATs, app key  │  │ description + path
                        │  │ • workers        │  │
                        │  └──────────────────┘  │
                        │  ┌──────────────────┐  │
@@ -314,11 +314,12 @@ by the agent runtime; Loupe configuration and worker TLS material remain
 outside the namespace even when a bare-metal deployment stores them under
 `/etc/loupe`.
 
-All secrets at rest in the SQLite DB (PATs, finding bodies, repo
-metadata) are sealed by SQLCipher under the operator's master key —
-the same key the server gets at startup via `LOUPE_MASTER_KEY` (or a
-file). See README's "Bootstrap the data directory" + "Run the
-server" sections for the master-key sourcing rules.
+All secrets at rest in the SQLite DB (PATs, the GitHub App key,
+finding bodies, repo metadata) are sealed by SQLCipher under the
+operator's master key — the same key the server gets at startup via
+`LOUPE_MASTER_KEY` (or a file). See README's "Bootstrap the data
+directory" + "Run the server" sections for the master-key sourcing
+rules.
 
 ## Storage layout for the review harness
 

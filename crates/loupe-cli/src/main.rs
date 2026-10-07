@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use loupe_proto::{
-	FindingDetail, GithubAppResponse, JobInfo, ListFindingsResponse, ListReposResponse,
-	RegisterRepoRequest, RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse,
-	ReportingSetup, RetryVerifyRequest, RetryVerifyResponse, RotateRepoPatRequest, ScanRequest,
-	ScanResponse, SetGithubAppRequest, SetRepoGithubReportingRequest, UpdateRepoRequest,
-	PROTOCOL_VERSION,
+	FindingDetail, GithubAppResponse, GithubReportingAuth, JobInfo, ListFindingsResponse,
+	ListReposResponse, RegisterRepoRequest, RegisterRepoResponse, RegisterWorkerRequest,
+	RegisterWorkerResponse, ReportingSetup, ReportingSummary, RetryVerifyRequest,
+	RetryVerifyResponse, RotateRepoPatRequest, ScanRequest, ScanResponse, SetGithubAppRequest,
+	SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -135,9 +135,11 @@ struct RepoSetGithubReportingArgs {
 	#[arg(long)]
 	target_repo: String,
 	/// PAT for the target tracker repo. Read from LOUPE_TRACKER_PAT if
-	/// omitted.
+	/// not supplied. Omit both to report through the server's GitHub
+	/// App instead; switching an existing PAT-backed repo this way drops
+	/// its stored PAT.
 	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
-	pat: String,
+	pat: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -191,16 +193,13 @@ struct RepoAddArgs {
 	/// `--no-reporting` is set.
 	#[arg(long, required_unless_present = "no_reporting")]
 	target_repo: Option<String>,
-	/// PAT with `repo` scope on the target tracker. Read from the env
-	/// var `LOUPE_TRACKER_PAT` if not supplied — never echo it on the
-	/// command line in shared shells. Required unless `--no-reporting`
-	/// is set.
-	#[arg(
-		long,
-		env = "LOUPE_TRACKER_PAT",
-		hide_env_values = true,
-		required_unless_present = "no_reporting"
-	)]
+	/// PAT with Issues write access on the target tracker. Read from the
+	/// env var `LOUPE_TRACKER_PAT` if not supplied — never echo it on
+	/// the command line in shared shells. Omit it (and unset the env
+	/// var) to report through the server's GitHub App instead, which is
+	/// the default; the server rejects the registration if no app is
+	/// configured.
+	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
 	pat: Option<String>,
 	/// Skip configuring an automatic reporter. Findings still go
 	/// through the full scan + verification + approval pipeline.
@@ -622,7 +621,7 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 			// so the unwrap is structurally safe.
 			target_owner: a.target_owner.expect("clap enforces target_owner"),
 			target_repo: a.target_repo.expect("clap enforces target_repo"),
-			github_pat: a.pat.expect("clap enforces pat"),
+			github_pat: a.pat,
 		}
 	};
 	let req = RegisterRepoRequest {
@@ -656,11 +655,12 @@ async fn repo_list(
 		let approval = r.require_approval.map_or("inherit".to_owned(), |v| v.to_string());
 		let disabled = r.disabled_at.map_or("active".to_owned(), |ts| format!("disabled@{ts}"));
 		println!(
-			"{:>4}\t{}\t{}/{}\tinterval={:?}\tverify={}\tapproval={}\t{}\tlast_sha={:?}",
+			"{:>4}\t{}\t{}/{}\treporting={}\tinterval={:?}\tverify={}\tapproval={}\t{}\tlast_sha={:?}",
 			r.id,
 			r.host,
 			r.owner,
 			r.repo,
+			reporting_label(r.reporting.as_ref()),
 			r.scan_interval_seconds,
 			r.verification_enabled,
 			approval,
@@ -669,6 +669,23 @@ async fn repo_list(
 		);
 	}
 	Ok(())
+}
+
+/// Compact reporter description for the human listing: which reporter,
+/// and for GitHub which credential it files issues with.
+fn reporting_label(reporting: Option<&ReportingSummary>) -> String {
+	match reporting {
+		Some(ReportingSummary::GithubIssue { target_owner, target_repo, auth }) => {
+			let auth = match auth {
+				GithubReportingAuth::App => "app",
+				GithubReportingAuth::Pat => "pat",
+			};
+			format!("github({auth})→{target_owner}/{target_repo}")
+		},
+		Some(ReportingSummary::Email { to, .. }) => format!("email→{}", to.join(",")),
+		Some(ReportingSummary::Manual) => "manual".to_owned(),
+		None => "unknown".to_owned(),
+	}
 }
 
 async fn repo_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
@@ -1221,7 +1238,52 @@ mod tests {
 		assert_eq!(args.id, 7);
 		assert_eq!(args.target_owner, "acme");
 		assert_eq!(args.target_repo, "tracker");
-		assert_eq!(args.pat, "ghp_replacement");
+		assert_eq!(args.pat.as_deref(), Some("ghp_replacement"));
+	}
+
+	#[test]
+	fn repo_set_github_reporting_without_a_pat_selects_the_app() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"set-github-reporting",
+			"7",
+			"--target-owner",
+			"acme",
+			"--target-repo",
+			"tracker",
+		])
+		.unwrap();
+		let Cmd::Repo(RepoCmd::SetGithubReporting(args)) = cli.cmd else {
+			panic!("expected repo set-github-reporting command");
+		};
+		assert_eq!(args.pat, None, "no --pat means GitHub App mode");
+	}
+
+	#[test]
+	fn repo_add_without_a_pat_selects_the_app() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"add",
+			"--clone-url",
+			"https://github.com/acme/widget.git",
+			"--target-owner",
+			"acme",
+			"--target-repo",
+			"tracker",
+		])
+		.unwrap();
+		let Cmd::Repo(RepoCmd::Add(args)) = cli.cmd else {
+			panic!("expected repo add command");
+		};
+		assert_eq!(args.target_owner.as_deref(), Some("acme"));
+		assert_eq!(args.pat, None, "no --pat means GitHub App mode");
+		assert!(!args.no_reporting);
 	}
 
 	#[test]

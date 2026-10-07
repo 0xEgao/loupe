@@ -35,6 +35,35 @@ pub struct AppState {
 	/// stored on the repo row so later server config changes do not
 	/// silently change existing repos.
 	pub verification_default: bool,
+	/// Tracker owners that app-mode GitHub destinations may point at.
+	/// `None` leaves the GitHub App's own installation as the only
+	/// limit; `Some` additionally refuses a `target_owner` (compared
+	/// case-insensitively) that is not listed. Enforced when a repo is
+	/// registered or re-pointed *and again at every dispatch*, so
+	/// tightening the list later also stops repos registered before the
+	/// change. PAT destinations are not restricted — the PAT already
+	/// scopes them.
+	pub github_app_allowed_owners: Option<Vec<String>>,
+}
+
+impl AppState {
+	/// Apply `github_app_allowed_owners` to one app-mode tracker owner.
+	/// The error text names the owner and the list so both registration
+	/// (as a 400) and dispatch (as a failed report) can surface it as-is.
+	pub fn check_github_app_target_owner(&self, target_owner: &str) -> Result<(), String> {
+		match &self.github_app_allowed_owners {
+			Some(allowed)
+				if !allowed.iter().any(|owner| owner.eq_ignore_ascii_case(target_owner)) =>
+			{
+				Err(format!(
+					"GitHub App reporting is restricted to tracker owners {}; {target_owner} is \
+					 not allowed (pass a PAT to report elsewhere)",
+					allowed.join(", ")
+				))
+			},
+			_ => Ok(()),
+		}
+	}
 }
 
 impl AppState {
@@ -48,7 +77,13 @@ impl AppState {
 			review_policy: Arc::new(crate::review::policy::ReviewPolicy::default()),
 			require_approval_default: false,
 			verification_default: false,
+			github_app_allowed_owners: None,
 		}
+	}
+
+	pub fn with_github_app_allowed_owners(mut self, owners: Option<Vec<String>>) -> Self {
+		self.github_app_allowed_owners = owners;
+		self
 	}
 
 	pub fn with_email_reporter(mut self, reporter: EmailReporter) -> Self {
