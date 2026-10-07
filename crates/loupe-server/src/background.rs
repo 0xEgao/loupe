@@ -161,7 +161,7 @@ mod tests {
 						reporting: ReportingDestination::GithubIssue {
 							target_owner: "x".into(),
 							target_repo: "y".into(),
-							pat_secret_id: secret_id,
+							pat_secret_id: Some(secret_id),
 						},
 						verification_enabled: false,
 						require_approval: None,

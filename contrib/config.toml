@@ -95,3 +95,19 @@ verification_default = true
 # survey_token_budget = 2000000
 # drilldown_token_budget = 3000000
 # verify_token_budget = 4000000
+
+[github_app]
+# Optional allowlist for reporting through the server-wide GitHub App
+# (`loupectl github-app set`). Repos registered without a PAT file
+# issues as the app; the app's installation on GitHub already decides
+# which trackers it can write to, so this is belt and braces: when set,
+# the server refuses app-mode destinations whose tracker owner (user or
+# organization, compared case-insensitively) is not listed. The list is
+# checked when a repo is registered or re-pointed and again every time
+# a finding is dispatched, so tightening it later also stops repos that
+# were registered before the change. PAT-backed repos are not affected —
+# the PAT itself scopes what they can reach.
+#
+# Default when unset: no server-side restriction. An empty list is
+# rejected at startup; omit the key instead.
+# allowed_target_owners = ["acme"]

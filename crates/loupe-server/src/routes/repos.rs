@@ -10,6 +10,7 @@ use loupe_proto::{
 	ListReposResponse, RegisterRepoRequest, RegisterRepoResponse, RepoSummary, ReportingSetup,
 	RotateRepoPatRequest, SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
 };
+use loupe_storage::github_app;
 use loupe_storage::repos::{self, NewRepo, RepoRow, RepoUpdate};
 use loupe_storage::secrets::{self, SecretKind};
 use serde::Deserialize;
@@ -48,9 +49,42 @@ fn positive_limit(limit: Option<i64>) -> Result<Option<i64>, (StatusCode, String
 	Ok(limit)
 }
 
-/// `POST /v1/repos` — admin only. Stores the GitHub PAT inline to the
+/// Validate the credential side of a GitHub issue destination before
+/// touching the database: a PAT must not be blank, and an app-mode
+/// destination's tracker owner has to pass `allowed_target_owners`. A
+/// PAT-backed destination skips the allowlist — the PAT itself scopes
+/// what it can reach. Whether a GitHub App is actually configured is
+/// checked inside the writing transaction (see [`NO_APP_CONFIGURED`]),
+/// so a concurrent `DELETE /v1/github-app` cannot slip in between.
+fn check_github_credential(
+	state: &AppState, target_owner: &str, github_pat: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+	match github_pat {
+		Some(pat) if pat.trim().is_empty() => {
+			Err((StatusCode::BAD_REQUEST, "github PAT must not be empty".into()))
+		},
+		Some(_) => Ok(()),
+		None => state
+			.check_github_app_target_owner(target_owner)
+			.map_err(|msg| (StatusCode::BAD_REQUEST, msg)),
+	}
+}
+
+/// 400 body for an app-mode destination on a server without an app.
+const NO_APP_CONFIGURED: &str =
+	"no GitHub App configured; run loupectl github-app set or pass a PAT";
+
+/// Outcome of a reporting write that may depend on the GitHub App
+/// existing at commit time.
+enum ReportingWrite<T> {
+	Done(T),
+	NoApp,
+}
+
+/// `POST /v1/repos` — admin only. Moves an inline GitHub PAT into the
 /// secrets table and persists the resulting `ReportingDestination` with
-/// the generated `pat_secret_id`. Returns the new repo id.
+/// the generated `pat_secret_id`; without a PAT the destination reports
+/// through the server-wide GitHub App. Returns the new repo id.
 pub async fn create(
 	State(state): State<AppState>, Json(req): Json<RegisterRepoRequest>,
 ) -> Result<(StatusCode, Json<RegisterRepoResponse>), (StatusCode, String)> {
@@ -62,6 +96,9 @@ pub async fn create(
 	}
 	let parsed = parse_github_clone_url(&req.clone_url)
 		.ok_or((StatusCode::BAD_REQUEST, "clone_url must be an https or file URL".into()))?;
+	if let ReportingSetup::GithubIssue { target_owner, github_pat, .. } = &req.reporting {
+		check_github_credential(&state, target_owner, github_pat.as_deref())?;
+	}
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 
 	let new_repo_id = state
@@ -72,18 +109,29 @@ pub async fn create(
 			let tx = c.transaction()?;
 			let reporting = match &req.reporting {
 				ReportingSetup::GithubIssue { target_owner, target_repo, github_pat } => {
-					let secret_label = format!("pat:{}:{}/{}", parsed.0, target_owner, target_repo);
-					let secret_id = secrets::insert(
-						&tx,
-						SecretKind::GithubPat,
-						&secret_label,
-						github_pat.as_bytes(),
-						now,
-					)?;
+					let pat_secret_id = match github_pat {
+						Some(github_pat) => {
+							let secret_label =
+								format!("pat:{}:{}/{}", parsed.0, target_owner, target_repo);
+							Some(secrets::insert(
+								&tx,
+								SecretKind::GithubPat,
+								&secret_label,
+								github_pat.as_bytes(),
+								now,
+							)?)
+						},
+						// Checked inside the transaction so the app cannot be
+						// cleared between the check and the insert.
+						None if github_app::get(&tx)?.is_none() => {
+							return Ok(ReportingWrite::NoApp);
+						},
+						None => None,
+					};
 					ReportingDestination::GithubIssue {
 						target_owner: target_owner.clone(),
 						target_repo: target_repo.clone(),
-						pat_secret_id: secret_id,
+						pat_secret_id,
 					}
 				},
 				ReportingSetup::Email { to, from, subject_prefix } => ReportingDestination::Email {
@@ -112,9 +160,13 @@ pub async fn create(
 				now,
 			)?;
 			tx.commit()?;
-			Ok(id)
+			Ok(ReportingWrite::Done(id))
 		})
 		.map_err(|e| (StatusCode::CONFLICT, format!("registering repo failed: {e}")))?;
+	let new_repo_id = match new_repo_id {
+		ReportingWrite::Done(id) => id,
+		ReportingWrite::NoApp => return Err((StatusCode::BAD_REQUEST, NO_APP_CONFIGURED.into())),
+	};
 
 	Ok((
 		StatusCode::CREATED,
@@ -206,8 +258,19 @@ pub async fn rotate_github_pat(
 		.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repo with id {id}")))?;
 	let host = row.host;
 	let (target_owner, target_repo, old_secret_id) = match row.reporting {
-		ReportingDestination::GithubIssue { target_owner, target_repo, pat_secret_id } => {
-			(target_owner, target_repo, pat_secret_id)
+		ReportingDestination::GithubIssue {
+			target_owner,
+			target_repo,
+			pat_secret_id: Some(pat_secret_id),
+		} => (target_owner, target_repo, pat_secret_id),
+		ReportingDestination::GithubIssue { pat_secret_id: None, .. } => {
+			return Err((
+				StatusCode::BAD_REQUEST,
+				format!(
+					"repo {id} reports through the GitHub App; use set-github-reporting with a \
+					 PAT to switch"
+				),
+			));
 		},
 		ReportingDestination::Email { .. } | ReportingDestination::Manual => {
 			return Err((
@@ -234,7 +297,7 @@ pub async fn rotate_github_pat(
 			let new_reporting = ReportingDestination::GithubIssue {
 				target_owner,
 				target_repo,
-				pat_secret_id: new_secret_id,
+				pat_secret_id: Some(new_secret_id),
 			};
 			if !repos::update_reporting(&tx, id, &new_reporting)? {
 				return Ok(false);
@@ -254,7 +317,10 @@ pub async fn rotate_github_pat(
 }
 
 /// `PUT /v1/repos/:id/reporting/github` — admin only. Configures or
-/// replaces the GitHub issue reporting destination for a repo.
+/// replaces the GitHub issue reporting destination for a repo. With a
+/// PAT the repo gets its own secret; without one it reports through the
+/// server-wide GitHub App. Either way a PAT the repo no longer uses is
+/// dropped unless another repo still references it.
 pub async fn set_github_reporting(
 	State(state): State<AppState>, Path(id): Path<i64>,
 	Json(req): Json<SetRepoGithubReportingRequest>,
@@ -273,9 +339,7 @@ pub async fn set_github_reporting(
 	if target_repo.is_empty() {
 		return Err((StatusCode::BAD_REQUEST, "target_repo must not be empty".into()));
 	}
-	if req.github_pat.trim().is_empty() {
-		return Err((StatusCode::BAD_REQUEST, "github PAT must not be empty".into()));
-	}
+	check_github_credential(&state, &target_owner, req.github_pat.as_deref())?;
 
 	let row = state
 		.db
@@ -284,35 +348,44 @@ pub async fn set_github_reporting(
 		.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repo with id {id}")))?;
 	let host = row.host;
 	let old_secret_id = match row.reporting {
-		ReportingDestination::GithubIssue { pat_secret_id, .. } => Some(pat_secret_id),
+		ReportingDestination::GithubIssue { pat_secret_id, .. } => pat_secret_id,
 		ReportingDestination::Email { .. } | ReportingDestination::Manual => None,
 	};
 
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
 	let now_secs = now.as_secs() as i64;
 	let old_label_id = old_secret_id.unwrap_or(0);
-	let secret_label = format!(
-		"pat:{host}:{target_owner}/{target_repo}:repo:{id}:replaces:{old_label_id}:at:{}",
-		now.as_nanos(),
-	);
 	let updated = state
 		.db
 		.with_conn(|c| {
 			let tx = c.transaction()?;
-			let new_secret_id = secrets::insert(
-				&tx,
-				SecretKind::GithubPat,
-				&secret_label,
-				req.github_pat.as_bytes(),
-				now_secs,
-			)?;
+			let new_secret_id = match &req.github_pat {
+				Some(github_pat) => {
+					let secret_label = format!(
+						"pat:{host}:{target_owner}/{target_repo}:repo:{id}:replaces:\
+						 {old_label_id}:at:{}",
+						now.as_nanos(),
+					);
+					Some(secrets::insert(
+						&tx,
+						SecretKind::GithubPat,
+						&secret_label,
+						github_pat.as_bytes(),
+						now_secs,
+					)?)
+				},
+				// Checked inside the transaction so the app cannot be
+				// cleared between the check and the update.
+				None if github_app::get(&tx)?.is_none() => return Ok(ReportingWrite::NoApp),
+				None => None,
+			};
 			let new_reporting = ReportingDestination::GithubIssue {
 				target_owner,
 				target_repo,
 				pat_secret_id: new_secret_id,
 			};
 			if !repos::update_reporting(&tx, id, &new_reporting)? {
-				return Ok(false);
+				return Ok(ReportingWrite::Done(false));
 			}
 			if let Some(old_secret_id) = old_secret_id
 				&& repos::count_github_pat_references(&tx, old_secret_id)? == 0
@@ -320,14 +393,16 @@ pub async fn set_github_reporting(
 				secrets::delete(&tx, old_secret_id)?;
 			}
 			tx.commit()?;
-			Ok(true)
+			Ok(ReportingWrite::Done(true))
 		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set GitHub reporting: {e}")))?;
-	if !updated {
-		return Err((StatusCode::NOT_FOUND, format!("no repo with id {id}")));
+	match updated {
+		ReportingWrite::Done(true) => Ok(StatusCode::NO_CONTENT),
+		ReportingWrite::Done(false) => {
+			Err((StatusCode::NOT_FOUND, format!("no repo with id {id}")))
+		},
+		ReportingWrite::NoApp => Err((StatusCode::BAD_REQUEST, NO_APP_CONFIGURED.into())),
 	}
-
-	Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /v1/repos/:id` — admin only. CASCADEs onto jobs, findings,

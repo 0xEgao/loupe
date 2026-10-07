@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::version::PROTOCOL_VERSION;
 
-/// Wire-only reporting setup. Carries the GitHub PAT inline so the
+/// Wire-only reporting setup. May carry a GitHub PAT inline so the
 /// admin can register a repo in a single round-trip; the server moves
 /// the PAT into the `secrets` table and persists a
 /// `loupe_core::ReportingDestination` referencing the resulting
@@ -12,10 +12,14 @@ use crate::version::PROTOCOL_VERSION;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReportingSetup {
+	/// File issues on `target_owner/target_repo`. Without `github_pat`
+	/// the server files them through its configured GitHub App and
+	/// rejects the registration if no app is configured.
 	GithubIssue {
 		target_owner: String,
 		target_repo: String,
-		github_pat: String,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		github_pat: Option<String>,
 	},
 	/// Send findings as email via the server's `sendmail` binary. No
 	/// secret material is required — the binary handles transport.
@@ -87,13 +91,42 @@ pub struct RotateRepoPatRequest {
 	pub github_pat: String,
 }
 
-/// Body of `PUT /v1/repos/:id/reporting/github`.
+/// Body of `PUT /v1/repos/:id/reporting/github`. Omitting `github_pat`
+/// switches the repo to the server's GitHub App.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetRepoGithubReportingRequest {
 	pub protocol_version: u16,
 	pub target_owner: String,
 	pub target_repo: String,
-	pub github_pat: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub github_pat: Option<String>,
+}
+
+/// Body of `PUT /v1/github-app`. Carries the app's private key inline,
+/// the same way repo registration carries a PAT; the server verifies it
+/// against GitHub and moves it into the `secrets` table. The key never
+/// travels back out in any response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetGithubAppRequest {
+	pub protocol_version: u16,
+	pub app_id: u64,
+	pub private_key_pem: String,
+}
+
+/// Non-secret view of the configured GitHub App.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubAppSummary {
+	pub app_id: u64,
+	pub slug: String,
+}
+
+/// Response body of `GET /v1/github-app`. `app` is `None` until an
+/// operator stores a credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubAppResponse {
+	pub protocol_version: u16,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub app: Option<GithubAppSummary>,
 }
 
 /// Body of `PATCH /v1/repos/:id`. All fields are optional — only the
@@ -133,19 +166,36 @@ pub struct ListReposResponse {
 	pub repos: Vec<RepoSummary>,
 }
 
+/// Which credential a GitHub issue destination files issues with.
+///
+/// Defaults to `Pat` because that is the only mode servers predating
+/// GitHub App support had; a listing without the field is one of theirs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubReportingAuth {
+	/// The server-wide GitHub App; issues appear authored by `<app>[bot]`.
+	App,
+	/// A personal access token stored for this repo.
+	#[default]
+	Pat,
+}
+
 /// Non-secret view of a repo's reporting destination.
 ///
-/// Mirrors `loupe_core::ReportingDestination` minus `pat_secret_id`.
-/// Clients need the reporter *kind* to decide which actions apply — PAT
-/// rotation is only meaningful for `GithubIssue`, and the server 400s a
-/// rotation attempt against any other destination — but the storage-side
-/// secret id has no meaning off the server and must never leave it.
+/// Mirrors `loupe_core::ReportingDestination` with `pat_secret_id`
+/// reduced to a [`GithubReportingAuth`] mode. Clients need the reporter
+/// *kind* and the auth mode to decide which actions apply — PAT rotation
+/// is only meaningful for a PAT-backed `GithubIssue`, and the server 400s
+/// a rotation attempt against anything else — but the storage-side secret
+/// id has no meaning off the server and must never leave it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReportingSummary {
 	GithubIssue {
 		target_owner: String,
 		target_repo: String,
+		#[serde(default)]
+		auth: GithubReportingAuth,
 	},
 	Email {
 		to: Vec<String>,
@@ -164,10 +214,14 @@ impl From<&ReportingDestination> for ReportingSummary {
 		// and forces a deliberate "does this belong on the wire?" call
 		// rather than silently leaking or silently dropping it.
 		match dest {
-			ReportingDestination::GithubIssue { target_owner, target_repo, pat_secret_id: _ } => {
+			ReportingDestination::GithubIssue { target_owner, target_repo, pat_secret_id } => {
 				Self::GithubIssue {
 					target_owner: target_owner.clone(),
 					target_repo: target_repo.clone(),
+					auth: match pat_secret_id {
+						Some(_) => GithubReportingAuth::Pat,
+						None => GithubReportingAuth::App,
+					},
 				}
 			},
 			ReportingDestination::Email { to, from, subject_prefix } => Self::Email {
@@ -243,7 +297,7 @@ mod tests {
 			reporting: ReportingSetup::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "security".into(),
-				github_pat: "ghp_xxx".into(),
+				github_pat: Some("ghp_xxx".into()),
 			},
 			scanner_config: json!({"regex": {"enabled": true}}),
 			verification_enabled: Some(true),
@@ -293,7 +347,7 @@ mod tests {
 		let dest = ReportingDestination::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: "tracker".into(),
-			pat_secret_id: 7,
+			pat_secret_id: Some(7),
 		};
 		let summary = ReportingSummary::from(&dest);
 		assert_eq!(
@@ -301,6 +355,7 @@ mod tests {
 			ReportingSummary::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
+				auth: GithubReportingAuth::Pat,
 			}
 		);
 
@@ -309,8 +364,68 @@ mod tests {
 		let s = serde_json::to_string(&summary).unwrap();
 		assert!(s.contains(r#""kind":"github_issue""#), "kind must be tagged: {s}");
 		assert!(s.contains("acme"), "non-secret target must survive: {s}");
+		assert!(s.contains(r#""auth":"pat""#), "auth mode must be on the wire: {s}");
 		assert!(!s.contains("pat_secret_id"), "secret id leaked onto the wire: {s}");
 		assert!(!s.contains('7'), "secret id value leaked onto the wire: {s}");
+	}
+
+	#[test]
+	fn reporting_summary_reports_app_mode_for_pat_less_destinations() {
+		let dest = ReportingDestination::GithubIssue {
+			target_owner: "acme".into(),
+			target_repo: "tracker".into(),
+			pat_secret_id: None,
+		};
+		let summary = ReportingSummary::from(&dest);
+		assert_eq!(
+			summary,
+			ReportingSummary::GithubIssue {
+				target_owner: "acme".into(),
+				target_repo: "tracker".into(),
+				auth: GithubReportingAuth::App,
+			}
+		);
+		let s = serde_json::to_string(&summary).unwrap();
+		assert!(s.contains(r#""auth":"app""#), "auth mode must be on the wire: {s}");
+	}
+
+	#[test]
+	fn reporting_summary_without_auth_reads_as_pat() {
+		// `auth` is additive: a listing from a server predating GitHub App
+		// support omits it, and every such repo used a PAT.
+		let legacy = r#"{"kind":"github_issue","target_owner":"acme","target_repo":"tracker"}"#;
+		let summary: ReportingSummary = serde_json::from_str(legacy).unwrap();
+		assert_eq!(
+			summary,
+			ReportingSummary::GithubIssue {
+				target_owner: "acme".into(),
+				target_repo: "tracker".into(),
+				auth: GithubReportingAuth::Pat,
+			}
+		);
+		assert_eq!(GithubReportingAuth::default(), GithubReportingAuth::Pat);
+	}
+
+	#[test]
+	fn reporting_setup_without_a_pat_means_github_app() {
+		// Older clients always send `github_pat`; newer ones leave it out
+		// to request app-mode reporting. Both shapes must parse.
+		let with_pat = r#"{"kind":"github_issue","target_owner":"acme","target_repo":"t","github_pat":"ghp_x"}"#;
+		let without_pat = r#"{"kind":"github_issue","target_owner":"acme","target_repo":"t"}"#;
+		let parsed: ReportingSetup = serde_json::from_str(with_pat).unwrap();
+		assert!(
+			matches!(parsed, ReportingSetup::GithubIssue { github_pat: Some(ref p), .. } if p == "ghp_x")
+		);
+		let parsed: ReportingSetup = serde_json::from_str(without_pat).unwrap();
+		assert!(matches!(parsed, ReportingSetup::GithubIssue { github_pat: None, .. }));
+
+		let setup = ReportingSetup::GithubIssue {
+			target_owner: "acme".into(),
+			target_repo: "t".into(),
+			github_pat: None,
+		};
+		let s = serde_json::to_string(&setup).unwrap();
+		assert!(!s.contains("github_pat"), "app mode must not send a null PAT: {s}");
 	}
 
 	#[test]
@@ -336,6 +451,7 @@ mod tests {
 		let summary = summary_with_reporting(Some(ReportingSummary::GithubIssue {
 			target_owner: "acme".into(),
 			target_repo: "tracker".into(),
+			auth: GithubReportingAuth::App,
 		}));
 		let s = serde_json::to_string(&summary).unwrap();
 		let back: RepoSummary = serde_json::from_str(&s).unwrap();
@@ -387,7 +503,7 @@ mod tests {
 			protocol_version: PROTOCOL_VERSION,
 			target_owner: "acme".into(),
 			target_repo: "tracker".into(),
-			github_pat: "ghp_new".into(),
+			github_pat: Some("ghp_new".into()),
 		};
 		let s = serde_json::to_string(&req).unwrap();
 		assert!(s.contains("github_pat"));

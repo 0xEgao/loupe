@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use loupe_proto::{
-	FindingDetail, JobInfo, ListFindingsResponse, ListReposResponse, RegisterRepoRequest,
-	RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	RetryVerifyRequest, RetryVerifyResponse, RotateRepoPatRequest, ScanRequest, ScanResponse,
+	FindingDetail, GithubAppResponse, GithubReportingAuth, JobInfo, ListFindingsResponse,
+	ListReposResponse, RegisterRepoRequest, RegisterRepoResponse, RegisterWorkerRequest,
+	RegisterWorkerResponse, ReportingSetup, ReportingSummary, RetryVerifyRequest,
+	RetryVerifyResponse, RotateRepoPatRequest, ScanRequest, ScanResponse, SetGithubAppRequest,
 	SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
 };
 
@@ -61,14 +62,46 @@ enum Cmd {
 	Finding(FindingCmd),
 	#[command(subcommand)]
 	Cert(CertCmd),
+	/// Manage the server-wide GitHub App used to file issues.
+	#[command(subcommand)]
+	GithubApp(GithubAppCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum GithubAppCmd {
+	/// Store (or replace) the GitHub App credential. The server verifies
+	/// the key against GitHub before persisting it.
+	Set(GithubAppSetArgs),
+	/// Show which GitHub App is configured.
+	Show,
+	/// Remove the stored GitHub App credential.
+	Clear,
+}
+
+#[derive(Debug, Args)]
+struct GithubAppSetArgs {
+	/// Numeric App ID from the app's settings page on GitHub.
+	#[arg(long)]
+	app_id: u64,
+	/// Path to the private key PEM downloaded from the app's settings
+	/// page. Read from LOUPE_GITHUB_APP_KEY if omitted. Alternatively
+	/// pass the PEM itself via LOUPE_GITHUB_APP_KEY_PEM or, base64
+	/// encoded, via LOUPE_GITHUB_APP_KEY_PEM_B64.
+	#[arg(long, env = "LOUPE_GITHUB_APP_KEY")]
+	private_key_file: Option<PathBuf>,
+	#[arg(long, env = "LOUPE_GITHUB_APP_KEY_PEM", hide_env_values = true)]
+	private_key_pem: Option<String>,
+	#[arg(long, env = "LOUPE_GITHUB_APP_KEY_PEM_B64", hide_env_values = true)]
+	private_key_pem_b64: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
 enum RepoCmd {
 	/// Register a new repo for scanning.
 	Add(RepoAddArgs),
-	/// List registered repos.
-	List(ListArgs),
+	/// List registered repos. Pass `--json` to dump the raw
+	/// ListReposResponse DTO instead (for scripting).
+	List(RepoListArgs),
 	/// Deregister a repo (cascades to its jobs and findings).
 	Rm { id: i64 },
 	/// Patch a repo's scheduling / verification settings. Each flag is
@@ -103,9 +136,11 @@ struct RepoSetGithubReportingArgs {
 	#[arg(long)]
 	target_repo: String,
 	/// PAT for the target tracker repo. Read from LOUPE_TRACKER_PAT if
-	/// omitted.
+	/// not supplied. Omit both to report through the server's GitHub
+	/// App instead; switching an existing PAT-backed repo this way drops
+	/// its stored PAT.
 	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
-	pat: String,
+	pat: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -159,16 +194,13 @@ struct RepoAddArgs {
 	/// `--no-reporting` is set.
 	#[arg(long, required_unless_present = "no_reporting")]
 	target_repo: Option<String>,
-	/// PAT with `repo` scope on the target tracker. Read from the env
-	/// var `LOUPE_TRACKER_PAT` if not supplied — never echo it on the
-	/// command line in shared shells. Required unless `--no-reporting`
-	/// is set.
-	#[arg(
-		long,
-		env = "LOUPE_TRACKER_PAT",
-		hide_env_values = true,
-		required_unless_present = "no_reporting"
-	)]
+	/// PAT with Issues write access on the target tracker. Read from the
+	/// env var `LOUPE_TRACKER_PAT` if not supplied — never echo it on
+	/// the command line in shared shells. Omit it (and unset the env
+	/// var) to report through the server's GitHub App instead, which is
+	/// the default; the server rejects the registration if no app is
+	/// configured.
+	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
 	pat: Option<String>,
 	/// Skip configuring an automatic reporter. Findings still go
 	/// through the full scan + verification + approval pipeline.
@@ -282,6 +314,16 @@ struct ListArgs {
 }
 
 #[derive(Debug, Args)]
+struct RepoListArgs {
+	/// Number of rows to return.
+	#[arg(short = 'n', long = "limit", value_parser = parse_positive_i64)]
+	limit: Option<i64>,
+	/// Output the raw JSON DTO instead of the tab-separated listing.
+	#[arg(long, default_value_t = false)]
+	json: bool,
+}
+
+#[derive(Debug, Args)]
 struct FindingListArgs {
 	repo_id: i64,
 	/// Number of rows to return.
@@ -356,7 +398,7 @@ async fn main() -> Result<()> {
 			},
 			RepoCmd::List(args) => {
 				let (client, base) = client_and_url(&conn)?;
-				repo_list(&client, base, args.limit).await
+				repo_list(&client, base, args.limit, args.json).await
 			},
 			RepoCmd::Rm { id } => {
 				let (client, base) = client_and_url(&conn)?;
@@ -440,7 +482,63 @@ async fn main() -> Result<()> {
 		Cmd::Cert(c) => match c {
 			CertCmd::MintServer(a) => cert_mint_server(a),
 		},
+		Cmd::GithubApp(c) => match c {
+			GithubAppCmd::Set(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				github_app_set(&client, base, a).await
+			},
+			GithubAppCmd::Show => {
+				let (client, base) = client_and_url(&conn)?;
+				github_app_show(&client, base).await
+			},
+			GithubAppCmd::Clear => {
+				let (client, base) = client_and_url(&conn)?;
+				github_app_clear(&client, base).await
+			},
+		},
 	}
+}
+
+async fn github_app_set(
+	client: &reqwest::Client, base: &reqwest::Url, a: GithubAppSetArgs,
+) -> Result<()> {
+	let private_key_pem = pem_from_env_or_file(
+		"GitHub App private key",
+		&a.private_key_pem,
+		&a.private_key_pem_b64,
+		a.private_key_file.as_ref(),
+		"GitHub App private key missing — pass --private-key-file or set LOUPE_GITHUB_APP_KEY_PEM / LOUPE_GITHUB_APP_KEY_PEM_B64",
+	)?;
+	let req = SetGithubAppRequest {
+		protocol_version: PROTOCOL_VERSION,
+		app_id: a.app_id,
+		private_key_pem,
+	};
+	let resp = client.put(url(base, "/v1/github-app")).json(&req).send().await?;
+	if !resp.status().is_success() {
+		anyhow::bail!("server returned {}: {}", resp.status(), resp.text().await?);
+	}
+	println!("github app {} configured", a.app_id);
+	Ok(())
+}
+
+async fn github_app_show(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
+	let resp = client.get(url(base, "/v1/github-app")).send().await?;
+	let body: GithubAppResponse = resp.error_for_status()?.json().await?;
+	match body.app {
+		Some(app) => println!("app_id={} slug={}", app.app_id, app.slug),
+		None => println!("no GitHub App configured"),
+	}
+	Ok(())
+}
+
+async fn github_app_clear(client: &reqwest::Client, base: &reqwest::Url) -> Result<()> {
+	let resp = client.delete(url(base, "/v1/github-app")).send().await?;
+	if !resp.status().is_success() {
+		anyhow::bail!("server returned {}: {}", resp.status(), resp.text().await?);
+	}
+	println!("github app cleared");
+	Ok(())
 }
 
 fn client_and_url(c: &ConnArgs) -> Result<(reqwest::Client, &reqwest::Url)> {
@@ -534,7 +632,7 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 			// so the unwrap is structurally safe.
 			target_owner: a.target_owner.expect("clap enforces target_owner"),
 			target_repo: a.target_repo.expect("clap enforces target_repo"),
-			github_pat: a.pat.expect("clap enforces pat"),
+			github_pat: a.pat,
 		}
 	};
 	let req = RegisterRepoRequest {
@@ -558,21 +656,26 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 }
 
 async fn repo_list(
-	client: &reqwest::Client, base: &reqwest::Url, limit: Option<i64>,
+	client: &reqwest::Client, base: &reqwest::Url, limit: Option<i64>, as_json: bool,
 ) -> Result<()> {
 	let req = client.get(url(base, "/v1/repos"));
 	let req = if let Some(limit) = limit { req.query(&[("limit", limit)]) } else { req };
 	let resp = req.send().await?;
 	let body: ListReposResponse = resp.error_for_status()?.json().await?;
+	if as_json {
+		println!("{}", repo_list_json(&body)?);
+		return Ok(());
+	}
 	for r in body.repos {
 		let approval = r.require_approval.map_or("inherit".to_owned(), |v| v.to_string());
 		let disabled = r.disabled_at.map_or("active".to_owned(), |ts| format!("disabled@{ts}"));
 		println!(
-			"{:>4}\t{}\t{}/{}\tinterval={:?}\tverify={}\tapproval={}\t{}\tlast_sha={:?}",
+			"{:>4}\t{}\t{}/{}\treporting={}\tinterval={:?}\tverify={}\tapproval={}\t{}\tlast_sha={:?}",
 			r.id,
 			r.host,
 			r.owner,
 			r.repo,
+			reporting_label(r.reporting.as_ref()),
 			r.scan_interval_seconds,
 			r.verification_enabled,
 			approval,
@@ -581,6 +684,31 @@ async fn repo_list(
 		);
 	}
 	Ok(())
+}
+
+/// The `--json` rendering of `repo list`: the `ListReposResponse` DTO
+/// exactly as the server returned it, pretty-printed. Scripts consume
+/// this (e.g. with jq) to find PAT-backed GitHub repos, so nothing is
+/// added, dropped, or reshaped on the way out.
+fn repo_list_json(body: &ListReposResponse) -> Result<String> {
+	Ok(serde_json::to_string_pretty(body)?)
+}
+
+/// Compact reporter description for the human listing: which reporter,
+/// and for GitHub which credential it files issues with.
+fn reporting_label(reporting: Option<&ReportingSummary>) -> String {
+	match reporting {
+		Some(ReportingSummary::GithubIssue { target_owner, target_repo, auth }) => {
+			let auth = match auth {
+				GithubReportingAuth::App => "app",
+				GithubReportingAuth::Pat => "pat",
+			};
+			format!("github({auth})→{target_owner}/{target_repo}")
+		},
+		Some(ReportingSummary::Email { to, .. }) => format!("email→{}", to.join(",")),
+		Some(ReportingSummary::Manual) => "manual".to_owned(),
+		None => "unknown".to_owned(),
+	}
 }
 
 async fn repo_rm(client: &reqwest::Client, base: &reqwest::Url, id: i64) -> Result<()> {
@@ -974,6 +1102,8 @@ async fn finding_reject(client: &reqwest::Client, base: &reqwest::Url, id: i64) 
 
 #[cfg(test)]
 mod tests {
+	use loupe_proto::RepoSummary;
+
 	use super::*;
 
 	#[test]
@@ -1133,7 +1263,52 @@ mod tests {
 		assert_eq!(args.id, 7);
 		assert_eq!(args.target_owner, "acme");
 		assert_eq!(args.target_repo, "tracker");
-		assert_eq!(args.pat, "ghp_replacement");
+		assert_eq!(args.pat.as_deref(), Some("ghp_replacement"));
+	}
+
+	#[test]
+	fn repo_set_github_reporting_without_a_pat_selects_the_app() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"set-github-reporting",
+			"7",
+			"--target-owner",
+			"acme",
+			"--target-repo",
+			"tracker",
+		])
+		.unwrap();
+		let Cmd::Repo(RepoCmd::SetGithubReporting(args)) = cli.cmd else {
+			panic!("expected repo set-github-reporting command");
+		};
+		assert_eq!(args.pat, None, "no --pat means GitHub App mode");
+	}
+
+	#[test]
+	fn repo_add_without_a_pat_selects_the_app() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"add",
+			"--clone-url",
+			"https://github.com/acme/widget.git",
+			"--target-owner",
+			"acme",
+			"--target-repo",
+			"tracker",
+		])
+		.unwrap();
+		let Cmd::Repo(RepoCmd::Add(args)) = cli.cmd else {
+			panic!("expected repo add command");
+		};
+		assert_eq!(args.target_owner.as_deref(), Some("acme"));
+		assert_eq!(args.pat, None, "no --pat means GitHub App mode");
+		assert!(!args.no_reporting);
 	}
 
 	#[test]
@@ -1374,5 +1549,82 @@ mod tests {
 		let decoded_ca =
 			base64::engine::general_purpose::STANDARD.decode(&assignments[1].1).unwrap();
 		assert_eq!(String::from_utf8(decoded_ca).unwrap(), bundle.ca_cert_pem);
+	}
+
+	#[test]
+	fn repo_list_parses_json_with_limit() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"list",
+			"--json",
+			"--limit",
+			"5",
+		])
+		.unwrap();
+		let Cmd::Repo(RepoCmd::List(args)) = cli.cmd else {
+			panic!("expected repo list command");
+		};
+		assert!(args.json);
+		assert_eq!(args.limit, Some(5));
+	}
+
+	#[test]
+	fn repo_list_json_is_the_raw_dto() {
+		let body = ListReposResponse {
+			protocol_version: PROTOCOL_VERSION,
+			repos: vec![
+				RepoSummary {
+					id: 1,
+					clone_url: "https://github.com/acme/widget.git".into(),
+					host: "github.com".into(),
+					owner: "acme".into(),
+					repo: "widget".into(),
+					default_branch: Some("main".into()),
+					scan_interval_seconds: Some(3600),
+					disabled_at: None,
+					verification_enabled: true,
+					require_approval: None,
+					last_scanned_sha: None,
+					last_scanned_at: None,
+					created_at: 1_700_000_000,
+					reporting: Some(ReportingSummary::GithubIssue {
+						target_owner: "acme".into(),
+						target_repo: "tracker".into(),
+						auth: GithubReportingAuth::App,
+					}),
+				},
+				RepoSummary {
+					id: 2,
+					clone_url: "https://github.com/acme/gadget.git".into(),
+					host: "github.com".into(),
+					owner: "acme".into(),
+					repo: "gadget".into(),
+					default_branch: None,
+					scan_interval_seconds: None,
+					disabled_at: Some(1_700_000_500),
+					verification_enabled: false,
+					require_approval: Some(true),
+					last_scanned_sha: Some("abc123".into()),
+					last_scanned_at: Some(1_700_000_400),
+					created_at: 1_700_000_001,
+					reporting: Some(ReportingSummary::GithubIssue {
+						target_owner: "acme".into(),
+						target_repo: "tracker".into(),
+						auth: GithubReportingAuth::Pat,
+					}),
+				},
+			],
+		};
+
+		let rendered = repo_list_json(&body).unwrap();
+
+		let parsed: ListReposResponse = serde_json::from_str(&rendered).unwrap();
+		assert_eq!(parsed, body, "JSON output must round-trip to the identical DTO");
+		assert!(rendered.contains("\"auth\": \"app\""), "missing app auth marker in:\n{rendered}");
+		assert!(rendered.contains("\"auth\": \"pat\""), "missing pat auth marker in:\n{rendered}");
+		assert!(rendered.contains("\"kind\": \"github_issue\""), "missing kind in:\n{rendered}");
 	}
 }

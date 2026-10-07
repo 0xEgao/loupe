@@ -17,9 +17,13 @@ fn v3_preserves_encrypted_legacy_data_and_claims() {
 		.collect();
 	drop(conn);
 	let db = Db::open(&path, &MasterKey::for_tests()).unwrap();
-	assert_eq!(db.schema_version().unwrap(), 3, "B1 must install schema v3");
+	assert_eq!(
+		db.schema_version().unwrap(),
+		LATEST_SCHEMA_VERSION,
+		"B1 installs v3; later markers stack on top"
+	);
 	db.with_conn(|conn| {
-		assert_eq!(markers(conn), (3, 3));
+		assert_eq!(markers(conn), (LATEST_SCHEMA_VERSION, LATEST_SCHEMA_VERSION));
 		assert!(fk_enabled(conn));
 		assert_eq!(rows(conn, "SELECT name, sql FROM sqlite_master WHERE name IN ('idx_jobs_queued', 'idx_jobs_lease', 'idx_jobs_repo', 'idx_jobs_capability') ORDER BY name"), legacy_indexes);
 		for job in rows(conn, "SELECT * FROM jobs ORDER BY id") {
@@ -84,7 +88,7 @@ fn v3_preserves_encrypted_legacy_data_and_claims() {
 	drop(db);
 	// Leases only block the migration, not reopening an already upgraded DB.
 	let db = Db::open(&path, &MasterKey::for_tests()).unwrap();
-	assert_eq!(db.schema_version().unwrap(), 3);
+	assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
 }
 
 #[test]
@@ -122,7 +126,11 @@ fn v3_installs_all_tables_indexes_and_job_kinds() {
 	let mut conn = Connection::open_in_memory().unwrap();
 	let prior_fk = fk_enabled(&conn);
 	apply_pending(&mut conn).unwrap();
-	assert_eq!(markers(&conn), (3, 3), "B1 must install schema v3");
+	assert_eq!(
+		markers(&conn),
+		(LATEST_SCHEMA_VERSION, LATEST_SCHEMA_VERSION),
+		"B1 must install schema v3"
+	);
 	for table in [
 		"job_kinds",
 		"review_campaigns",

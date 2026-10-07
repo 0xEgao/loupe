@@ -38,6 +38,22 @@ pub struct FileConfig {
 	pub policy: PolicySection,
 	#[serde(default)]
 	pub review: ReviewSection,
+	#[serde(default)]
+	pub github_app: GithubAppSection,
+}
+
+/// Limits on reporting through the server-wide GitHub App. The app's
+/// installation on GitHub already decides which trackers it can write
+/// to; this section lets the server refuse destinations outside an
+/// expected owner set before an issue is ever filed.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubAppSection {
+	/// Tracker owners (users or organizations) that app-mode GitHub
+	/// destinations may point at, compared case-insensitively. Unset
+	/// means no server-side restriction.
+	#[serde(default)]
+	pub allowed_target_owners: Option<Vec<String>>,
 }
 
 /// Review-harness overrides. Environment and CLI overrides arrive at cutover.
@@ -135,7 +151,23 @@ impl FileConfig {
 		cfg.paths.ca_cert = cfg.paths.ca_cert.map(|p| resolve(base, p));
 		cfg.paths.ca_key = cfg.paths.ca_key.map(|p| resolve(base, p));
 		cfg.paths.master_key = cfg.paths.master_key.map(|p| resolve(base, p));
+		cfg.github_app
+			.validate()
+			.with_context(|| format!("validating config file {}", path.display()))?;
 		Ok(cfg)
+	}
+}
+
+impl GithubAppSection {
+	/// An empty allowlist would silently refuse every app-mode
+	/// destination; make the operator say what they mean instead.
+	pub fn validate(&self) -> Result<()> {
+		if matches!(&self.allowed_target_owners, Some(owners) if owners.is_empty()) {
+			anyhow::bail!(
+				"[github_app] allowed_target_owners must list at least one owner or be omitted"
+			);
+		}
+		Ok(())
 	}
 }
 
@@ -203,5 +235,37 @@ mod tests {
 		let cfg = FileConfig::load(&path).unwrap();
 		assert_eq!(cfg.policy.require_approval_default, Some(true));
 		assert_eq!(cfg.policy.verification_default, Some(true));
+	}
+
+	#[test]
+	fn github_app_section_lists_allowed_owners() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.toml");
+		std::fs::write(&path, b"[github_app]\nallowed_target_owners = [\"acme\", \"Acme-Labs\"]\n")
+			.unwrap();
+		let cfg = FileConfig::load(&path).unwrap();
+		assert_eq!(
+			cfg.github_app.allowed_target_owners,
+			Some(vec!["acme".to_owned(), "Acme-Labs".to_owned()])
+		);
+
+		let empty = dir.path().join("empty.toml");
+		std::fs::write(&empty, b"").unwrap();
+		assert_eq!(FileConfig::load(&empty).unwrap().github_app.allowed_target_owners, None);
+	}
+
+	#[test]
+	fn empty_allowed_owner_list_is_rejected_at_load() {
+		// `[]` would silently refuse every app-mode destination; an
+		// operator who wants that should see it at startup, not per repo.
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.toml");
+		std::fs::write(&path, b"[github_app]\nallowed_target_owners = []\n").unwrap();
+		let err = FileConfig::load(&path).unwrap_err();
+		let msg = format!("{err:#}");
+		assert!(
+			msg.contains("allowed_target_owners must list at least one owner or be omitted"),
+			"got: {msg}"
+		);
 	}
 }

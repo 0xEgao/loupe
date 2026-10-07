@@ -56,6 +56,7 @@ pub fn router(state: WebState) -> Router {
 		.route("/api/config", get(routes::assets::client_config))
 		.route("/api/health", get(routes::api::health))
 		.route("/api/whoami", get(routes::api::whoami))
+		.route("/api/github-app", get(routes::api::github_app))
 		.route("/api/repos", get(routes::api::list_repos).post(routes::api::create_repo))
 		.route("/api/repos/{id}", patch(routes::api::update_repo).delete(routes::api::delete_repo))
 		.route("/api/repos/{id}/scan", post(routes::api::enqueue_scan))

@@ -3,6 +3,8 @@
 //! keep the dependency tree minimal; the integration we need is small
 //! enough to maintain ourselves.
 
+use std::time::Duration;
+
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use loupe_core::{format_finding_id, Finding, ReportingDestination, Severity};
@@ -10,14 +12,21 @@ use loupe_storage::repos::RepoRow;
 use reqwest::{StatusCode, Url};
 use serde::Serialize;
 
-use super::{DispatchReceipt, ReportFinding, Reporter};
+use super::github_app::{self, GithubAppInfo, GithubAppKey, InstallationTokens};
+use super::{DispatchReceipt, ReportFinding, Reporter, ReporterCredential};
 
 const DEFAULT_API_BASE: &str = "https://api.github.com";
 const MAX_TITLE_CHARS: usize = 100;
+/// Upper bounds on one GitHub API call; see `with_base` for why.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct GithubReporter {
 	http: reqwest::Client,
 	api_base: Url,
+	/// Installation tokens minted for app-mode repos, reused across
+	/// dispatches to the same tracker until shortly before they expire.
+	tokens: InstallationTokens,
 }
 
 impl GithubReporter {
@@ -30,13 +39,89 @@ impl GithubReporter {
 	/// integration tests' fake-github stub.
 	pub fn with_base(base: &str) -> Result<Self> {
 		let api_base = base.parse::<Url>().context("parsing GithubReporter API base URL")?;
+		// Bounded waits matter here: the installation-token cache holds
+		// its lock across lookup + mint so concurrent dispatches share one
+		// token, which means a GitHub call that never answers would stall
+		// every app-mode dispatch (and the worker `complete` handlers that
+		// await them) instead of just this one.
 		let http = reqwest::Client::builder()
 			.user_agent("loupe-server/0.0.0")
 			.use_rustls_tls()
+			.connect_timeout(CONNECT_TIMEOUT)
+			.timeout(REQUEST_TIMEOUT)
 			.build()
 			.context("building GithubReporter http client")?;
-		Ok(Self { http, api_base })
+		Ok(Self { http, api_base, tokens: InstallationTokens::default() })
 	}
+
+	/// Prove a GitHub App credential works by fetching the app it belongs
+	/// to. Used by the credential route so a bad key or app id fails at
+	/// configuration time rather than at the first dispatch.
+	pub async fn verify_app(&self, key: &GithubAppKey) -> Result<GithubAppInfo> {
+		github_app::fetch_app(&self.http, &self.api_base, key).await
+	}
+
+	/// Resolve the bearer token for one dispatch: the stored PAT as-is, or
+	/// a repo-scoped installation token minted from the GitHub App.
+	async fn bearer_for(
+		&self, credential: &ReporterCredential, target_owner: &str, target_repo: &str,
+	) -> Result<String> {
+		match credential {
+			ReporterCredential::GithubPat(pat) => Ok(pat.clone()),
+			ReporterCredential::GithubApp(key) => {
+				self.tokens
+					.token_for(&self.http, &self.api_base, key, target_owner, target_repo)
+					.await
+			},
+			ReporterCredential::None => {
+				anyhow::bail!("GithubReporter dispatched without a PAT or GitHub App credential")
+			},
+		}
+	}
+
+	/// POST `body` to `url` with the session's current bearer. In app
+	/// mode a 401 means the cached installation token is no longer good
+	/// (revoked, or expired ahead of the cached deadline), so it is
+	/// dropped, a fresh one is minted into the session, and the request
+	/// is sent once more. A second 401 is returned to the caller like any
+	/// other failure. A PAT has nothing to refresh, so its 401 is
+	/// returned as-is.
+	async fn post_with_refresh<B: Serialize>(
+		&self, url: Url, body: &B, session: &mut DispatchSession<'_>, what: &str,
+	) -> Result<reqwest::Response> {
+		let resp =
+			self.post_json(url.clone(), body, &session.bearer).await.context(what.to_owned())?;
+		let ReporterCredential::GithubApp(key) = session.credential else {
+			return Ok(resp);
+		};
+		if resp.status() != StatusCode::UNAUTHORIZED {
+			return Ok(resp);
+		}
+		let (owner, repo) = (session.target_owner, session.target_repo);
+		tracing::warn!(
+			target = %format!("{owner}/{repo}"),
+			"github rejected the cached installation token; minting a fresh one and retrying"
+		);
+		self.tokens.invalidate(key.app_id(), owner, repo).await;
+		session.bearer = self.bearer_for(session.credential, owner, repo).await?;
+		self.post_json(url, body, &session.bearer).await.context(what.to_owned())
+	}
+
+	async fn post_json<B: Serialize>(
+		&self, url: Url, body: &B, bearer: &str,
+	) -> reqwest::Result<reqwest::Response> {
+		github_app::github_request(self.http.post(url), bearer).json(body).send().await
+	}
+}
+
+/// Everything one dispatch needs to authenticate against its tracker:
+/// the credential it started from and the bearer currently in use,
+/// which `post_with_refresh` may replace mid-dispatch.
+struct DispatchSession<'a> {
+	credential: &'a ReporterCredential,
+	target_owner: &'a str,
+	target_repo: &'a str,
+	bearer: String,
 }
 
 #[derive(Serialize)]
@@ -68,7 +153,7 @@ impl Reporter for GithubReporter {
 	}
 
 	async fn dispatch(
-		&self, repo: &RepoRow, findings: &[ReportFinding], pat: &str,
+		&self, repo: &RepoRow, findings: &[ReportFinding], credential: &ReporterCredential,
 	) -> Result<DispatchReceipt> {
 		let (target_owner, target_repo) = match &repo.reporting {
 			ReportingDestination::GithubIssue { target_owner, target_repo, .. } => {
@@ -79,30 +164,34 @@ impl Reporter for GithubReporter {
 		if findings.is_empty() {
 			return Ok(DispatchReceipt { kind: self.kind(), external_id: None });
 		}
+		// One bearer per dispatch: labels and issues share it, and an
+		// app-mode dispatch mints at most one installation token up front
+		// (plus one more if GitHub rejects it mid-way; see
+		// `post_with_refresh`).
+		let bearer = self.bearer_for(credential, target_owner, target_repo).await?;
+		let mut session = DispatchSession { credential, target_owner, target_repo, bearer };
 
 		let mut external_ids = Vec::new();
 		for report_finding in findings {
 			let finding = &report_finding.finding;
 			let severity = severity_label(finding.severity);
-			self.ensure_label(target_owner, target_repo, pat, severity).await?;
+			self.ensure_label(&mut session, severity).await?;
 			let title = render_title(finding);
 			let body = render_body(repo, report_finding);
 			let labels = vec!["loupe".to_owned(), severity.name.to_owned()];
 
+			let url = self
+				.api_base
+				.join(&format!("/repos/{target_owner}/{target_repo}/issues"))
+				.map_err(|e| anyhow!("building issues URL: {e}"))?;
 			let resp = self
-				.http
-				.post(
-					self.api_base
-						.join(&format!("/repos/{target_owner}/{target_repo}/issues"))
-						.map_err(|e| anyhow!("building issues URL: {e}"))?,
+				.post_with_refresh(
+					url,
+					&CreateIssueBody { title: &title, body, labels },
+					&mut session,
+					"posting github issue",
 				)
-				.bearer_auth(pat)
-				.header("Accept", "application/vnd.github+json")
-				.header("X-GitHub-Api-Version", "2022-11-28")
-				.json(&CreateIssueBody { title: &title, body, labels })
-				.send()
-				.await
-				.context("posting github issue")?;
+				.await?;
 			let status = resp.status();
 			if !status.is_success() {
 				let body = resp.text().await.unwrap_or_default();
@@ -122,26 +211,24 @@ impl Reporter for GithubReporter {
 
 impl GithubReporter {
 	async fn ensure_label(
-		&self, target_owner: &str, target_repo: &str, pat: &str, label: LabelSpec,
+		&self, session: &mut DispatchSession<'_>, label: LabelSpec,
 	) -> Result<()> {
 		let url = self
 			.api_base
-			.join(&format!("/repos/{target_owner}/{target_repo}/labels"))
+			.join(&format!("/repos/{}/{}/labels", session.target_owner, session.target_repo))
 			.map_err(|e| anyhow!("building labels URL: {e}"))?;
 		let resp = self
-			.http
-			.post(url)
-			.bearer_auth(pat)
-			.header("Accept", "application/vnd.github+json")
-			.header("X-GitHub-Api-Version", "2022-11-28")
-			.json(&CreateLabelBody {
-				name: label.name,
-				color: label.color,
-				description: label.description,
-			})
-			.send()
-			.await
-			.with_context(|| format!("creating github label {}", label.name))?;
+			.post_with_refresh(
+				url,
+				&CreateLabelBody {
+					name: label.name,
+					color: label.color,
+					description: label.description,
+				},
+				session,
+				&format!("creating github label {}", label.name),
+			)
+			.await?;
 		let status = resp.status();
 		if status.is_success() {
 			return Ok(());
@@ -280,7 +367,7 @@ mod tests {
 			reporting: ReportingDestination::GithubIssue {
 				target_owner: "acme".into(),
 				target_repo: "tracker".into(),
-				pat_secret_id: 7,
+				pat_secret_id: Some(7),
 			},
 			verification_enabled: false,
 			require_approval: None,
@@ -362,5 +449,171 @@ mod tests {
 			&ReportFinding { id: 1234, finding: finding(), reviewed_revision: None },
 		);
 		assert!(!body.contains("- scanner:"), "body must omit the scanner header: {body}");
+	}
+
+	/// Stub GitHub for the dispatch path: mints numbered installation
+	/// tokens and rejects issue POSTs that still carry the first one, the
+	/// way GitHub does once a token has been revoked or has expired.
+	mod stub {
+		use std::net::SocketAddr;
+		use std::sync::{Arc, Mutex};
+
+		use axum::extract::{Path, State};
+		use axum::http::{HeaderMap, StatusCode};
+		use axum::routing::{get, post};
+		use axum::{Json, Router};
+
+		#[derive(Clone, Default)]
+		pub struct Github {
+			pub mints: Arc<Mutex<usize>>,
+			/// Bearer tokens seen on label POSTs, in order.
+			pub label_auths: Arc<Mutex<Vec<String>>>,
+			/// Bearer tokens seen on issue POSTs, in order.
+			pub issue_auths: Arc<Mutex<Vec<String>>>,
+			/// Bearers the stub answers with 401.
+			pub rejected: Arc<Mutex<Vec<String>>>,
+		}
+
+		fn bearer(headers: &HeaderMap) -> String {
+			headers
+				.get(axum::http::header::AUTHORIZATION)
+				.and_then(|v| v.to_str().ok())
+				.and_then(|v| v.strip_prefix("Bearer "))
+				.unwrap_or("")
+				.to_owned()
+		}
+
+		async fn installation() -> Json<serde_json::Value> {
+			Json(serde_json::json!({"id": 777}))
+		}
+
+		async fn mint(State(gh): State<Github>) -> (StatusCode, Json<serde_json::Value>) {
+			let n = {
+				let mut mints = gh.mints.lock().unwrap();
+				*mints += 1;
+				*mints
+			};
+			(
+				StatusCode::CREATED,
+				Json(
+					serde_json::json!({"token": format!("ghs_{n}"), "expires_at": "2099-01-01T00:00:00Z"}),
+				),
+			)
+		}
+
+		async fn label(
+			State(gh): State<Github>, Path((_o, _r)): Path<(String, String)>, headers: HeaderMap,
+			Json(body): Json<serde_json::Value>,
+		) -> (StatusCode, Json<serde_json::Value>) {
+			let auth = bearer(&headers);
+			gh.label_auths.lock().unwrap().push(auth.clone());
+			if gh.rejected.lock().unwrap().contains(&auth) {
+				return (
+					StatusCode::UNAUTHORIZED,
+					Json(serde_json::json!({"message": "Bad credentials"})),
+				);
+			}
+			(StatusCode::CREATED, Json(body))
+		}
+
+		async fn issue(
+			State(gh): State<Github>, Path((_o, _r)): Path<(String, String)>, headers: HeaderMap,
+		) -> (StatusCode, Json<serde_json::Value>) {
+			let auth = bearer(&headers);
+			gh.issue_auths.lock().unwrap().push(auth.clone());
+			if gh.rejected.lock().unwrap().contains(&auth) {
+				return (
+					StatusCode::UNAUTHORIZED,
+					Json(serde_json::json!({"message": "Bad credentials"})),
+				);
+			}
+			(StatusCode::CREATED, Json(serde_json::json!({"number": 9})))
+		}
+
+		pub async fn spawn() -> (SocketAddr, Github) {
+			let gh = Github::default();
+			let app = Router::new()
+				.route("/repos/{owner}/{repo}/installation", get(installation))
+				.route("/app/installations/{id}/access_tokens", post(mint))
+				.route("/repos/{owner}/{repo}/labels", post(label))
+				.route("/repos/{owner}/{repo}/issues", post(issue))
+				.with_state(gh.clone());
+			let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+			let addr = listener.local_addr().unwrap();
+			tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+			(addr, gh)
+		}
+	}
+
+	fn app_mode_repo() -> RepoRow {
+		let mut repo = repo();
+		repo.reporting = ReportingDestination::GithubIssue {
+			target_owner: "acme".into(),
+			target_repo: "tracker".into(),
+			pat_secret_id: None,
+		};
+		repo
+	}
+
+	fn app_credential() -> ReporterCredential {
+		ReporterCredential::GithubApp(Box::new(
+			GithubAppKey::from_pem(42, super::github_app::testing::APP_PRIVATE_KEY_PEM).unwrap(),
+		))
+	}
+
+	fn one_finding() -> Vec<ReportFinding> {
+		vec![ReportFinding { id: 1, finding: finding(), reviewed_revision: None }]
+	}
+
+	#[tokio::test]
+	async fn app_mode_dispatch_mints_a_fresh_token_after_a_401_and_retries_once() {
+		let (addr, gh) = stub::spawn().await;
+		let reporter = GithubReporter::with_base(&format!("http://{addr}")).unwrap();
+		let credential = app_credential();
+
+		// Warm the cache, then have GitHub start rejecting that token.
+		reporter.dispatch(&app_mode_repo(), &one_finding(), &credential).await.unwrap();
+		assert_eq!(*gh.mints.lock().unwrap(), 1);
+		gh.rejected.lock().unwrap().push("ghs_1".into());
+
+		let receipt =
+			reporter.dispatch(&app_mode_repo(), &one_finding(), &credential).await.unwrap();
+		assert_eq!(receipt.external_id.as_deref(), Some("9"));
+		assert_eq!(*gh.mints.lock().unwrap(), 2, "exactly one re-mint after the 401");
+		// Second dispatch: the label POST got the stale token, was refused,
+		// and was retried with the fresh one; the issue went straight out
+		// with the fresh token.
+		let label_auths = gh.label_auths.lock().unwrap().clone();
+		assert_eq!(label_auths, vec!["ghs_1", "ghs_1", "ghs_2"], "label auths: {label_auths:?}");
+		let issue_auths = gh.issue_auths.lock().unwrap().clone();
+		assert_eq!(issue_auths, vec!["ghs_1", "ghs_2"], "issue auths: {issue_auths:?}");
+
+		// A token that is refused even when freshly minted fails as before.
+		gh.rejected.lock().unwrap().push("ghs_2".into());
+		gh.rejected.lock().unwrap().push("ghs_3".into());
+		let err = reporter
+			.dispatch(&app_mode_repo(), &one_finding(), &credential)
+			.await
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("401"), "error: {err}");
+		assert_eq!(*gh.mints.lock().unwrap(), 3, "one re-mint per dispatch, never a loop");
+	}
+
+	#[tokio::test]
+	async fn pat_mode_dispatch_does_not_retry_a_401() {
+		let (addr, gh) = stub::spawn().await;
+		let reporter = GithubReporter::with_base(&format!("http://{addr}")).unwrap();
+		gh.rejected.lock().unwrap().push("ghp_stale".into());
+
+		let err = reporter
+			.dispatch(&repo(), &one_finding(), &ReporterCredential::GithubPat("ghp_stale".into()))
+			.await
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("401"), "error: {err}");
+		assert_eq!(gh.label_auths.lock().unwrap().as_slice(), ["ghp_stale"]);
+		assert!(gh.issue_auths.lock().unwrap().is_empty());
+		assert_eq!(*gh.mints.lock().unwrap(), 0, "a PAT never mints anything");
 	}
 }
