@@ -35,8 +35,9 @@
     <form id="repo-add" class="card" hidden autocomplete="off">
       <h3>Add repository</h3>
       <p class="hint">
-        The clone URL and reporting destination cannot be changed later —
-        re-register the repository instead. Pick them deliberately.
+        The clone URL cannot be changed later — re-register the repository
+        instead. Reporting can later be re-pointed at a GitHub tracker (app
+        or PAT) from the repo's actions, but not back to email or manual.
       </p>
       <label>Clone URL
         <input name="clone_url" type="url" required
@@ -63,12 +64,9 @@
           <label>Target repo
             <input name="target_repo" type="text" placeholder="widget-security">
           </label>
-          <label>GitHub PAT
+          <label>GitHub PAT <span class="optional">optional</span>
             <input name="github_pat" type="password" autocomplete="new-password">
-            <span class="hint">
-              Needs Issues: read and write on the tracker repo. Stored
-              encrypted server-side and never returned by the API.
-            </span>
+            <span class="hint" id="github-auth-hint"></span>
           </label>
         </div>
 

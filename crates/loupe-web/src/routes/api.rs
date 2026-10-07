@@ -75,6 +75,13 @@ pub async fn whoami(State(state): State<WebState>) -> Response {
 	forward(&state, Method::GET, "/v1/whoami", &[], None).await
 }
 
+/// Read-only view of the server-wide GitHub App, so the page can tell
+/// whether a PAT is optional. Setting or clearing the app stays a
+/// `loupectl` job: the private key should never pass through a browser.
+pub async fn github_app(State(state): State<WebState>) -> Response {
+	forward(&state, Method::GET, "/v1/github-app", &[], None).await
+}
+
 // ----------------------------------------------------------------- repos
 
 #[derive(Debug, Deserialize)]

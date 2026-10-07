@@ -10,7 +10,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::routing::get;
+use axum::{Json, Router};
+use loupe_proto::PROTOCOL_VERSION;
 use loupe_server::init::run_init;
+use loupe_server::reporters::github_app::testing::APP_PRIVATE_KEY_PEM;
+use loupe_server::reporters::GithubReporter;
 use loupe_server::{serve as serve_server, AppState, Config};
 use loupe_storage::Db;
 use loupe_tls::Ca;
@@ -19,15 +24,58 @@ use loupe_web::guard::REQUEST_HEADER;
 use loupe_web::token::HEADER_NAME as TOKEN_HEADER;
 use loupe_web::{router, Token, WebState};
 
+/// The GitHub App the stub below vouches for. `PUT /v1/github-app`
+/// verifies a key by calling `GET /app` and compares the returned id with
+/// the one the operator claims, so the stub has to agree with
+/// `configure_github_app`.
+const STUB_APP_ID: u64 = 42;
+const STUB_APP_SLUG: &str = "loupe-reporter";
+
+/// Stand-in for GitHub's `GET /app`, which is all the server calls while
+/// storing an app credential. Same shape as the server's own
+/// `tests/github_app.rs` stub, minus the call recording this file never
+/// inspects.
+async fn spawn_github_stub() -> SocketAddr {
+	let app = Router::new().route(
+		"/app",
+		get(|| async { Json(serde_json::json!({"id": STUB_APP_ID, "slug": STUB_APP_SLUG})) }),
+	);
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+	addr
+}
+
 struct Fixture {
 	server: loupe_server::ServeHandle,
 	web_addr: SocketAddr,
 	web_join: tokio::task::JoinHandle<()>,
 	token: String,
 	http: reqwest::Client,
+	/// Direct admin client against `loupe-server`, for setup the dashboard
+	/// deliberately has no route for (storing the GitHub App credential is
+	/// a `loupectl` job).
+	admin: reqwest::Client,
 }
 
 impl Fixture {
+	/// Store the stub-backed GitHub App credential on the server, as
+	/// `loupectl github-app set` would.
+	async fn configure_github_app(&self) {
+		let resp = self
+			.admin
+			.put("https://loupe-server/v1/github-app")
+			.json(&serde_json::json!({
+				"protocol_version": PROTOCOL_VERSION,
+				"app_id": STUB_APP_ID,
+				"private_key_pem": APP_PRIVATE_KEY_PEM,
+			}))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(resp.status(), 204, "{}", resp.text().await.unwrap_or_default());
+	}
+
 	fn url(&self, path: &str) -> String {
 		format!("http://{}{path}", self.web_addr)
 	}
@@ -62,6 +110,7 @@ impl Fixture {
 }
 
 async fn bring_up() -> Fixture {
+	let stub_addr = spawn_github_stub().await;
 	let tmp = tempfile::tempdir().unwrap();
 	let init = run_init(tmp.path(), &["loupe-server".to_owned()], None).unwrap();
 
@@ -80,11 +129,8 @@ async fn bring_up() -> Fixture {
 		ca_key_pem: std::fs::read_to_string(&init.layout.ca_key).unwrap(),
 	};
 	let db = Arc::new(Db::open(&init.layout.db_path, &init.master_key).unwrap());
-	let state = AppState::new(
-		db,
-		Arc::new(ca),
-		Arc::new(loupe_server::reporters::GithubReporter::new().unwrap()),
-	);
+	let reporter = Arc::new(GithubReporter::with_base(&format!("http://{stub_addr}")).unwrap());
+	let state = AppState::new(db, Arc::new(ca), reporter);
 	let server = serve_server(cfg, state).await.unwrap();
 	let server_addr = server.local_addr;
 	std::mem::forget(tmp);
@@ -104,8 +150,10 @@ async fn bring_up() -> Fixture {
 		.use_rustls_tls()
 		.build()
 		.unwrap();
-	let client =
-		AdminClient::from_parts(upstream, reqwest::Url::parse("https://loupe-server/").unwrap());
+	let client = AdminClient::from_parts(
+		upstream.clone(),
+		reqwest::Url::parse("https://loupe-server/").unwrap(),
+	);
 
 	let token = Token::generate();
 	let token_plain = token.reveal().to_owned();
@@ -126,6 +174,7 @@ async fn bring_up() -> Fixture {
 			.redirect(reqwest::redirect::Policy::none())
 			.build()
 			.unwrap(),
+		admin: upstream,
 	}
 }
 
@@ -305,6 +354,32 @@ async fn the_document_carries_a_strict_csp() {
 	f.shutdown().await;
 }
 
+/// Cheap static guards for the GitHub App affordances: the page needs the
+/// hint element the script fills from `/api/github-app`, and the listing
+/// has to say which credential a GitHub destination files issues with.
+#[tokio::test]
+async fn the_page_explains_github_app_reporting() {
+	let f = bring_up().await;
+
+	let html = f.http.get(f.url("/")).send().await.unwrap().text().await.unwrap();
+	assert!(html.contains(r#"id="github-auth-hint""#), "no auth hint element in index.html");
+	assert!(
+		!html.contains(r#"name="github_pat" type="password" required"#),
+		"the PAT must not be statically required: the script decides per server"
+	);
+
+	let js = f.http.get(f.url("/app.js")).send().await.unwrap().text().await.unwrap();
+	assert!(js.contains("/api/github-app"), "app.js never asks for the GitHub App status");
+	assert!(js.contains("(via app)"), "app.js must label app-mode destinations");
+	assert!(js.contains("(via PAT)"), "app.js must label PAT-mode destinations");
+	assert!(
+		js.contains("GitHub App status unavailable"),
+		"a failed app-status fetch must degrade instead of aborting the repos view"
+	);
+
+	f.shutdown().await;
+}
+
 // ---------------------------------------------------------------- functional
 
 #[tokio::test]
@@ -366,6 +441,122 @@ async fn a_repo_registered_through_the_dashboard_round_trips() {
 
 	let resp = f.delete(&format!("/api/repos/{repo_id}")).send().await.unwrap();
 	assert_eq!(resp.status(), 204);
+
+	f.shutdown().await;
+}
+
+/// The page decides whether a PAT is optional from this route, so it has
+/// to reflect the server's credential store, not a build-time answer.
+#[tokio::test]
+async fn the_github_app_status_is_forwarded() {
+	let f = bring_up().await;
+
+	let resp = f.get("/api/github-app").send().await.unwrap();
+	assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+	let body: serde_json::Value = resp.json().await.unwrap();
+	assert_eq!(body["protocol_version"], PROTOCOL_VERSION);
+	assert!(body["app"].is_null(), "a fresh server has no app: {body}");
+
+	f.configure_github_app().await;
+
+	let raw = f.get("/api/github-app").send().await.unwrap().text().await.unwrap();
+	assert!(!raw.contains("PRIVATE KEY"), "the app key reached the browser: {raw}");
+	let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+	assert_eq!(body["app"]["app_id"], STUB_APP_ID);
+	assert_eq!(body["app"]["slug"], STUB_APP_SLUG);
+
+	f.shutdown().await;
+}
+
+/// The form omits `github_pat` entirely when the operator leaves it
+/// empty; the server reads that as "report through the app".
+#[tokio::test]
+async fn a_repo_without_a_pat_reports_through_the_app() {
+	let f = bring_up().await;
+	f.configure_github_app().await;
+
+	let resp = f
+		.post("/api/repos")
+		.json(&serde_json::json!({
+			"clone_url": "https://github.com/acme/widget.git",
+			"reporting": {
+				"kind": "github_issue",
+				"target_owner": "acme",
+				"target_repo": "tracker",
+			},
+		}))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+
+	let raw = f.get("/api/repos").send().await.unwrap().text().await.unwrap();
+	assert!(!raw.contains("pat_secret_id"), "secret id reached the browser: {raw}");
+	assert!(!raw.contains("github_pat"), "a PAT field reached the browser: {raw}");
+	let listing: serde_json::Value = serde_json::from_str(&raw).unwrap();
+	let reporting = &listing["repos"][0]["reporting"];
+	assert_eq!(reporting["kind"], "github_issue");
+	assert_eq!(reporting["auth"], "app", "listing must say the repo uses the app: {raw}");
+
+	// A PAT-backed registration is labelled the other way, so the page can
+	// offer the right per-repo actions.
+	let resp = f
+		.post("/api/repos")
+		.json(&serde_json::json!({
+			"clone_url": "https://github.com/acme/gadget.git",
+			"reporting": {
+				"kind": "github_issue",
+				"target_owner": "acme",
+				"target_repo": "tracker",
+				"github_pat": "ghp_do_not_leak",
+			},
+		}))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+	let listing: serde_json::Value =
+		f.get("/api/repos").send().await.unwrap().json().await.unwrap();
+	let auths: Vec<&str> = listing["repos"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|r| r["reporting"]["auth"].as_str().unwrap())
+		.collect();
+	assert!(auths.contains(&"pat") && auths.contains(&"app"), "{auths:?}");
+
+	f.shutdown().await;
+}
+
+/// Without a configured app the server refuses a PAT-less registration;
+/// the page relies on that refusal reaching it as a JSON error carrying
+/// the server's own explanation.
+#[tokio::test]
+async fn registering_without_a_pat_needs_a_configured_app() {
+	let f = bring_up().await;
+
+	let resp = f
+		.post("/api/repos")
+		.json(&serde_json::json!({
+			"clone_url": "https://github.com/acme/widget.git",
+			"reporting": {
+				"kind": "github_issue",
+				"target_owner": "acme",
+				"target_repo": "tracker",
+			},
+		}))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 400);
+	let body: serde_json::Value = resp.json().await.unwrap();
+	assert!(
+		body["error"].as_str().unwrap().contains("no GitHub App configured"),
+		"the server's explanation should survive: {body}"
+	);
+	let listing: serde_json::Value =
+		f.get("/api/repos").send().await.unwrap().json().await.unwrap();
+	assert!(listing["repos"].as_array().unwrap().is_empty(), "nothing registered: {listing}");
 
 	f.shutdown().await;
 }

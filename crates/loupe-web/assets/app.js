@@ -15,6 +15,10 @@ let CONFIG = {
 };
 let CAPABILITY_TOKEN = null;
 let REPOS = [];
+// The server-wide GitHub App ({ app_id, slug }) or null while none is
+// configured. Decides whether the PAT field is optional and which GitHub
+// actions a repo row offers.
+let GITHUB_APP = null;
 let FINDINGS = [];
 let CURRENT_VIEW = "repos";
 let POLL_TIMER = null;
@@ -174,7 +178,8 @@ async function refreshStatus() {
 function reportingLabel(reporting) {
   if (!reporting) return "unknown";
   if (reporting.kind === "github_issue") {
-    return "github issues → " + reporting.target_owner + "/" + reporting.target_repo;
+    const via = reporting.auth === "app" ? " (via app)" : reporting.auth === "pat" ? " (via PAT)" : "";
+    return "github issues → " + reporting.target_owner + "/" + reporting.target_repo + via;
   }
   if (reporting.kind === "email") return "email → " + (reporting.to || []).join(", ");
   if (reporting.kind === "manual") return "manual (no reporter)";
@@ -187,8 +192,94 @@ function approvalLabel(repo) {
   return "approval: server default";
 }
 
+/** Re-point a repo at a GitHub tracker. Without `pat` the server switches
+ *  the repo to the GitHub App, so the key is left out rather than sent
+ *  empty. */
+async function setGithubReporting(repo, owner, target, pat) {
+  const payload = { target_owner: owner, target_repo: target };
+  if (pat) payload.github_pat = pat;
+  await api("PUT", "/api/repos/" + repo.id + "/reporting/github", payload);
+  await loadRepos();
+}
+
+/** The GitHub-related actions for a repo row, which depend on how the
+ *  repo currently authenticates: PAT-backed repos can rotate the PAT or
+ *  move to the app, app-backed repos can fall back to a PAT, and anything
+ *  else can be pointed at a tracker. */
+function githubActions(repo) {
+  const reporting = repo.reporting || {};
+  if (reporting.kind !== "github_issue") {
+    return [
+      el("button", {
+        text: "Set GitHub reporting…",
+        class: "secondary",
+        title: "Point this repo at a GitHub tracker; works from any current destination",
+        on: { click: () => guarded(async () => {
+          const owner = window.prompt("Target owner:");
+          if (owner === null || owner.trim() === "") return;
+          const target = window.prompt("Target repo:");
+          if (target === null || target.trim() === "") return;
+          const pat = window.prompt("GitHub PAT (leave empty to use the GitHub App):");
+          if (pat === null) return;
+          await setGithubReporting(repo, owner.trim(), target.trim(), pat.trim());
+        }) },
+      }),
+    ];
+  }
+  if (reporting.auth === "app") {
+    return [
+      el("button", {
+        text: "Use a PAT instead…",
+        class: "secondary",
+        title: "File issues with a personal access token rather than the GitHub App",
+        on: { click: () => guarded(async () => {
+          const pat = window.prompt("GitHub PAT (not echoed back anywhere):");
+          if (pat === null || pat.trim() === "") return;
+          await setGithubReporting(repo, reporting.target_owner, reporting.target_repo, pat.trim());
+        }) },
+      }),
+    ];
+  }
+  const switchOpts = {
+    text: "Switch to GitHub App",
+    class: "secondary",
+    title: GITHUB_APP
+      ? "Drop this repo's PAT and file issues through the GitHub App " + GITHUB_APP.slug
+      : "No GitHub App is configured on this server; set one with loupectl github-app set",
+    on: { click: () => guarded(async () => {
+      // The button's disabled state was fixed when the row rendered; the
+      // app may have been cleared since, so re-check before using it.
+      if (!GITHUB_APP) {
+        throw new Error("No GitHub App is configured on this server; set one with loupectl github-app set");
+      }
+      if (!window.confirm(
+        "Switch repo #" + repo.id + " to the GitHub App?\n\n" +
+        "Its stored PAT is dropped; issues on " + reporting.target_owner + "/" +
+        reporting.target_repo + " will be filed by " + GITHUB_APP.slug + "[bot]."
+      )) return;
+      await setGithubReporting(repo, reporting.target_owner, reporting.target_repo, "");
+    }) },
+  };
+  if (!GITHUB_APP) switchOpts.attrs = { disabled: "" };
+  return [
+    el("button", {
+      text: "Update PAT…",
+      class: "secondary",
+      on: { click: () => guarded(async () => {
+        const pat = window.prompt("New GitHub PAT (not echoed back anywhere):");
+        if (pat === null || pat.trim() === "") return;
+        await api("POST", "/api/repos/" + repo.id + "/reporting/github-pat", {
+          github_pat: pat.trim(),
+        });
+        banner("");
+        window.alert("PAT rotated for repo #" + repo.id + ".");
+      }) },
+    }),
+    el("button", switchOpts),
+  ];
+}
+
 function repoRow(repo) {
-  const isGithub = repo.reporting && repo.reporting.kind === "github_issue";
   const disabled = repo.disabled_at !== null && repo.disabled_at !== undefined;
 
   const meta = el("div", { class: "row-meta" }, [
@@ -279,39 +370,7 @@ function repoRow(repo) {
         await loadRepos();
       }) },
     }),
-    isGithub
-      ? el("button", {
-          text: "Update PAT…",
-          class: "secondary",
-          on: { click: () => guarded(async () => {
-            const pat = window.prompt("New GitHub PAT (not echoed back anywhere):");
-            if (pat === null || pat.trim() === "") return;
-            await api("POST", "/api/repos/" + repo.id + "/reporting/github-pat", {
-              github_pat: pat.trim(),
-            });
-            banner("");
-            window.alert("PAT rotated for repo #" + repo.id + ".");
-          }) },
-        })
-      : el("button", {
-          text: "Set GitHub reporting…",
-          class: "secondary",
-          title: "Point this repo at a GitHub tracker; works from any current destination",
-          on: { click: () => guarded(async () => {
-            const owner = window.prompt("Target owner:");
-            if (owner === null || owner.trim() === "") return;
-            const target = window.prompt("Target repo:");
-            if (target === null || target.trim() === "") return;
-            const pat = window.prompt("GitHub PAT:");
-            if (pat === null || pat.trim() === "") return;
-            await api("PUT", "/api/repos/" + repo.id + "/reporting/github", {
-              target_owner: owner.trim(),
-              target_repo: target.trim(),
-              github_pat: pat.trim(),
-            });
-            await loadRepos();
-          }) },
-        }),
+    ...githubActions(repo),
     el("button", {
       text: "Findings",
       class: "secondary",
@@ -355,6 +414,43 @@ async function loadRepos() {
   syncRepoSelect();
 }
 
+/** Refresh the GitHub App status. A failure (for instance a server that
+ *  predates the route) must not take the whole repos view down with it:
+ *  fall back to "no app" and report the error, but let the caller carry
+ *  on loading repos. */
+async function loadGithubApp() {
+  try {
+    const status = await api("GET", "/api/github-app");
+    GITHUB_APP = status.app || null;
+  } catch (e) {
+    GITHUB_APP = null;
+    banner("GitHub App status unavailable: " + String(e.message || e));
+  }
+  applyGithubAuthHint();
+}
+
+/** Explain what an empty PAT field does, and only insist on one when the
+ *  server has no app to fall back to. `required` is set only while the
+ *  GitHub block is the visible one: a required control inside a hidden
+ *  block would block submitting an email or manual registration. */
+function applyGithubAuthHint() {
+  const hint = $("github-auth-hint");
+  const pat = document.querySelector("#repo-add input[name=github_pat]");
+  const githubSelected = document.querySelector("#repo-add input[name=reporting]:checked");
+  const githubVisible = githubSelected !== null && githubSelected.value === "github_issue";
+  if (GITHUB_APP) {
+    hint.textContent =
+      "Leave empty to report through the GitHub App " + GITHUB_APP.slug +
+      " (App ID " + GITHUB_APP.app_id + "). Fill in only to file issues with a personal token instead.";
+    pat.required = false;
+  } else {
+    hint.textContent =
+      "No GitHub App is configured on this server, so a PAT is required until one is set with " +
+      "`loupectl github-app set`.";
+    pat.required = githubVisible;
+  }
+}
+
 function syncRepoSelect() {
   const select = $("findings-repo");
   const previous = select.value;
@@ -388,12 +484,14 @@ function readRepoForm(form) {
       kind: "github_issue",
       target_owner: text("target_owner"),
       target_repo: text("target_repo"),
-      github_pat: text("github_pat"),
     };
     if (!payload.reporting.target_owner || !payload.reporting.target_repo) {
       throw new Error("GitHub reporting needs a target owner and repo");
     }
-    if (!payload.reporting.github_pat) throw new Error("GitHub reporting needs a PAT");
+    // An absent `github_pat` means "report through the GitHub App"; an
+    // empty string would be rejected as an empty PAT, so never send one.
+    if (text("github_pat")) payload.reporting.github_pat = text("github_pat");
+    else if (!GITHUB_APP) throw new Error("GitHub reporting needs a PAT (no GitHub App is configured)");
   } else if (kind === "email") {
     const to = text("email_to").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
     if (to.length === 0) throw new Error("email reporting needs at least one recipient");
@@ -779,7 +877,11 @@ function switchView(view) {
 }
 
 async function refreshView() {
-  if (CURRENT_VIEW === "repos") return loadRepos();
+  if (CURRENT_VIEW === "repos") {
+    // The app status comes first: the rows' GitHub actions depend on it.
+    await loadGithubApp();
+    return loadRepos();
+  }
   if (CURRENT_VIEW === "jobs") return loadJobs();
   if (CURRENT_VIEW === "findings") {
     if (REPOS.length === 0) await loadRepos();
@@ -828,6 +930,9 @@ function wireUp() {
   $("repo-add-toggle").addEventListener("click", () => {
     const form = $("repo-add");
     form.hidden = !form.hidden;
+    // The app may have been set or cleared with loupectl since the view
+    // loaded; the hint should describe what a submit will actually do.
+    if (!form.hidden) guarded(() => loadGithubApp());
   });
   for (const button of document.querySelectorAll("[data-cancel]")) {
     button.addEventListener("click", () => {
@@ -839,6 +944,7 @@ function wireUp() {
       for (const block of document.querySelectorAll("#repo-add [data-reporting]")) {
         block.hidden = block.dataset.reporting !== radio.value || !radio.checked;
       }
+      applyGithubAuthHint();
     });
   }
   $("repo-add").addEventListener("submit", (event) => {
