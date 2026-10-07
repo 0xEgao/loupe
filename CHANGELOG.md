@@ -9,6 +9,7 @@
 - Add typed, transactional review-harness storage with bounded text, semantic identities, replay records, and project-scoped proof metadata; keep unsupported job kinds readable but inert ([#62]).
 - Log the database schema version and runtime image revision at server startup ([#62]).
 - Add campaign-aware review scheduling with frozen budgets, resumable survey batches, bounded fair claims, and deadline handling; preserve legacy leasing and keep survey/drilldown runtime-gated.
+- File GitHub issues through a server-wide GitHub App by default, with repo-scoped short-lived installation tokens, an optional tracker-owner allowlist, and a schema v4 bump; keep per-repo PATs as a fallback.
 
 ## v0.1 — 2026-09-07
 

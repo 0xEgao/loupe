@@ -195,7 +195,10 @@ A finding's journey from "agent saw something" to "human looked at it":
                   ▼ (when state = confirmed)
    ┌─────────────────────────────────┐
    │ dispatch:                       │
-   │   GithubIssue → POST issue +    │
+   │   GithubIssue → POST issue as   │
+   │     the App bot (per-repo       │
+   │     installation token) or      │
+   │     with the repo's PAT +       │
    │     stamp reported_at           │     dispatch
    │   Email → sendmail +            │
    │     stamp reported_at           │

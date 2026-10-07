@@ -79,11 +79,19 @@ Before installing, the host needs:
   instance can override `[bkb].api_url` in the worker config. Absence
   is silent: workers without bkb-mcp run normally and the agent's
   prompt doesn't mention bkb at all.
-- **A GitHub personal access token** for each target tracker repo,
-  only if you intend to use the GitHub-issue reporter (skip this
-  prereq when registering repos with `--no-reporting` for manual
+- **A GitHub App** owned by the organization that holds your tracker
+  repos, only if you intend to use the GitHub-issue reporter (skip
+  this prereq when registering repos with `--no-reporting` for manual
   triage). The GitHub-issue reporter has no extra prereq beyond
-  outbound HTTPS to `api.github.com`. The token is
+  outbound HTTPS to `api.github.com`. One server-wide credential (App
+  ID + RSA private key) covers every tracker repo the app is
+  installed on: the server mints short-lived installation tokens
+  restricted to that single tracker repo with **Issues: Read and
+  write**, reuses each one for up to 50 minutes, and the issues are
+  authored by `<app-slug>[bot]` rather than by a human account. The
+  GitHub-side steps are under "GitHub App setup" below.
+- **Or: a GitHub personal access token** for a tracker repo, as a
+  per-repo fallback where the app is not an option. The token is
   used by the server to call `POST /repos/{owner}/{repo}/issues`, so
   it needs scope to file issues on the *tracker* repo (not the source
   repo being scanned — those can be different). Required scopes:
@@ -92,7 +100,7 @@ Before installing, the host needs:
     *Read and write*.
   - **Classic PAT**: the `repo` scope. (`public_repo` is enough if
     the tracker repo is public.)
-  PATs are stored in the `secrets` table inside an
+  The app key and PATs are stored in the `secrets` table inside an
   SQLCipher-encrypted SQLite file. The whole database — secrets,
   findings (descriptions, PoCs, suggested fixes), repo metadata,
   audit trails — is sealed with AES-256 + HMAC-SHA512 under
@@ -353,26 +361,36 @@ legacy work may remain, but leased jobs block the migration.
 
 ### 6. Register a repo and trigger a scan
 
-The `--pat` value here is the GitHub PAT you minted in the
-prerequisites: a fine-grained token with **Issues: Read and write**
-on the *tracker* repo, or a classic token with the `repo` scope.
-Pass it via the `LOUPE_TRACKER_PAT` env var rather than as a
-positional flag so it doesn't end up in shell history. The server
-encrypts it at rest with the master key (see prerequisites) before
-persisting; the plaintext PAT never travels back out of the server in
-any response.
+Store the GitHub App credential once per server. The App ID and the
+private key PEM come from the app's settings page on GitHub (see
+"GitHub App setup" below). The server signs a throwaway JWT with the
+key and checks it against GitHub's `GET /app` before persisting, so a
+wrong key or ID is rejected here rather than at the first dispatch.
+The key is encrypted at rest with the master key (see prerequisites)
+and never travels back out of the server in any response.
 
 ```
-export LOUPE_TRACKER_PAT=ghp_xxx_with_issues_write_scope
+loupectl github-app set --app-id 123456 --private-key-file loupe-reporter.pem
+loupectl github-app show             # app_id=123456 slug=loupe-reporter
+```
 
+`--private-key-file` can also come from `LOUPE_GITHUB_APP_KEY`; to
+avoid a key file on disk, pass the PEM itself via
+`LOUPE_GITHUB_APP_KEY_PEM` or base64-encoded via
+`LOUPE_GITHUB_APP_KEY_PEM_B64`.
+
+Then register the repo. Without `--pat` the reporter files issues
+through the app, which is the default; the server answers `400` if no
+app is configured yet.
+
+```
 loupectl repo add \
   --clone-url     https://github.com/acme/widget.git \
   --target-owner  acme \
   --target-repo   widget-security \
-  --pat           "$LOUPE_TRACKER_PAT" \
   --scan-interval-seconds 86400      # optional; daily
 
-loupectl repo list
+loupectl repo list                   # reporting=github(app)→acme/widget-security
 loupectl repo scan 1                 # one-shot scan of repo id 1
 ```
 
@@ -381,11 +399,104 @@ through verifier jobs before reporting. If the server-wide verification
 default is on, omit it to inherit the default, or pass
 `--no-verification` to opt this repo out.
 
-Confirmed findings dispatch automatically — the GitHub reporter
-reads the PAT out of the secrets table (transparently decrypted by
-SQLCipher when the row is fetched) and posts to
-`https://api.github.com/repos/acme/widget-security/issues`, stamping
-`reported_at` on the finding row.
+Confirmed findings dispatch automatically — the GitHub reporter signs
+a short-lived JWT with the app key, resolves the app's installation
+for the tracker repo, mints a one-hour installation token restricted
+to that single repo with Issues write (cached in memory for 50
+minutes, never persisted), and posts to
+`https://api.github.com/repos/acme/widget-security/issues` as
+`loupe-reporter[bot]`, stamping `reported_at` on the finding row.
+
+#### GitHub App setup
+
+On GitHub, under the organization that owns the tracker repos, open
+*Settings → Developer settings → GitHub Apps → New GitHub App*:
+
+- **Webhook**: uncheck *Active*. Loupe never receives events.
+- **Repository permissions**: *Issues: Read and write*. GitHub adds
+  *Metadata: Read-only* on its own; nothing else is needed.
+- **Where can this GitHub App be installed?**: *Only on this account*.
+- After creating the app, note its **App ID** and generate a private
+  key. GitHub downloads a PKCS#1 PEM, which is what
+  `loupectl github-app set --private-key-file` expects.
+- Install the app on the organization and pick *Only select
+  repositories*, listing the tracker repos. When a new tracker repo
+  appears later, add it to the installation's repository selection
+  first — the server cannot resolve an installation for it otherwise.
+
+`loupectl github-app show` prints the configured App ID and slug.
+`loupectl github-app clear` removes the credential, but is refused
+with `409` while any repo still reports through the app; switch those
+to a PAT with `loupectl repo set-github-reporting <id> ... --pat`
+first, or remove and re-register them.
+
+Security model: the app key is strictly more powerful than one PAT —
+it reaches every tracker the app is installed on, with Issues write
+only. Installing an app grants access *to* the app owner, never
+*from* it, so a third party cannot obtain credentials by installing
+it, and *Only on this account* prevents installation elsewhere
+anyway. The installation's repository selection is the real
+allowlist, so install the app on tracker repos only. With the app
+configured, the admin certificate alone decides where findings go;
+there is no per-destination secret to hand over any more. As belt and
+braces, the optional `[github_app] allowed_target_owners = ["acme"]`
+key in the server config restricts app-mode destinations to the
+listed owners (compared case-insensitively), enforced when a repo is
+registered or switched and again at dispatch time; an empty list is
+rejected at startup. A repo whose owner is excluded later fails every
+dispatch with a warning in the server log and its findings stay
+`confirmed` for retry; `loupectl repo list` does not flag it, so check
+the log after tightening the list. To revoke the credential,
+regenerate or delete the key on the app's settings page: new tokens
+stop immediately, while an installation token already minted keeps
+working for the rest of its hour (scoped to issues on one repo). Then
+`loupectl github-app set` the new key.
+
+Notifications: GitHub does not email you about issues the bot files
+unless you watch the tracker repo with *All activity*. Set your watch
+to *Participating and @mentions* to hear only about threads you take
+part in.
+
+Upgrading an existing deployment: deploy the server first. The
+database schema bumps from 3 to 4 automatically — no table changes,
+but older binaries refuse the database up front instead of failing
+on the first app-mode repo row. Configure the app, then switch repos
+one at a time with `loupectl repo set-github-reporting` (below), or
+script it from `loupectl repo list --json`. PAT repos keep working
+untouched.
+The dashboard's add-repo form defaults to the app as well and shows
+which app is configured.
+
+#### Or: with a PAT
+
+Pass `--pat` to make a single repo report with a personal access
+token instead of the app: a fine-grained token with **Issues: Read
+and write** on the *tracker* repo, or a classic token with the `repo`
+scope. Pass it via the `LOUPE_TRACKER_PAT` env var rather than as a
+positional flag so it doesn't end up in shell history. The server
+encrypts it at rest with the master key before persisting; the
+plaintext PAT never travels back out of the server in any response,
+and the reporter reads it out of the secrets table (transparently
+decrypted by SQLCipher when the row is fetched) at dispatch time.
+
+```
+export LOUPE_TRACKER_PAT=ghp_xxx_with_issues_write_scope
+
+loupectl repo add \
+  --clone-url     https://github.com/acme/widget.git \
+  --target-owner  acme \
+  --target-repo   widget-security \
+  --pat           "$LOUPE_TRACKER_PAT"
+
+loupectl repo list                   # reporting=github(pat)→acme/widget-security
+```
+
+`loupectl repo rotate-pat <id>` replaces the token of a PAT repo and
+is only for PAT repos. `loupectl repo set-github-reporting <id>
+--target-owner O --target-repo R` without `--pat` switches an existing
+PAT repo to the app and drops the orphaned PAT; with `--pat` it
+switches back. `loupectl repo list --json` prints the raw listing for
+scripting, where `reporting` carries `auth: app|pat`.
 
 #### Or: email reporting
 
@@ -421,7 +532,7 @@ or configure reporting later and retry delivery:
 ```
 loupectl repo set-github-reporting <repo-id> \
   --target-owner acme \
-  --target-repo widget-security
+  --target-repo widget-security     # add --pat to use a PAT instead of the app
 
 loupectl finding retry-report <finding-id>
 ```
@@ -431,7 +542,8 @@ Reject still moves a held finding to terminal `dismissed`.
 ### 7. Inspect what happened
 
 ```
-loupectl repo list [-n <limit>]
+loupectl repo list [-n <limit>]            # reporting=github(app|pat)→owner/repo
+loupectl repo list --json                  # raw listing; reporting.auth is app|pat
 loupectl job list [-n <limit>]
 loupectl job get  <job-id>
 loupectl job retry <job-id>                # requeue a failed job
@@ -547,9 +659,11 @@ from an authorized page can initially inherit a copy of its session
 storage, after which the two stores are independent. The token itself does
 not change while the process runs.
 
-Covers repo list/add/update/delete, PAT rotation, switching a repo to
-GitHub reporting, ad-hoc scans (full and incremental), the job board, and
-finding review including the proof-of-concept diff and approve/reject.
+Covers repo list/add/update/delete (the add form defaults to the GitHub
+App, shows which app is configured, and takes a PAT only if you fill the
+field in), PAT rotation, switching a repo between app and PAT reporting,
+ad-hoc scans (full and incremental), the job board, and finding review
+including the proof-of-concept diff and approve/reject.
 Worker registration is **not** exposed: there is no list-workers RPC to
 drive a revoke UI from, and `worker register` returns a private key the
 server keeps no copy of, which has no business travelling through a
