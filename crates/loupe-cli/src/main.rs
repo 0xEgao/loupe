@@ -99,8 +99,9 @@ struct GithubAppSetArgs {
 enum RepoCmd {
 	/// Register a new repo for scanning.
 	Add(RepoAddArgs),
-	/// List registered repos.
-	List(ListArgs),
+	/// List registered repos. Pass `--json` to dump the raw
+	/// ListReposResponse DTO instead (for scripting).
+	List(RepoListArgs),
 	/// Deregister a repo (cascades to its jobs and findings).
 	Rm { id: i64 },
 	/// Patch a repo's scheduling / verification settings. Each flag is
@@ -313,6 +314,16 @@ struct ListArgs {
 }
 
 #[derive(Debug, Args)]
+struct RepoListArgs {
+	/// Number of rows to return.
+	#[arg(short = 'n', long = "limit", value_parser = parse_positive_i64)]
+	limit: Option<i64>,
+	/// Output the raw JSON DTO instead of the tab-separated listing.
+	#[arg(long, default_value_t = false)]
+	json: bool,
+}
+
+#[derive(Debug, Args)]
 struct FindingListArgs {
 	repo_id: i64,
 	/// Number of rows to return.
@@ -387,7 +398,7 @@ async fn main() -> Result<()> {
 			},
 			RepoCmd::List(args) => {
 				let (client, base) = client_and_url(&conn)?;
-				repo_list(&client, base, args.limit).await
+				repo_list(&client, base, args.limit, args.json).await
 			},
 			RepoCmd::Rm { id } => {
 				let (client, base) = client_and_url(&conn)?;
@@ -645,12 +656,16 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 }
 
 async fn repo_list(
-	client: &reqwest::Client, base: &reqwest::Url, limit: Option<i64>,
+	client: &reqwest::Client, base: &reqwest::Url, limit: Option<i64>, as_json: bool,
 ) -> Result<()> {
 	let req = client.get(url(base, "/v1/repos"));
 	let req = if let Some(limit) = limit { req.query(&[("limit", limit)]) } else { req };
 	let resp = req.send().await?;
 	let body: ListReposResponse = resp.error_for_status()?.json().await?;
+	if as_json {
+		println!("{}", repo_list_json(&body)?);
+		return Ok(());
+	}
 	for r in body.repos {
 		let approval = r.require_approval.map_or("inherit".to_owned(), |v| v.to_string());
 		let disabled = r.disabled_at.map_or("active".to_owned(), |ts| format!("disabled@{ts}"));
@@ -669,6 +684,14 @@ async fn repo_list(
 		);
 	}
 	Ok(())
+}
+
+/// The `--json` rendering of `repo list`: the `ListReposResponse` DTO
+/// exactly as the server returned it, pretty-printed. Scripts consume
+/// this (e.g. with jq) to find PAT-backed GitHub repos, so nothing is
+/// added, dropped, or reshaped on the way out.
+fn repo_list_json(body: &ListReposResponse) -> Result<String> {
+	Ok(serde_json::to_string_pretty(body)?)
 }
 
 /// Compact reporter description for the human listing: which reporter,
@@ -1079,6 +1102,8 @@ async fn finding_reject(client: &reqwest::Client, base: &reqwest::Url, id: i64) 
 
 #[cfg(test)]
 mod tests {
+	use loupe_proto::RepoSummary;
+
 	use super::*;
 
 	#[test]
@@ -1524,5 +1549,82 @@ mod tests {
 		let decoded_ca =
 			base64::engine::general_purpose::STANDARD.decode(&assignments[1].1).unwrap();
 		assert_eq!(String::from_utf8(decoded_ca).unwrap(), bundle.ca_cert_pem);
+	}
+
+	#[test]
+	fn repo_list_parses_json_with_limit() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"list",
+			"--json",
+			"--limit",
+			"5",
+		])
+		.unwrap();
+		let Cmd::Repo(RepoCmd::List(args)) = cli.cmd else {
+			panic!("expected repo list command");
+		};
+		assert!(args.json);
+		assert_eq!(args.limit, Some(5));
+	}
+
+	#[test]
+	fn repo_list_json_is_the_raw_dto() {
+		let body = ListReposResponse {
+			protocol_version: PROTOCOL_VERSION,
+			repos: vec![
+				RepoSummary {
+					id: 1,
+					clone_url: "https://github.com/acme/widget.git".into(),
+					host: "github.com".into(),
+					owner: "acme".into(),
+					repo: "widget".into(),
+					default_branch: Some("main".into()),
+					scan_interval_seconds: Some(3600),
+					disabled_at: None,
+					verification_enabled: true,
+					require_approval: None,
+					last_scanned_sha: None,
+					last_scanned_at: None,
+					created_at: 1_700_000_000,
+					reporting: Some(ReportingSummary::GithubIssue {
+						target_owner: "acme".into(),
+						target_repo: "tracker".into(),
+						auth: GithubReportingAuth::App,
+					}),
+				},
+				RepoSummary {
+					id: 2,
+					clone_url: "https://github.com/acme/gadget.git".into(),
+					host: "github.com".into(),
+					owner: "acme".into(),
+					repo: "gadget".into(),
+					default_branch: None,
+					scan_interval_seconds: None,
+					disabled_at: Some(1_700_000_500),
+					verification_enabled: false,
+					require_approval: Some(true),
+					last_scanned_sha: Some("abc123".into()),
+					last_scanned_at: Some(1_700_000_400),
+					created_at: 1_700_000_001,
+					reporting: Some(ReportingSummary::GithubIssue {
+						target_owner: "acme".into(),
+						target_repo: "tracker".into(),
+						auth: GithubReportingAuth::Pat,
+					}),
+				},
+			],
+		};
+
+		let rendered = repo_list_json(&body).unwrap();
+
+		let parsed: ListReposResponse = serde_json::from_str(&rendered).unwrap();
+		assert_eq!(parsed, body, "JSON output must round-trip to the identical DTO");
+		assert!(rendered.contains("\"auth\": \"app\""), "missing app auth marker in:\n{rendered}");
+		assert!(rendered.contains("\"auth\": \"pat\""), "missing pat auth marker in:\n{rendered}");
+		assert!(rendered.contains("\"kind\": \"github_issue\""), "missing kind in:\n{rendered}");
 	}
 }
